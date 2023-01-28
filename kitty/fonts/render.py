@@ -373,11 +373,6 @@ def render_cursor(
         vert('left', cursor_beam_thickness)
     elif which == 2:  # underline
         horz('bottom', cursor_underline_thickness)
-    elif which == 3:  # hollow
-        vert('left')
-        vert('right')
-        horz('top')
-        horz('bottom')
     return ans
 
 
