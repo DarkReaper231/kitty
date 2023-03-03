@@ -23,6 +23,7 @@ from .constants import (
     glfw_path,
     is_macos,
     is_wayland,
+    kitten_exe,
     kitty_exe,
     logo_png_file,
     running_in_kitty,
@@ -56,6 +57,7 @@ from .utils import (
     detach,
     expandvars,
     log_error,
+    parse_os_window_state,
     single_instance,
     startup_notification_handler,
     unix_socket_paths,
@@ -237,12 +239,16 @@ def _run_app(opts: Options, args: CLIOptions, prewarm: PrewarmProcess, bad_lines
     with cached_values_for(run_app.cached_values_name) as cached_values:
         startup_sessions = tuple(create_sessions(opts, args, default_session=opts.startup_session))
         wincls = (startup_sessions[0].os_window_class if startup_sessions else '') or args.cls or appname
+        window_state = (args.start_as if args.start_as and args.start_as != 'normal' else None) or (
+            getattr(startup_sessions[0], 'os_window_state', None) if startup_sessions else None
+        )
+        wstate = parse_os_window_state(window_state) if window_state is not None else None
         with startup_notification_handler(extra_callback=run_app.first_window_callback) as pre_show_callback:
             window_id = create_os_window(
                     run_app.initial_window_size_func(get_os_window_sizing_data(opts, startup_sessions[0] if startup_sessions else None), cached_values),
                     pre_show_callback,
                     args.title or appname, args.name or args.cls or appname,
-                    wincls, load_all_shaders, disallow_override_title=bool(args.title))
+                    wincls, wstate, load_all_shaders, disallow_override_title=bool(args.title))
         boss = Boss(opts, args, cached_values, global_shortcuts, prewarm)
         boss.start(window_id, startup_sessions)
         if bad_lines:
@@ -382,6 +388,15 @@ def ensure_kitty_in_path() -> None:
                 os.environ['PATH'] = prepend_if_not_present(rpath, env_path)
 
 
+def ensure_kitten_in_path() -> None:
+    correct_kitten = kitten_exe()
+    existing = shutil.which('kitten')
+    if existing and safe_samefile(existing, correct_kitten):
+        return
+    env_path = os.environ.get('PATH', '')
+    os.environ['PATH'] = prepend_if_not_present(os.path.dirname(correct_kitten), env_path)
+
+
 def setup_manpath(env: Dict[str, str]) -> None:
     # Ensure kitty manpages are available in frozen builds
     if not getattr(sys, 'frozen', False):
@@ -407,6 +422,7 @@ def setup_environment(opts: Options, cli_opts: CLIOptions) -> None:
         cli_opts.listen_on = expand_listen_on(cli_opts.listen_on, from_config_file)
     env = opts.env.copy()
     ensure_kitty_in_path()
+    ensure_kitten_in_path()
     kitty_path = shutil.which('kitty')
     if kitty_path:
         child_path = env.get('PATH')

@@ -30,8 +30,7 @@ class TestBuild(BaseTest):
         from kittens.choose import subseq_matcher
         from kittens.diff import diff_speedup
         from kittens.transfer import rsync
-        from kittens.unicode_input import unicode_names
-        del fdt, unicode_names, subseq_matcher, diff_speedup, rsync
+        del fdt, subseq_matcher, diff_speedup, rsync
 
     def test_loading_shaders(self) -> None:
         from kitty.utils import load_shaders
@@ -68,7 +67,7 @@ class TestBuild(BaseTest):
             q = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
             return mode & q == q
 
-        for x in ('kitty', 'kitten', 'askpass.py'):
+        for x in ('kitty', 'kitten'):
             x = os.path.join(shell_integration_dir, 'ssh', x)
             self.assertTrue(is_executable(x), f'{x} is not executable')
         if getattr(sys, 'frozen', False):

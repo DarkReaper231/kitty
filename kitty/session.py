@@ -15,7 +15,7 @@ from .options.types import Options
 from .options.utils import resize_window, to_layout_names, window_size
 from .os_window_size import WindowSize, WindowSizeData, WindowSizes
 from .typing import SpecialWindowInstance
-from .utils import expandvars, log_error, resolve_custom_file, resolved_shell
+from .utils import expandvars, log_error, resolve_custom_file, resolved_shell, which
 
 if TYPE_CHECKING:
     from .launch import LaunchSpec
@@ -61,6 +61,7 @@ class Session:
         self.default_title = default_title
         self.os_window_size: Optional[WindowSizes] = None
         self.os_window_class: Optional[str] = None
+        self.os_window_state: Optional[str] = None
         self.focus_os_window: bool = False
 
     def add_tab(self, opts: Options, name: str = '') -> None:
@@ -177,6 +178,8 @@ def parse_session(raw: str, opts: Options, environ: Optional[Mapping[str, str]] 
                 ans.os_window_size = WindowSizes(WindowSize(*w), WindowSize(*h))
             elif cmd == 'os_window_class':
                 ans.os_window_class = rest
+            elif cmd == 'os_window_state':
+                ans.os_window_state = rest
             elif cmd == 'resize_window':
                 ans.resize_window(rest.split())
             else:
@@ -231,6 +234,7 @@ def create_sessions(
     if special_window is None:
         cmd = args.args if args and args.args else resolved_shell(opts)
         if args and args.hold:
+            cmd[0] = which(cmd[0]) or cmd[0]
             cmd = [kitten_exe(), '__hold_till_enter__'] + cmd
         from kitty.tabs import SpecialWindow
         cwd: Optional[str] = args.directory if respect_cwd and args else None

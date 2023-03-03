@@ -333,7 +333,8 @@ def init_env(
     ignore_compiler_warnings: bool = False,
     build_universal_binary: bool = False,
     extra_library_dirs: Iterable[str] = (),
-    verbose: bool = True
+    verbose: bool = True,
+    vcs_rev: str = '',
 ) -> Env:
     native_optimizations = native_optimizations and not sanitize and not debug
     if native_optimizations and is_macos and is_arm:
@@ -428,7 +429,7 @@ def init_env(
         set_arches(cflags)
         set_arches(ldflags)
 
-    return Env(cc, cppflags, cflags, ldflags, library_paths, ccver=ccver, ldpaths=ldpaths)
+    return Env(cc, cppflags, cflags, ldflags, library_paths, ccver=ccver, ldpaths=ldpaths, vcs_rev=vcs_rev)
 
 
 def kitty_env() -> Env:
@@ -503,7 +504,7 @@ def run_tool(cmd: Union[str, List[str]], desc: Optional[str] = None) -> None:
 
 
 @lru_cache
-def get_vcs_rev_define() -> str:
+def get_vcs_rev() -> str:
     ans = ''
     if os.path.exists('.git'):
         try:
@@ -526,7 +527,9 @@ def get_source_specific_defines(env: Env, src: str) -> Tuple[str, Optional[List[
     if src == 'kitty/parser_dump.c':
         return 'kitty/parser.c', ['DUMP_COMMANDS']
     if src == 'kitty/data-types.c':
-        return src, [f'KITTY_VCS_REV="{get_vcs_rev_define()}"', f'WRAPPED_KITTENS="{wrapped_kittens()}"']
+        if not env.vcs_rev:
+            env.vcs_rev = get_vcs_rev()
+        return src, [f'KITTY_VCS_REV="{env.vcs_rev}"', f'WRAPPED_KITTENS="{wrapped_kittens()}"']
     try:
         return src, env.library_paths[src]
     except KeyError:
@@ -835,7 +838,7 @@ def init_env_from_args(args: Options, native_optimizations: bool = False) -> Non
         args.debug, args.sanitize, native_optimizations, args.link_time_optimization, args.profile,
         args.egl_library, args.startup_notification_library, args.canberra_library, args.fontconfig_library,
         args.extra_logging, args.extra_include_dirs, args.ignore_compiler_warnings,
-        args.build_universal_binary, args.extra_library_dirs, verbose=args.verbose > 0
+        args.build_universal_binary, args.extra_library_dirs, verbose=args.verbose > 0, vcs_rev=args.vcs_rev,
     )
 
 
@@ -908,7 +911,8 @@ def build_static_kittens(
     if not for_platform:
         update_go_generated_files(args, os.path.join(launcher_dir, appname))
     cmd = [go, 'build', '-v']
-    ld_flags = [f"-X 'kitty.VCSRevision={get_vcs_rev_define()}'"]
+    vcs_rev = args.vcs_rev or get_vcs_rev()
+    ld_flags = [f"-X 'kitty.VCSRevision={vcs_rev}'"]
     if for_freeze:
         ld_flags.append("-X 'kitty.IsFrozenBuild=true'")
     if for_platform:
@@ -928,6 +932,8 @@ def build_static_kittens(
             print(shlex.join(c))
         e = os.environ.copy()
         e.update(env)
+        # https://github.com/kovidgoyal/kitty/issues/6051#issuecomment-1441369828
+        e.pop('PWD', None)
         if for_platform:
             e['CGO_ENABLED'] = '0'
             e['GOOS'] = for_platform[0]
@@ -953,7 +959,7 @@ def build_static_kittens(
 def build_static_binaries(args: Options, launcher_dir: str) -> None:
     arches = 'amd64', 'arm64'
     for os_, arches_ in {
-        'darwin': arches, 'linux': arches + ('arm',), 'freebsd': arches, 'netbsd': arches, 'openbsd': arches,
+        'darwin': arches, 'linux': arches + ('arm', '386'), 'freebsd': arches, 'netbsd': arches, 'openbsd': arches,
         'dragonfly': ('amd64',),
     }.items():
         for arch in arches_:
@@ -1126,7 +1132,7 @@ Exec=kitty +open %U
 Icon=kitty
 Categories=System;TerminalEmulator;
 NoDisplay=true
-MimeType=image/*;application/x-sh;application/x-shellscript;inode/directory;text/*;x-scheme-handler/kitty;
+MimeType=image/*;application/x-sh;application/x-shellscript;inode/directory;text/*;x-scheme-handler/kitty;x-scheme-handler/ssh;
 '''
             )
 
@@ -1457,7 +1463,7 @@ def package(args: Options, bundle_type: str) -> None:
         if path.endswith('.so'):
             return True
         q = path.split(os.sep)[-2:]
-        if len(q) == 2 and q[0] == 'ssh' and q[1] in ('askpass.py', 'kitty', 'kitten'):
+        if len(q) == 2 and q[0] == 'ssh' and q[1] in ('kitty', 'kitten'):
             return True
         return False
 
@@ -1511,7 +1517,7 @@ def clean() -> None:
             dirs.remove(d)
         for f in files:
             ext = f.rpartition('.')[-1]
-            if ext in ('so', 'dylib', 'pyc', 'pyo') or f.endswith('_generated.h') or f.endswith('_generated.go'):
+            if ext in ('so', 'dylib', 'pyc', 'pyo') or f.endswith('_generated.h') or f.endswith('_generated.go') or f.endswith('_generated.bin'):
                 os.unlink(os.path.join(root, f))
     for x in glob.glob('glfw/wayland-*-protocol.[ch]'):
         os.unlink(x)
@@ -1585,6 +1591,10 @@ def option_parser() -> argparse.ArgumentParser:  # {{{
         '--libdir-name',
         default=Options.libdir_name,
         help='The name of the directory inside --prefix in which to store compiled files. Defaults to "lib"'
+    )
+    p.add_argument(
+        '--vcs-rev', default='',
+        help='The VCS revision to embed in the binary. The default is to read it from the .git directory when present.'
     )
     p.add_argument(
         '--extra-logging',

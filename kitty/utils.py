@@ -25,7 +25,7 @@ from .constants import (
     shell_path,
     ssh_control_master_template,
 )
-from .fast_data_types import Color, open_tty
+from .fast_data_types import WINDOW_FULLSCREEN, WINDOW_MAXIMIZED, WINDOW_MINIMIZED, WINDOW_NORMAL, Color, open_tty
 from .rgb import to_color
 from .types import run_once
 from .typing import AddressFamily, PopenType, Socket, StartupCtx
@@ -507,6 +507,13 @@ def parse_address_spec(spec: str) -> Tuple[AddressFamily, Union[Tuple[str, int],
     else:
         raise ValueError(f'Unknown protocol in --listen-on value: {spec}')
     return family, address, socket_path
+
+
+def parse_os_window_state(state: str) -> int:
+    return {
+        'normal': WINDOW_NORMAL, 'maximized': WINDOW_MAXIMIZED, 'minimized': WINDOW_MINIMIZED,
+        'fullscreen': WINDOW_FULLSCREEN, 'fullscreened':WINDOW_FULLSCREEN
+    }[state]
 
 
 def write_all(fd: int, data: Union[str, bytes], block_until_written: bool = True) -> None:
@@ -1130,3 +1137,11 @@ def extract_all_from_tarfile_safely(tf: 'tarfile.TarFile', dest: str) -> None:
         tar.extractall(path, tar.getmembers(), numeric_owner=numeric_owner)
 
     safe_extract(tf, dest)
+
+
+def is_png(path: str) -> bool:
+    if path:
+        with suppress(Exception), open(path, 'rb') as f:
+            header = f.read(8)
+            return header.startswith(b'\211PNG\r\n\032\n')
+    return False

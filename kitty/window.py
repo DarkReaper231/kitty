@@ -7,7 +7,7 @@ import re
 import sys
 import weakref
 from collections import deque
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from enum import Enum, IntEnum, auto
 from functools import lru_cache, partial
 from gettext import gettext as _
@@ -19,6 +19,7 @@ from typing import (
     Callable,
     Deque,
     Dict,
+    Generator,
     Iterable,
     List,
     NamedTuple,
@@ -144,6 +145,7 @@ class CwdRequest:
     def __init__(self, window: Optional['Window'] = None, request_type: CwdRequestType = CwdRequestType.current) -> None:
         self.window_id = -1 if window is None else window.id
         self.request_type = request_type
+        self.rc_from_window_id = 0
 
     def __bool__(self) -> bool:
         return self.window_id > -1
@@ -170,14 +172,15 @@ class CwdRequest:
             return ''
         reported_cwd = path_from_osc7_url(window.screen.last_reported_cwd) if window.screen.last_reported_cwd else ''
         if reported_cwd and (self.request_type is not CwdRequestType.root or window.root_in_foreground_processes):
-            # First check if we are running ssh kitten, and trying to open the configured login shell
-            if argv[0] == resolved_shell(get_options())[0]:
-                ssh_kitten_cmdline = window.ssh_kitten_cmdline()
-                if ssh_kitten_cmdline:
-                    from kittens.ssh.utils import set_cwd_in_cmdline
-                    argv[:] = ssh_kitten_cmdline
-                    set_cwd_in_cmdline(reported_cwd, argv)
-                    return ''
+            ssh_kitten_cmdline = window.ssh_kitten_cmdline()
+            if ssh_kitten_cmdline:
+                run_shell = argv[0] == resolved_shell(get_options())[0]
+                server_args = [] if run_shell else list(argv)
+                from kittens.ssh.utils import set_cwd_in_cmdline, set_server_args_in_cmdline
+                argv[:] = ssh_kitten_cmdline
+                set_cwd_in_cmdline(reported_cwd, argv)
+                set_server_args_in_cmdline(server_args, argv, allocate_tty=not run_shell)
+                return ''
             if not window.child_is_remote and (self.request_type is CwdRequestType.last_reported or window.at_prompt):
                 return reported_cwd
         return window.get_cwd_of_child(oldest=self.request_type is CwdRequestType.oldest) or ''
@@ -506,6 +509,9 @@ class EdgeWidths:
     def serialize(self) -> Dict[str, Optional[float]]:
         return {'left': self.left, 'right': self.right, 'top': self.top, 'bottom': self.bottom}
 
+    def copy(self) -> 'EdgeWidths':
+        return EdgeWidths(self.serialize())
+
 
 class GlobalWatchers:
 
@@ -537,6 +543,22 @@ class Window:
 
     window_custom_type: str = ''
     overlay_type = OverlayType.transient
+    initial_ignore_focus_changes: bool = False
+    initial_ignore_focus_changes_context_manager_in_operation: bool = False
+
+    @classmethod
+    @contextmanager
+    def set_ignore_focus_changes_for_new_windows(cls, value: bool = True) -> Generator[None, None, None]:
+        if cls.initial_ignore_focus_changes_context_manager_in_operation:
+            yield
+        else:
+            orig, cls.initial_ignore_focus_changes = cls.initial_ignore_focus_changes, value
+            cls.initial_ignore_focus_changes_context_manager_in_operation = True
+            try:
+                yield
+            finally:
+                cls.initial_ignore_focus_changes = orig
+                cls.initial_ignore_focus_changes_context_manager_in_operation = False
 
     def __init__(
         self,
@@ -555,6 +577,7 @@ class Window:
         else:
             self.watchers = global_watchers().copy()
         self.last_focused_at = 0.
+        self.is_focused: bool = False
         self.last_resized_at = 0.
         self.started_at = monotonic()
         self.current_remote_data: List[str] = []
@@ -569,6 +592,7 @@ class Window:
         self.pty_resized_once = False
         self.last_reported_pty_size = (-1, -1, -1, -1)
         self.needs_attention = False
+        self.ignore_focus_changes = self.initial_ignore_focus_changes
         self.override_title = override_title
         self.default_title = os.path.basename(child.argv[0] or appname)
         self.child_title = self.default_title
@@ -814,8 +838,10 @@ class Window:
             if val:
                 self.refresh()
 
-    def refresh(self) -> None:
+    def refresh(self, reload_all_gpu_data: bool = False) -> None:
         self.screen.mark_as_dirty()
+        if reload_all_gpu_data:
+            self.screen.reload_all_gpu_data()
         wakeup_io_loop()
         wakeup_main_loop()
 
@@ -957,7 +983,7 @@ class Window:
 
     def handle_remote_file(self, netloc: str, remote_path: str) -> None:
         from kittens.remote_file.main import is_ssh_kitten_sentinel
-        from kittens.ssh.main import get_connection_data
+        from kittens.ssh.utils import get_connection_data
 
         from .utils import SSHConnectionData
         args = self.ssh_kitten_cmdline()
@@ -986,8 +1012,9 @@ class Window:
             return False
 
     def focus_changed(self, focused: bool) -> None:
-        if self.destroyed:
+        if self.destroyed or self.ignore_focus_changes or self.is_focused == focused:
             return
+        self.is_focused = focused
         call_watchers(weakref.ref(self), 'on_focus_change', {'focused': focused})
         for c in self.actions_on_focus_change:
             try:
@@ -1154,7 +1181,7 @@ class Window:
         self.write_to_child(data)
 
     def handle_remote_ssh(self, msg: str) -> None:
-        from kittens.ssh.main import get_ssh_data
+        from kittens.ssh.utils import get_ssh_data
         for line in get_ssh_data(msg, f'{os.getpid()}-{self.id}'):
             self.write_to_child(line)
 
@@ -1354,6 +1381,9 @@ class Window:
         lines = self.screen.text_for_selection(as_ansi, strip_trailing_spaces)
         return ''.join(lines)
 
+    def has_selection(self) -> bool:
+        return self.screen.has_selection()
+
     def call_watchers(self, which: Iterable[Watcher], data: Dict[str, Any]) -> None:
         boss = get_boss()
         for w in which:
@@ -1442,9 +1472,9 @@ class Window:
             'text': text
         }
 
-    def set_logo(self, path: str, position: str = '', alpha: float = -1) -> None:
+    def set_logo(self, path: str, position: str = '', alpha: float = -1, png_data: bytes = b'') -> None:
         path = resolve_custom_file(path) if path else ''
-        set_window_logo(self.os_window_id, self.tab_id, self.id, path, position or '', alpha)
+        set_window_logo(self.os_window_id, self.tab_id, self.id, path, position or '', alpha, png_data)
 
     def paste_with_actions(self, text: str) -> None:
         if self.destroyed or not text:

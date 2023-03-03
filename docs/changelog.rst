@@ -35,7 +35,64 @@ mouse anywhere in the current command to move the cursor there. See
 Detailed list of changes
 -------------------------------------
 
-0.27.0 [future]
+0.28.0 [future]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Text rendering: Use sRGB correct linear gamma blending for nicer font rendering and better color accuracy with transparent windows. See the option :opt:`text_composition_strategy` for details. The obsolete :opt:`macos_thicken_font` will make the font too thick and needs to be removed manually if it is configured. (:pull:`5969`)
+
+- Fix a regression in 0.27.0 that broke ``kitty @ set-font-size 0`` (:iss:`5992`)
+
+- launch: When using ``--cwd=current`` for a remote system support running non shell commands as well (:disc:`5987`)
+
+- When changing the cursor color via escape codes or remote control to a fixed color, do not reset cursor_text_color (:iss:`5994`)
+
+- Input Method Extensions: Fix incorrect rendering of IME in-progress and committed text in some situations (:pull:`6049`)
+
+- Linux: Reduce minimum required OpenGL version from 3.3 to 3.1 + extensions (:iss:`2790`)
+
+- Fix a regression that broke drawing of images below cell backgrounds (:iss:`6061`)
+
+- macOS: Fix the window buttons not being hidden after exiting the traditional full screen (:iss:`6009`)
+
+- When reloading configuration, also reload custom MIME types from :file:`mime.types` config file (:pull:`6012`)
+
+- launch: Allow specifying the state (full screen/maximized/minimized) for newly created OS Windows (:iss:`6026`)
+
+- Sessions: Allow specifying the OS window state via the ``os_window_state`` directive (:iss:`5863`)
+
+- macOS: Display the newly created OS window in specified state to avoid or reduce the window transition animations (:pull:`6035`)
+
+- macOS: Fix the maximized window not taking up full space when the title bar is hidden or when :opt:`resize_in_steps` is configured (:iss:`6021`)
+
+- ssh kitten: Change the syntax of glob patterns slightly to match common usage
+  elsewhere. Now the syntax is the same a "extendedglob" in most shells.
+
+- hints kitten: Allow copying matches to named buffers (:disc:`6073`)
+
+- Fix overlay windows not inheriting the per-window padding and margin settings
+  of their parents (:iss:`6063`)
+
+
+0.27.1 [2023-02-07]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Fix :opt:`modify_font` not working for strikethrough position (:iss:`5946`)
+
+- Fix a regression causing the ``edit-in-kitty`` command not working if :file:`kitten` is not added
+  to PATH (:iss:`5956`)
+
+- icat kitten: Fix a regression that broke display of animated GIFs over SSH (:iss:`5958`)
+
+- Wayland GNOME: Fix for ibus not working when using XWayland (:iss:`5967`)
+
+- Fix regression in previous release that caused incorrect entries in terminfo for modifier+F3 key combinations (:pull:`5970`)
+
+- Bring back the deprecated and removed ``kitty +complete`` and delegate it to :program:`kitten` for backward compatibility (:pull:`5977`)
+
+- Bump the version of Go needed to build kitty to ``1.20`` so we can use the Go stdlib ecdh package for crypto.
+
+
+0.27.0 [2023-01-31]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - A new statically compiled, standalone executable, ``kitten`` (written in Go)
@@ -67,7 +124,7 @@ Detailed list of changes
 
 - A new option :opt:`undercurl_style` to control the rendering of undercurls (:pull:`5883`)
 
-- Bash integration: Fix ``clone-in-kitty`` not working on bash >= 5.2 if an environment variable values contain newlines or other special characters (:iss:`5629`)
+- Bash integration: Fix ``clone-in-kitty`` not working on bash >= 5.2 if environment variable values contain newlines or other special characters (:iss:`5629`)
 
 - A new :ac:`sleep` action useful in combine based mappings to make kitty sleep before executing the next action
 
@@ -96,6 +153,8 @@ Detailed list of changes
 - Fix using :opt:`cursor` = ``none`` not working on text that has reverse video (:iss:`5897`)
 
 - Fix ssh kitten not working on FreeBSD (:iss:`5928`)
+
+- macOS: Export kitty selected text to the system for use with services that accept it (patch by Sertaç Ö. Yıldız)
 
 
 0.26.5 [2022-11-07]

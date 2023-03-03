@@ -294,6 +294,10 @@ PRESS: int
 RELEASE: int
 DRAG: int
 MOVE: int
+WINDOW_NORMAL: int = 0
+WINDOW_FULLSCREEN: int
+WINDOW_MAXIMIZED: int
+WINDOW_MINIMIZED: int
 # }}}
 
 
@@ -508,10 +512,11 @@ def create_os_window(
     title: str,
     wm_class_name: str,
     wm_class_class: str,
+    window_state: Optional[int] = WINDOW_NORMAL,
     load_programs: Optional[Callable[[bool], None]] = None,
-    x: int = -1,
-    y: int = -1,
-    disallow_override_title: bool = False,
+    x: Optional[int] = -1,
+    y: Optional[int] = -1,
+    disallow_override_title: Optional[bool] = False,
 ) -> int:
     pass
 
@@ -604,6 +609,7 @@ def set_background_image(
     os_window_ids: Tuple[int, ...],
     configured: bool = True,
     layout_name: Optional[str] = None,
+    png_data: bytes = b''
 ) -> None:
     pass
 
@@ -818,7 +824,7 @@ def cocoa_set_menubar_title(title: str) -> None:
     pass
 
 
-def change_os_window_state(state: str) -> None:
+def change_os_window_state(state: int, os_window_id: Optional[int] = 0) -> None:
     pass
 
 
@@ -1100,6 +1106,9 @@ class Screen:
     def mark_as_dirty(self) -> None:
         pass
 
+    def reload_all_gpu_data(self) -> None:
+        pass
+
     def resize(self, width: int, height: int) -> None:
         pass
 
@@ -1338,7 +1347,11 @@ def mouse_selection(os_window_id: int, tab_id: int, window_id: int, code: int, b
     pass
 
 
-def set_window_logo(os_window_id: int, tab_id: int, window_id: int, path: str, position: str, alpha: float) -> None:
+def send_mouse_event(screen: Screen, x: int, y: int, button: int, action: int, mods: int) -> bool:
+    pass
+
+
+def set_window_logo(os_window_id: int, tab_id: int, window_id: int, path: str, position: str, alpha: float, png_data: bytes = b'') -> None:
     pass
 
 

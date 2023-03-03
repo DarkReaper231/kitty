@@ -1,6 +1,7 @@
 *.so
 *.pyc
 *.pyo
+*.bin
 *_stub.pyi
 *_generated.go
 *_generated.h
@@ -11,14 +12,13 @@
 /kitty.app/
 /glad/out/
 /kitty/launcher/kitt*
-/tools/cmd/at/*_generated.go
-*_generated.go
 /*.dSYM/
 __pycache__/
 /glfw/wayland-*-client-protocol.[ch]
 /docs/_build/
 /docs/generated/
 /.mypy_cache
+/.ruff_cache
 .DS_Store
 .cache
 bypy/b

@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 # License: GPLv3 Copyright: 2020, Kovid Goyal <kovid at kovidgoyal.net>
 
-import imghdr
 import os
 from base64 import standard_b64decode, standard_b64encode
+from io import BytesIO
 from typing import TYPE_CHECKING, Optional
 
 from kitty.types import AsyncResponse
+from kitty.utils import is_png
 
 from .base import (
     MATCH_WINDOW_OPTION,
@@ -14,7 +15,6 @@ from .base import (
     Boss,
     CmdGenerator,
     ImageCompletion,
-    NamedTemporaryFile,
     PayloadGetType,
     PayloadType,
     RCOptions,
@@ -80,16 +80,18 @@ failed, the command will exit with a success code.
         if len(args) != 1:
             self.fatal('Must specify path to exactly one PNG image')
         path = os.path.expanduser(args[0])
+        import secrets
         ret = {
             'match': opts.match,
             'configured': opts.configured,
             'layout': opts.layout,
             'all': opts.all,
+            'stream_id': secrets.token_urlsafe(),
         }
         if path.lower() == 'none':
             ret['data'] = '-'
             return ret
-        if imghdr.what(path) != 'png':
+        if not is_png(path):
             self.fatal(f'{path} is not a PNG image')
 
         def file_pipe(path: str) -> CmdGenerator:
@@ -111,17 +113,16 @@ failed, the command will exit with a success code.
         layout = payload_get('layout')
         if data == '-':
             path = None
-            tfile = NamedTemporaryFile()
+            tfile = BytesIO()
         else:
             q = self.handle_streamed_data(standard_b64decode(data) if data else b'', payload_get)
             if isinstance(q, AsyncResponse):
                 return q
-            path = q.name
+            path = '/image/from/remote/control'
             tfile = q
 
         try:
-            with tfile:
-                boss.set_background_image(path, os_windows, payload_get('configured'), layout)
+            boss.set_background_image(path, os_windows, payload_get('configured'), layout, tfile.getvalue())
         except ValueError as err:
             err.hide_traceback = True  # type: ignore
             raise

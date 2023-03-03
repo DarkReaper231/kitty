@@ -148,6 +148,13 @@ func (self *Term) Close() error {
 	return err
 }
 
+func (self *Term) WasEchoOnOriginally() bool {
+	if len(self.states) > 0 {
+		return self.states[0].Lflag&unix.ECHO != 0
+	}
+	return false
+}
+
 func (self *Term) Tcgetattr(ans *unix.Termios) error {
 	return eintr_retry_noret(func() error { return Tcgetattr(self.Fd(), ans) })
 }
@@ -209,20 +216,30 @@ func (self *Term) RestoreAndClose() error {
 	return self.Close()
 }
 
-func (self *Term) SuspendAndRun(callback func() error) error {
+func (self *Term) Suspend() (resume func() error, err error) {
 	var state unix.Termios
-	err := self.Tcgetattr(&state)
+	err = self.Tcgetattr(&state)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(self.states) > 0 {
 		err := self.Tcsetattr(TCSANOW, &self.states[0])
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
-	defer self.Tcsetattr(TCSANOW, &state)
-	return callback()
+	return func() error { return self.Tcsetattr(TCSANOW, &state) }, nil
+
+}
+
+func (self *Term) SuspendAndRun(callback func() error) error {
+	resume, err := self.Suspend()
+	if err != nil {
+		return err
+	}
+	err = callback()
+	resume()
+	return err
 }
 
 func clamp(v, lo, hi int64) int64 {
@@ -246,13 +263,19 @@ func (self *Term) ReadWithTimeout(b []byte, d time.Duration) (n int, err error) 
 	}
 	num_ready, err := pselect()
 	if err != nil {
-		return
+		return 0, err
 	}
 	if num_ready == 0 {
 		err = os.ErrDeadlineExceeded
-		return
+		return 0, err
 	}
-	return self.Read(b)
+	for {
+		n, err = self.Read(b)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		return n, err
+	}
 }
 
 func (self *Term) Read(b []byte) (int, error) {
@@ -263,15 +286,23 @@ func (self *Term) Write(b []byte) (int, error) {
 	return self.os_file.Write(b)
 }
 
+func is_temporary_error(err error) bool {
+	return errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, io.ErrShortWrite)
+}
+
 func (self *Term) WriteAll(b []byte) error {
 	for len(b) > 0 {
 		n, err := self.os_file.Write(b)
-		if err != nil && !errors.Is(err, io.ErrShortWrite) {
+		if err != nil && !is_temporary_error(err) {
 			return err
 		}
 		b = b[n:]
 	}
 	return nil
+}
+
+func (self *Term) WriteAllString(s string) error {
+	return self.WriteAll(utils.UnsafeStringToBytes(s))
 }
 
 func (self *Term) WriteString(b string) (int, error) {

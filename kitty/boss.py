@@ -7,7 +7,7 @@ import json
 import os
 import re
 import sys
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from functools import partial
 from gettext import gettext as _
 from time import monotonic, sleep
@@ -17,6 +17,7 @@ from typing import (
     Callable,
     Container,
     Dict,
+    Generator,
     Iterable,
     Iterator,
     List,
@@ -49,6 +50,7 @@ from .constants import (
     handled_signals,
     is_macos,
     is_wayland,
+    kitten_exe,
     kitty_exe,
     logo_png_file,
     supports_primary_selection,
@@ -74,7 +76,6 @@ from .fast_data_types import (
     apply_options_update,
     background_opacity_of,
     change_background_opacity,
-    change_os_window_state,
     cocoa_hide_app,
     cocoa_hide_other_apps,
     cocoa_minimize_os_window,
@@ -110,6 +111,7 @@ from .fast_data_types import (
     toggle_fullscreen,
     toggle_maximized,
     toggle_secure_input,
+    wrapped_kitten_names,
 )
 from .key_encoding import get_name_to_functional_number_map
 from .keys import get_shortcut, shortcut_matches
@@ -135,6 +137,7 @@ from .utils import (
     macos_version,
     open_url,
     parse_address_spec,
+    parse_os_window_state,
     parse_uri_list,
     platform_window_id,
     remove_socket_file,
@@ -379,20 +382,20 @@ class Boss:
         si = startup_sessions or create_sessions(get_options(), self.args, default_session=get_options().startup_session)
         focused_os_window = wid = 0
         token = os.environ.pop('XDG_ACTIVATION_TOKEN', '')
-        for startup_session in si:
-            wid = self.add_os_window(startup_session, os_window_id=os_window_id)
-            if startup_session.focus_os_window:
-                focused_os_window = wid
-            os_window_id = None
-            if self.args.start_as != 'normal':
-                if self.args.start_as == 'fullscreen':
-                    self.toggle_fullscreen()
-                else:
-                    change_os_window_state(self.args.start_as)
-        if focused_os_window > 0:
-            focus_os_window(focused_os_window, True, token)
-        elif token and is_wayland() and wid:
-            focus_os_window(wid, True, token)
+        with Window.set_ignore_focus_changes_for_new_windows():
+            for startup_session in si:
+                # The window state from the CLI options will override and apply to every single OS window in startup session
+                wstate = self.args.start_as if self.args.start_as and self.args.start_as != 'normal' else None
+                wid = self.add_os_window(startup_session, window_state=wstate, os_window_id=os_window_id)
+                if startup_session.focus_os_window:
+                    focused_os_window = wid
+                os_window_id = None
+            if focused_os_window > 0:
+                focus_os_window(focused_os_window, True, token)
+            elif token and is_wayland() and wid:
+                focus_os_window(wid, True, token)
+        for w in self.all_windows:
+            w.ignore_focus_changes = False
 
     def add_os_window(
         self,
@@ -400,6 +403,7 @@ class Boss:
         os_window_id: Optional[int] = None,
         wclass: Optional[str] = None,
         wname: Optional[str] = None,
+        window_state: Optional[str] = None,
         opts_for_size: Optional[Options] = None,
         startup_id: Optional[str] = None,
         override_title: Optional[str] = None,
@@ -409,11 +413,13 @@ class Boss:
             wclass = wclass or getattr(startup_session, 'os_window_class', None) or self.args.cls or appname
             wname = wname or self.args.name or wclass
             wtitle = override_title or self.args.title
+            window_state = window_state or getattr(startup_session, 'os_window_state', None)
+            wstate = parse_os_window_state(window_state) if window_state is not None else None
             with startup_notification_handler(do_notify=startup_id is not None, startup_id=startup_id) as pre_show_callback:
                 os_window_id = create_os_window(
                         initial_window_size_func(size_data, self.cached_values),
                         pre_show_callback,
-                        wtitle or appname, wname, wclass, disallow_override_title=bool(wtitle))
+                        wtitle or appname, wname, wclass, wstate, disallow_override_title=bool(wtitle))
         else:
             wname = self.args.name or self.args.cls or appname
             wclass = self.args.cls or appname
@@ -699,10 +705,9 @@ class Boss:
     def remote_control(self, *args: str) -> None:
         try:
             self.call_remote_control(self.active_window, args)
-        except (Exception, SystemExit):
-            import traceback
-            tb = traceback.format_exc()
-            self.show_error(_('remote_control mapping failed'), tb)
+        except (Exception, SystemExit) as e:
+            import shlex
+            self.show_error(_('remote_control mapping failed'), shlex.join(args) + '\n' + str(e))
 
     def call_remote_control(self, active_window: Optional[Window], args: Tuple[str, ...]) -> 'ResponseType':
         from .rc.base import PayloadGetter, command_for_name, parse_subcommand_cli
@@ -806,36 +811,50 @@ class Boss:
                     if not self.shutting_down:
                         self.mark_os_window_for_close(src_tab.os_window_id)
 
+    @contextmanager
+    def suppress_focus_change_events(self) -> Generator[None, None, None]:
+        changes = {}
+        for w in self.window_id_map.values():
+            changes[w] = w.ignore_focus_changes
+            w.ignore_focus_changes = True
+        try:
+            yield
+        finally:
+            for w, val in changes.items():
+                w.ignore_focus_changes = val
+
     def on_child_death(self, window_id: int) -> None:
         prev_active_window = self.active_window
         window = self.window_id_map.pop(window_id, None)
         if window is None:
             return
-        for close_action in window.actions_on_close:
-            try:
-                close_action(window)
-            except Exception:
-                import traceback
-                traceback.print_exc()
-        os_window_id = window.os_window_id
-        window.destroy()
-        tm = self.os_window_map.get(os_window_id)
-        tab = None
-        if tm is not None:
-            for q in tm:
-                if window in q:
-                    tab = q
-                    break
-        if tab is not None:
-            tab.remove_window(window)
-            self._cleanup_tab_after_window_removal(tab)
-        for removal_action in window.actions_on_removal:
-            try:
-                removal_action(window)
-            except Exception:
-                import traceback
-                traceback.print_exc()
-        del window.actions_on_close[:], window.actions_on_removal[:]
+        with self.suppress_focus_change_events():
+            for close_action in window.actions_on_close:
+                try:
+                    close_action(window)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            os_window_id = window.os_window_id
+            window.destroy()
+            tm = self.os_window_map.get(os_window_id)
+            tab = None
+            if tm is not None:
+                for q in tm:
+                    if window in q:
+                        tab = q
+                        break
+            if tab is not None:
+                tab.remove_window(window)
+                self._cleanup_tab_after_window_removal(tab)
+            for removal_action in window.actions_on_removal:
+                try:
+                    removal_action(window)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            del window.actions_on_close[:], window.actions_on_removal[:]
+
         window = self.active_window
         if window is not prev_active_window:
             if prev_active_window is not None:
@@ -1730,17 +1749,23 @@ class Boss:
                     if sel:
                         x = sel
                 final_args.append(x)
+            env = {
+                'KITTY_COMMON_OPTS': json.dumps(copts),
+                'KITTY_CHILD_PID': str(w.child.pid),
+                'OVERLAID_WINDOW_LINES': str(w.screen.lines),
+                'OVERLAID_WINDOW_COLS': str(w.screen.columns),
+            }
+            if kitten in wrapped_kitten_names():
+                cmd = [kitten_exe(), kitten]
+                env['KITTEN_RUNNING_AS_UI'] = '1'
+            else:
+                cmd = [kitty_exe(), '+runpy', 'from kittens.runner import main; main()']
+                env['PYTHONWARNINGS'] = 'ignore'
             overlay_window = tab.new_special_window(
                 SpecialWindow(
-                    [kitty_exe(), '+runpy', 'from kittens.runner import main; main()'] + final_args,
+                    cmd + final_args,
                     stdin=data,
-                    env={
-                        'KITTY_COMMON_OPTS': json.dumps(copts),
-                        'KITTY_CHILD_PID': str(w.child.pid),
-                        'PYTHONWARNINGS': 'ignore',
-                        'OVERLAID_WINDOW_LINES': str(w.screen.lines),
-                        'OVERLAID_WINDOW_COLS': str(w.screen.columns),
-                    },
+                    env=env,
                     cwd=w.cwd_of_child,
                     overlay_for=w.id,
                     overlay_behind=end_kitten.has_ready_notification,
@@ -1985,6 +2010,22 @@ class Boss:
             return w.text_for_selection()
         return None
 
+    def has_active_selection(self) -> bool:
+        w = self.active_window
+        if w is not None and not w.destroyed:
+            return w.has_selection()
+        return False
+
+    def set_clipboard_buffer(self, buffer_name: str, text: Optional[str] = None) -> None:
+        if buffer_name:
+            if text is not None:
+                self.clipboard_buffers[buffer_name] = text
+            elif buffer_name in self.clipboard_buffers:
+                del self.clipboard_buffers[buffer_name]
+
+    def get_clipboard_buffer(self, buffer_name: str) -> Optional[str]:
+        return self.clipboard_buffers.get(buffer_name)
+
     @ac('cp', '''
         Copy the selection from the active window to the specified buffer
 
@@ -2000,7 +2041,7 @@ class Boss:
                 elif buffer_name == 'primary':
                     set_primary_selection(text)
                 else:
-                    self.clipboard_buffers[buffer_name] = text
+                    self.set_clipboard_buffer(buffer_name, text)
 
     @ac('cp', '''
         Paste from the specified buffer to the active window
@@ -2013,7 +2054,7 @@ class Boss:
         elif buffer_name == 'primary':
             text = get_primary_selection()
         else:
-            text = self.clipboard_buffers.get(buffer_name)
+            text = self.get_clipboard_buffer(buffer_name)
         if text:
             self.paste_to_active_window(text)
 
@@ -2332,7 +2373,6 @@ class Boss:
 
     def apply_new_options(self, opts: Options) -> None:
         from .fonts.box_drawing import set_scale
-
         # Update options storage
         set_options(opts, is_wayland(), self.args.debug_rendering, self.args.debug_font_fallback)
         apply_options_update()
@@ -2349,12 +2389,16 @@ class Boss:
         # Update key bindings
         self.update_keymap()
         # Update misc options
+        try:
+            set_background_image(opts.background_image, tuple(self.os_window_map), True, opts.background_image_layout)
+        except Exception as e:
+            log_error(f'Failed to set background image with error: {e}')
         for tm in self.all_tab_managers:
             tm.apply_options()
         # Update colors
         for w in self.all_windows:
             self.default_bg_changed_for(w.id)
-            w.refresh()
+            w.refresh(reload_all_gpu_data=True)
         self.prewarm.reload_kitty_config()
 
     @ac('misc', '''
@@ -2379,6 +2423,8 @@ class Boss:
         self.apply_new_options(opts)
         from .open_actions import clear_caches
         clear_caches()
+        from .guess_mime_type import clear_mime_cache
+        clear_mime_cache()
 
     def safe_delete_temp_file(self, path: str) -> None:
         if is_path_in_temp_dir(path):
@@ -2470,36 +2516,37 @@ class Boss:
         src_tab = self.tab_for_window(window)
         if src_tab is None:
             return
-        if target_os_window_id == 'new':
-            target_os_window_id = self.add_os_window()
-            tm = self.os_window_map[target_os_window_id]
-            target_tab = tm.new_tab(empty_tab=True)
-        else:
-            target_os_window_id = target_os_window_id or current_os_window()
-            if isinstance(target_tab_id, str):
-                if not isinstance(target_os_window_id, int):
-                    q = self.active_tab_manager
-                    assert q is not None
-                    tm = q
-                else:
-                    tm = self.os_window_map[target_os_window_id]
-                if target_tab_id == 'new':
-                    target_tab = tm.new_tab(empty_tab=True)
-                else:
-                    target_tab = tm.tab_at_location(target_tab_id) or tm.new_tab(empty_tab=True)
+        with self.suppress_focus_change_events():
+            if target_os_window_id == 'new':
+                target_os_window_id = self.add_os_window()
+                tm = self.os_window_map[target_os_window_id]
+                target_tab = tm.new_tab(empty_tab=True)
             else:
-                for tab in self.all_tabs:
-                    if tab.id == target_tab_id:
-                        target_tab = tab
-                        target_os_window_id = tab.os_window_id
-                        break
+                target_os_window_id = target_os_window_id or current_os_window()
+                if isinstance(target_tab_id, str):
+                    if not isinstance(target_os_window_id, int):
+                        q = self.active_tab_manager
+                        assert q is not None
+                        tm = q
+                    else:
+                        tm = self.os_window_map[target_os_window_id]
+                    if target_tab_id == 'new':
+                        target_tab = tm.new_tab(empty_tab=True)
+                    else:
+                        target_tab = tm.tab_at_location(target_tab_id) or tm.new_tab(empty_tab=True)
                 else:
-                    return
+                    for tab in self.all_tabs:
+                        if tab.id == target_tab_id:
+                            target_tab = tab
+                            target_os_window_id = tab.os_window_id
+                            break
+                    else:
+                        return
 
-        for detached_window in src_tab.detach_window(window):
-            target_tab.attach_window(detached_window)
-        self._cleanup_tab_after_window_removal(src_tab)
-        target_tab.make_active()
+            for detached_window in src_tab.detach_window(window):
+                target_tab.attach_window(detached_window)
+            self._cleanup_tab_after_window_removal(src_tab)
+            target_tab.make_active()
 
     def _move_tab_to(self, tab: Optional[Tab] = None, target_os_window_id: Optional[int] = None) -> None:
         tab = tab or self.active_tab
@@ -2620,8 +2667,8 @@ class Boss:
 
         self.choose_entry('Choose an OS window to move the tab to', items, chosen)
 
-    def set_background_image(self, path: Optional[str], os_windows: Tuple[int, ...], configured: bool, layout: Optional[str]) -> None:
-        set_background_image(path, os_windows, configured, layout)
+    def set_background_image(self, path: Optional[str], os_windows: Tuple[int, ...], configured: bool, layout: Optional[str], png_data: bytes = b'') -> None:
+        set_background_image(path, os_windows, configured, layout, png_data)
         for os_window_id in os_windows:
             self.default_bg_changed_for(os_window_id)
 

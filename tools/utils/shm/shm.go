@@ -3,12 +3,15 @@
 package shm
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand"
+	"io"
+	"io/fs"
 	"os"
-	"strconv"
 	"strings"
+
+	"kitty/tools/cli"
 
 	"golang.org/x/sys/unix"
 )
@@ -41,11 +44,6 @@ func prefix_and_suffix(pattern string) (prefix, suffix string, err error) {
 	return prefix, suffix, nil
 }
 
-func next_random() string {
-	num := rand.Uint32()
-	return strconv.FormatUint(uint64(num), 16)
-}
-
 type MMap interface {
 	Close() error
 	Unlink() error
@@ -53,6 +51,11 @@ type MMap interface {
 	Name() string
 	IsFileSystemBacked() bool
 	FileSystemName() string
+	Stat() (fs.FileInfo, error)
+	Flush() error
+	Seek(offset int64, whence int) (ret int64, err error)
+	Read(b []byte) (n int, err error)
+	Write(b []byte) (n int, err error)
 }
 
 type AccessFlags int
@@ -102,4 +105,135 @@ func truncate_or_unlink(ans *os.File, size uint64) (err error) {
 		return fmt.Errorf("Failed to ftruncate() SHM file %s to size: %d with error: %w", ans.Name(), size, err)
 	}
 	return
+}
+
+const NUM_BYTES_FOR_SIZE = 4
+
+var ErrRegionTooSmall = errors.New("mmaped region too small")
+
+func WriteWithSize(self MMap, b []byte, at int) error {
+	if len(self.Slice()) < at+len(b)+NUM_BYTES_FOR_SIZE {
+		return ErrRegionTooSmall
+	}
+	binary.BigEndian.PutUint32(self.Slice()[at:], uint32(len(b)))
+	copy(self.Slice()[at+NUM_BYTES_FOR_SIZE:], b)
+	return nil
+}
+
+func ReadWithSize(self MMap, at int) ([]byte, error) {
+	s := self.Slice()[at:]
+	if len(s) < NUM_BYTES_FOR_SIZE {
+		return nil, ErrRegionTooSmall
+	}
+	size := int(binary.BigEndian.Uint32(self.Slice()[at : at+NUM_BYTES_FOR_SIZE]))
+	s = s[NUM_BYTES_FOR_SIZE:]
+	if len(s) < size {
+		return nil, ErrRegionTooSmall
+	}
+	return s[:size], nil
+}
+
+func ReadWithSizeAndUnlink(name string, file_callback ...func(fs.FileInfo) error) ([]byte, error) {
+	mmap, err := Open(name, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(file_callback) > 0 {
+		s, err := mmap.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("Failed to stat SHM file with error: %w", err)
+		}
+		for _, f := range file_callback {
+			err = f(s)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	defer func() {
+		mmap.Close()
+		mmap.Unlink()
+	}()
+	slice, err := ReadWithSize(mmap, 0)
+	if err != nil {
+		return nil, err
+	}
+	ans := make([]byte, len(slice))
+	copy(ans, slice)
+	return ans, nil
+}
+
+func Read(self MMap, b []byte) (n int, err error) {
+	pos, _ := self.Seek(0, io.SeekCurrent)
+	if pos < 0 {
+		pos = 0
+	}
+	s := self.Slice()
+	sz := int64(len(s))
+	if pos >= sz {
+		return 0, io.EOF
+	}
+	n = copy(b, s[pos:])
+	self.Seek(int64(n), io.SeekCurrent)
+	return
+}
+
+func Write(self MMap, b []byte) (n int, err error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	pos, _ := self.Seek(0, io.SeekCurrent)
+	if pos < 0 {
+		pos = 0
+	}
+	s := self.Slice()
+	if pos >= int64(len(s)) {
+		return 0, io.ErrShortWrite
+	}
+	n = copy(s[pos:], b)
+	self.Seek(int64(n), io.SeekCurrent)
+	if n < len(b) {
+		return n, io.ErrShortWrite
+	}
+	return n, nil
+}
+
+func test_integration_with_python(args []string) (rc int, err error) {
+	switch args[0] {
+	default:
+		return 1, fmt.Errorf("Unknown test type: %s", args[0])
+	case "read":
+		data, err := ReadWithSizeAndUnlink(args[1])
+		if err != nil {
+			return 1, err
+		}
+		_, err = os.Stdout.Write(data)
+		if err != nil {
+			return 1, err
+		}
+	case "write":
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return 1, err
+		}
+		mmap, err := CreateTemp("shmtest-", uint64(len(data)+NUM_BYTES_FOR_SIZE))
+		if err != nil {
+			return 1, err
+		}
+		WriteWithSize(mmap, data, 0)
+		mmap.Close()
+		fmt.Println(mmap.Name())
+	}
+	return 0, nil
+}
+
+func TestEntryPoint(root *cli.Command) {
+	root.AddSubCommand(&cli.Command{
+		Name:            "shm",
+		OnlyArgsAllowed: true,
+		Run: func(cmd *cli.Command, args []string) (rc int, err error) {
+			return test_integration_with_python(args)
+		},
+	})
+
 }

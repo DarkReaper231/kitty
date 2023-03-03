@@ -395,3 +395,17 @@ GLFWAPI GLFWcurrentselectionfun glfwSetCurrentSelectionCallback(GLFWcurrentselec
     _GLFW_SWAP_POINTERS(_glfw.callbacks.get_current_selection, cbfun);
     return cbfun;
 }
+
+GLFWAPI GLFWhascurrentselectionfun glfwSetHasCurrentSelectionCallback(GLFWhascurrentselectionfun cbfun)
+{
+    _GLFW_REQUIRE_INIT_OR_RETURN(NULL);
+    _GLFW_SWAP_POINTERS(_glfw.callbacks.has_current_selection, cbfun);
+    return cbfun;
+}
+
+GLFWAPI GLFWimecursorpositionfun glfwSetIMECursorPositionCallback(GLFWimecursorpositionfun cbfun)
+{
+    _GLFW_REQUIRE_INIT_OR_RETURN(NULL);
+    _GLFW_SWAP_POINTERS(_glfw.callbacks.get_ime_cursor_position, cbfun);
+    return cbfun;
+}

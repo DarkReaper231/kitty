@@ -66,8 +66,8 @@ func complete_plus_open(completions *cli.Completions, word string, arg_num int) 
 }
 
 func complete_themes(completions *cli.Completions, word string, arg_num int) {
-	kitty, err := utils.KittyExe()
-	if err == nil {
+	kitty := utils.KittyExe()
+	if kitty != "" {
 		out, err := exec.Command(kitty, "+runpy", "from kittens.themes.collection import *; print_theme_names()").Output()
 		if err == nil {
 			mg := completions.AddMatchGroup("Themes")
@@ -87,7 +87,7 @@ func EntryPoint(tool_root *cli.Command) {
 		Name: "__complete__", Hidden: true,
 		Usage:            "output_type [shell state...]",
 		ShortDescription: "Generate completions for kitty commands",
-		HelpText:         "Generate completion candidates for kitty commands. The command line is read from STDIN. output_type can be one of the supported  shells or 'json' for JSON output.",
+		HelpText:         "Generate completion candidates for kitty commands. The command line is read from STDIN. output_type can be one of the supported shells: :code:`zsh`, :code:`fish`, :code:`bash`, or :code:`setup` for completion setup script following with the shell name, or :code:`json` for JSON output.",
 		Run: func(cmd *cli.Command, args []string) (ret int, err error) {
 			return ret, cli.GenerateCompletions(args)
 		},

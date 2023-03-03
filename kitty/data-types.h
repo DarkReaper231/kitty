@@ -18,7 +18,12 @@
 #include "banned.h"
 // Required minimum OpenGL version
 #define OPENGL_REQUIRED_VERSION_MAJOR 3
+#ifdef __APPLE__
 #define OPENGL_REQUIRED_VERSION_MINOR 3
+#else
+#define OPENGL_REQUIRED_VERSION_MINOR 1
+#endif
+#define GLSL_VERSION 140
 #define GLFW_MOD_KITTY (GLFW_MOD_LAST * 2)
 #define UNUSED __attribute__ ((unused))
 #define PYNOARG PyObject *__a1 UNUSED, PyObject *__a2 UNUSED

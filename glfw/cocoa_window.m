@@ -1454,15 +1454,11 @@ is_ascii_control_char(char x) {
 }
 
 void _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
-    [w->ns.view updateIMEStateFor: ev->type focused:(bool)ev->focused left:(CGFloat)ev->cursor.left top:(CGFloat)ev->cursor.top cellWidth:(CGFloat)ev->cursor.width cellHeight:(CGFloat)ev->cursor.height];
+    [w->ns.view updateIMEStateFor: ev->type focused:(bool)ev->focused];
 }
 
 - (void)updateIMEStateFor:(GLFWIMEUpdateType)which
                   focused:(bool)focused
-                     left:(CGFloat)left
-                      top:(CGFloat)top
-                cellWidth:(CGFloat)cellWidth
-               cellHeight:(CGFloat)cellHeight
 {
     if (which == GLFW_IME_UPDATE_FOCUS && !focused && [self hasMarkedText] && window) {
         [input_context discardMarkedText];
@@ -1472,16 +1468,7 @@ void _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
         _glfw.ns.text[0] = 0;
     }
     if (which != GLFW_IME_UPDATE_CURSOR_POSITION) return;
-    left /= window->ns.xscale;
-    top /= window->ns.yscale;
-    cellWidth /= window->ns.xscale;
-    cellHeight /= window->ns.yscale;
-    debug_key("updateIMEPosition: left=%f, top=%f, width=%f, height=%f\n", left, top, cellWidth, cellHeight);
-    const NSRect frame = [window->ns.view frame];
-    const NSRect rectInView = NSMakeRect(left,
-                                         frame.size.height - top - cellHeight,
-                                         cellWidth, cellHeight);
-    markedRect = [window->ns.object convertRectToScreen: rectInView];
+
     if (_glfwPlatformWindowFocused(window)) [[window->ns.view inputContext] invalidateCharacterCoordinates];
 }
 
@@ -1507,6 +1494,21 @@ void _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
                          actualRange:(NSRangePointer)actualRange
 {
     (void)range; (void)actualRange;
+    if (_glfw.callbacks.get_ime_cursor_position) {
+        GLFWIMEUpdateEvent ev = { .type = GLFW_IME_UPDATE_CURSOR_POSITION };
+        if (_glfw.callbacks.get_ime_cursor_position((GLFWwindow*)window, &ev)) {
+            const CGFloat left = (CGFloat)ev.cursor.left / window->ns.xscale;
+            const CGFloat top = (CGFloat)ev.cursor.top / window->ns.yscale;
+            const CGFloat cellWidth = (CGFloat)ev.cursor.width / window->ns.xscale;
+            const CGFloat cellHeight = (CGFloat)ev.cursor.height / window->ns.yscale;
+            debug_key("updateIMEPosition: left=%f, top=%f, width=%f, height=%f\n", left, top, cellWidth, cellHeight);
+            const NSRect frame = [window->ns.view frame];
+            const NSRect rectInView = NSMakeRect(left,
+                                                 frame.size.height - top - cellHeight,
+                                                 cellWidth, cellHeight);
+            markedRect = [window->ns.object convertRectToScreen: rectInView];
+        }
+    }
     return markedRect;
 }
 
@@ -1574,6 +1576,71 @@ void _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
         }
     }
     return text;
+}
+
+// <https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/SysServices/Articles/using.html>
+
+// Support services receiving "public.utf8-plain-text" and "NSStringPboardType"
+- (id)validRequestorForSendType:(NSString *)sendType returnType:(NSString *)returnType
+{
+    if (
+        (!sendType || [sendType isEqual:NSPasteboardTypeString] || [sendType isEqual:@"NSStringPboardType"]) &&
+        (!returnType || [returnType isEqual:NSPasteboardTypeString] || [returnType isEqual:@"NSStringPboardType"])
+    ) {
+        if (_glfw.callbacks.has_current_selection && _glfw.callbacks.has_current_selection()) return self;
+    }
+    return [super validRequestorForSendType:sendType returnType:returnType];
+}
+
+// Selected text as input to be sent to Services
+// For example, after selecting an absolute path, open the global menu bar kitty->Services and click `Show in Finder`.
+- (BOOL)writeSelectionToPasteboard:(NSPasteboard *)pboard types:(NSArray *)types
+{
+    if (!_glfw.callbacks.get_current_selection) return NO;
+    char *text = _glfw.callbacks.get_current_selection();
+    if (!text) return NO;
+    BOOL ans = NO;
+    if (text[0]) {
+        if ([types containsObject:NSPasteboardTypeString] == YES) {
+            [pboard declareTypes:@[NSPasteboardTypeString] owner:self];
+            ans = [pboard setString:@(text) forType:NSPasteboardTypeString];
+        } else if ([types containsObject:@"NSStringPboardType"] == YES) {
+            [pboard declareTypes:@[@"NSStringPboardType"] owner:self];
+            ans = [pboard setString:@(text) forType:@"NSStringPboardType"];
+        }
+        free(text);
+    }
+    return ans;
+}
+
+// Service output to be handled
+// For example, open System Settings->Keyboard->Keyboard Shortcuts->Services->Text, enable `Convert Text to Full Width`, select some text and execute the service.
+- (BOOL)readSelectionFromPasteboard:(NSPasteboard *)pboard
+{
+    NSString* text = nil;
+    NSArray *types = [pboard types];
+    if ([types containsObject:NSPasteboardTypeString] == YES) {
+        text = [pboard stringForType:NSPasteboardTypeString]; // public.utf8-plain-text
+    } else if ([types containsObject:@"NSStringPboardType"] == YES) {
+        text = [pboard stringForType:@"NSStringPboardType"]; // for older services (need re-encode?)
+    } else {
+        return NO;
+    }
+    if (text && [text length] > 0) {
+        // The service wants us to replace the selection, but we can't replace anything but insert text.
+        const char *utf8 = polymorphic_string_as_utf8(text);
+        debug_key("Sending text received in readSelectionFromPasteboard as key event\n");
+        GLFWkeyevent glfw_keyevent = {.text=utf8, .ime_state=GLFW_IME_COMMIT_TEXT};
+        _glfwInputKeyboard(window, &glfw_keyevent);
+        // Restore pre-edit text after inserting the received text
+        if ([self hasMarkedText]) {
+            glfw_keyevent.text = [[markedText string] UTF8String];
+            glfw_keyevent.ime_state = GLFW_IME_PREEDIT_CHANGED;
+            _glfwInputKeyboard(window, &glfw_keyevent);
+        }
+        return YES;
+    }
+    return NO;
 }
 
 @end
@@ -1650,6 +1717,18 @@ void _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
     // When the window decoration is hidden, toggling fullscreen causes the style mask to be changed,
     // and causes the first responder to be cleared.
     if (glfw_window && !glfw_window->decorated && glfw_window->ns.view) [self makeFirstResponder:glfw_window->ns.view];
+}
+
+- (void)zoom:(id)sender
+{
+    if (![self isZoomed]) {
+        const NSSize original = [self resizeIncrements];
+        [self setResizeIncrements:NSMakeSize(1.0, 1.0)];
+        [super zoom:sender];
+        [self setResizeIncrements:original];
+    } else {
+        [super zoom:sender];
+    }
 }
 
 @end
@@ -1805,8 +1884,9 @@ int _glfwPlatformCreateWindow(_GLFWwindow* window,
 
     if (window->monitor)
     {
-        _glfwPlatformShowWindow(window);
-        _glfwPlatformFocusWindow(window);
+        // Do not show the window here until after setting the window size, maximized state, and full screen
+        // _glfwPlatformShowWindow(window);
+        // _glfwPlatformFocusWindow(window);
         acquireMonitor(window);
     }
 
@@ -1998,8 +2078,9 @@ void _glfwPlatformRestoreWindow(_GLFWwindow* window)
 
 void _glfwPlatformMaximizeWindow(_GLFWwindow* window)
 {
-    if (![window->ns.object isZoomed])
+    if (![window->ns.object isZoomed]) {
         [window->ns.object zoom:nil];
+    }
 }
 
 void _glfwPlatformShowWindow(_GLFWwindow* window)
@@ -2504,6 +2585,19 @@ bool _glfwPlatformToggleFullscreen(_GLFWwindow* w, unsigned int flags) {
         bool in_fullscreen = sm & NSWindowStyleMaskFullScreen;
         if (in_fullscreen) made_fullscreen = false;
         [window toggleFullScreen: nil];
+    }
+    // Update window button visibility
+    if (w->ns.titlebar_hidden) {
+        // The hidden buttons might be automatically reset to be visible after going full screen
+        // to show up in the auto-hide title bar, so they need to be set back to hidden.
+        BOOL button_hidden = YES;
+        // When title bar is configured to be hidden, it should be shown with buttons (auto-hide) after going to full screen.
+        if (!traditional) {
+            button_hidden = (BOOL) !made_fullscreen;
+        }
+        [[window standardWindowButton: NSWindowCloseButton] setHidden:button_hidden];
+        [[window standardWindowButton: NSWindowMiniaturizeButton] setHidden:button_hidden];
+        [[window standardWindowButton: NSWindowZoomButton] setHidden:button_hidden];
     }
     return made_fullscreen;
 }

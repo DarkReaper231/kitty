@@ -57,6 +57,10 @@ type RGBA struct {
 	Red, Green, Blue, Inverse_alpha uint8
 }
 
+func (self RGBA) AsRGBSharp() string {
+	return fmt.Sprintf("#%02x%02x%02x", self.Red, self.Green, self.Blue)
+}
+
 func (self *RGBA) parse_rgb_strings(r string, g string, b string) bool {
 	var rv, gv, bv uint64
 	var err error
@@ -75,6 +79,12 @@ func (self *RGBA) parse_rgb_strings(r string, g string, b string) bool {
 
 func (self *RGBA) AsRGB() uint32 {
 	return uint32(self.Blue) | (uint32(self.Green) << 8) | (uint32(self.Red) << 16)
+}
+
+func (self *RGBA) FromRGB(col uint32) {
+	self.Red = uint8((col >> 16) & 0xff)
+	self.Green = uint8((col >> 8) & 0xff)
+	self.Blue = uint8((col) & 0xff)
 }
 
 type color_type struct {
@@ -327,7 +337,7 @@ func parse_spec(spec string) []escape_code {
 			sgr.italic.from_string(val)
 		case "reverse":
 			sgr.reverse.from_string(val)
-		case "dim":
+		case "dim", "faint":
 			sgr.dim.from_string(val)
 		case "underline", "u":
 			sgr.underline.from_string(val)

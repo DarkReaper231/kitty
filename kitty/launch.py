@@ -58,7 +58,7 @@ Where to launch the child process:
 :code:`tab`
     A new :term:`tab` in the current OS window
 
-:code:`os-window <os_window>`
+:code:`os-window`
     A new :term:`operating system window <os_window>`
 
 :code:`overlay`
@@ -252,6 +252,13 @@ titles set by programs running in kitty. The special value :code:`current` will
 use the title of the current OS window, if any.
 
 
+--os-window-state
+type=choices
+default=normal
+choices=normal,fullscreen,maximized,minimized
+The initial state for the newly created OS Window.
+
+
 --logo
 completion=type:file ext:png group:"PNG images" relative:conf
 Path to a PNG image to use as the logo for the newly created window. See
@@ -284,7 +291,8 @@ type=list
 Set the margin and padding for the newly created window.
 For example: :code:`margin=20` or :code:`padding-left=10` or :code:`margin-h=30`. The shorthand form sets
 all values, the :code:`*-h` and :code:`*-v` variants set horizontal and vertical values.
-Can be specified multiple times.
+Can be specified multiple times. Note that this is ignored for overlay windows as these use the settings
+from the base window.
 
 
 --watcher -w
@@ -322,7 +330,11 @@ def tab_for_window(boss: Boss, opts: LaunchCLIOptions, target_tab: Optional[Tab]
 
     def create_tab(tm: Optional[TabManager] = None) -> Tab:
         if tm is None:
-            oswid = boss.add_os_window(wclass=opts.os_window_class, wname=opts.os_window_name, override_title=opts.os_window_title or None)
+            oswid = boss.add_os_window(
+                wclass=opts.os_window_class,
+                wname=opts.os_window_name,
+                window_state=opts.os_window_state,
+                override_title=opts.os_window_title or None)
             tm = boss.os_window_map[oswid]
         tab = tm.new_tab(empty_tab=True, location=opts.location)
         if opts.tab_title:
@@ -423,7 +435,7 @@ force_window_launch = ForceWindowLaunch()
 non_window_launch_types = 'background', 'clipboard', 'primary'
 
 
-def launch(
+def _launch(
     boss: Boss,
     opts: LaunchCLIOptions,
     args: List[str],
@@ -431,6 +443,7 @@ def launch(
     force_target_tab: bool = False,
     active: Optional[Window] = None,
     is_clone_launch: str = '',
+    rc_from_window: Optional[Window] = None,
 ) -> Optional[Window]:
     active = active or boss.active_window_for_cwd
     if active:
@@ -485,6 +498,8 @@ def launch(
                 kw['cwd_from'] = CwdRequest(active, CwdRequestType.root)
         else:
             kw['cwd'] = opts.cwd
+        if kw['cwd_from'] is not None and rc_from_window is not None:
+            kw['cwd_from'].rc_from_window_id = rc_from_window.id
     if opts.location != 'default':
         kw['location'] = opts.location
     if opts.copy_colors and active:
@@ -537,9 +552,10 @@ def launch(
                         elif x == '@last-line-on-screen':
                             x = str(screen.visual_line(screen.lines - 1) or '')
             final_cmd.append(x)
-        exe = which(final_cmd[0])
-        if exe:
-            final_cmd[0] = exe
+        if rc_from_window is None and final_cmd:
+            exe = which(final_cmd[0])
+            if exe:
+                final_cmd[0] = exe
         kw['cmd'] = final_cmd
     if force_window_launch and opts.type not in non_window_launch_types:
         opts.type = 'window'
@@ -563,6 +579,8 @@ def launch(
     else:
         if opts.hold:
             cmd = kw['cmd'] or [shell_path]
+            if not os.path.isabs(cmd[0]):
+                cmd[0] = which(cmd[0]) or cmd[0]
             kw['cmd'] = [kitten_exe(), '__hold_till_enter__'] + cmd
         if force_target_tab:
             tab = target_tab
@@ -570,14 +588,19 @@ def launch(
             tab = tab_for_window(boss, opts, target_tab)
         if tab is not None:
             watchers = load_watch_modules(opts.watcher)
-            new_window: Window = tab.new_window(env=env or None, watchers=watchers or None, is_clone_launch=is_clone_launch, **kw)
+            with Window.set_ignore_focus_changes_for_new_windows(opts.keep_focus):
+                new_window: Window = tab.new_window(
+                    env=env or None, watchers=watchers or None, is_clone_launch=is_clone_launch, **kw)
             if spacing:
                 patch_window_edges(new_window, spacing)
                 tab.relayout()
             if opts.color:
                 apply_colors(new_window, opts.color)
-            if opts.keep_focus and active:
-                boss.set_active_window(active, switch_os_window_if_needed=True, for_keep_focus=True)
+            if opts.keep_focus:
+                if active:
+                    boss.set_active_window(active, switch_os_window_if_needed=True, for_keep_focus=True)
+                if not Window.initial_ignore_focus_changes_context_manager_in_operation:
+                    new_window.ignore_focus_changes = False
             if opts.logo:
                 new_window.set_logo(opts.logo, opts.logo_position or '', opts.logo_alpha)
             if opts.type == 'overlay-main':
@@ -586,11 +609,30 @@ def launch(
     return None
 
 
+def launch(
+    boss: Boss,
+    opts: LaunchCLIOptions,
+    args: List[str],
+    target_tab: Optional[Tab] = None,
+    force_target_tab: bool = False,
+    active: Optional[Window] = None,
+    is_clone_launch: str = '',
+    rc_from_window: Optional[Window] = None,
+) -> Optional[Window]:
+    active = active or boss.active_window_for_cwd
+    if opts.keep_focus and active:
+        orig, active.ignore_focus_changes = active.ignore_focus_changes, True
+    try:
+        return _launch(boss, opts, args, target_tab, force_target_tab, active, is_clone_launch, rc_from_window)
+    finally:
+        if opts.keep_focus and active:
+            active.ignore_focus_changes = orig
+
 @run_once
 def clone_safe_opts() -> FrozenSet[str]:
     return frozenset((
         'window_title', 'tab_title', 'type', 'keep_focus', 'cwd', 'env', 'hold',
-        'location', 'os_window_class', 'os_window_name', 'os_window_title',
+        'location', 'os_window_class', 'os_window_name', 'os_window_title', 'os_window_state',
         'logo', 'logo_position', 'logo_alpha', 'color', 'spacing',
     ))
 

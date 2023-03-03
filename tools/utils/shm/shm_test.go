@@ -3,10 +3,10 @@
 package shm
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io/fs"
-	"math/rand"
 	"os"
 	"reflect"
 	"testing"
@@ -23,6 +23,10 @@ func TestSHM(t *testing.T) {
 	}
 
 	copy(mm.Slice(), data)
+	err = mm.Flush()
+	if err != nil {
+		t.Fatalf("Failed to msync() with error: %v", err)
+	}
 	err = mm.Close()
 	if err != nil {
 		t.Fatalf("Failed to close with error: %v", err)

@@ -545,6 +545,9 @@ for the operating system. Various special values are supported:
 :code:`*`
     copy the match to the primary selection (on systems that support primary selections)
 
+:code:`@NAME`
+    copy the match to the specified buffer, e.g. :code:`@a`
+
 :code:`default`
     run the default open program.
 
@@ -592,7 +595,7 @@ example:
 :code:`kitty +kitten hints --type=linenum --linenum-action=tab vim +{line} {path}`
 will open the matched path at the matched line number in vim in
 a new kitty tab. Note that in order to use :option:`--program` to copy or paste
-text, you need to use the special value :code:`self`.
+the provided arguments, you need to use the special value :code:`self`.
 
 
 --url-prefixes
@@ -746,15 +749,24 @@ def linenum_handle_result(args: List[str], data: Dict[str, Any], target_window_i
 
     if action == 'self':
         if w is not None:
-            is_copy_action = cmd[0] in ('-', '@', '*')
-            if is_copy_action:
-                text = ' '.join(cmd[1:])
-                if cmd[0] == '-':
-                    w.paste_bytes(text)
-                elif cmd[0] == '@':
-                    set_clipboard_string(text)
-                elif cmd[0] == '*':
-                    set_primary_selection(text)
+            def is_copy_action(s: str) -> bool:
+                return s in ('-', '@', '*') or s.startswith('@')
+
+            programs = list(filter(is_copy_action, data['programs'] or ()))
+            # keep for backward compatibility, previously option `--program` does not need to be specified to perform copy actions
+            if is_copy_action(cmd[0]):
+                programs.append(cmd.pop(0))
+            if programs:
+                text = ' '.join(cmd)
+                for program in programs:
+                    if program == '-':
+                        w.paste_bytes(text)
+                    elif program == '@':
+                        set_clipboard_string(text)
+                    elif program == '*':
+                        set_primary_selection(text)
+                    elif program.startswith('@'):
+                        boss.set_clipboard_buffer(program[1:], text)
             else:
                 import shlex
                 text = ' '.join(shlex.quote(arg) for arg in cmd)
@@ -811,10 +823,13 @@ def handle_result(args: List[str], data: Dict[str, Any], target_window_id: int, 
             w = boss.window_id_map.get(target_window_id)
             if w is not None:
                 w.paste_text(joined_text())
-        elif program == '@':
-            set_clipboard_string(joined_text())
         elif program == '*':
             set_primary_selection(joined_text())
+        elif program.startswith('@'):
+            if program == '@':
+                set_clipboard_string(joined_text())
+            else:
+                boss.set_clipboard_buffer(program[1:], joined_text())
         else:
             from kitty.conf.utils import to_cmdline
             cwd = data['cwd']

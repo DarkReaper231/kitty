@@ -168,6 +168,10 @@ func New(loop *loop.Loop, r RlInit) *Readline {
 	return ans
 }
 
+func (self *Readline) SetPrompt(prompt string) {
+	self.prompt = self.make_prompt(prompt, false)
+}
+
 func (self *Readline) Shutdown() {
 	self.history.Shutdown()
 }
@@ -252,6 +256,10 @@ func (self *Readline) TextAfterCursor() string {
 
 func (self *Readline) AllText() string {
 	return self.all_text()
+}
+
+func (self *Readline) SetText(text string) {
+	self.set_text(text)
 }
 
 func (self *Readline) MoveCursorToEnd() bool {

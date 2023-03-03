@@ -6,10 +6,13 @@ package shm
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"strings"
 	"unsafe"
+
+	"kitty/tools/utils"
 
 	"golang.org/x/sys/unix"
 )
@@ -63,6 +66,7 @@ func shm_open(name string, flags, perm int) (ans *os.File, err error) {
 
 type syscall_based_mmap struct {
 	f        *os.File
+	pos      int64
 	region   []byte
 	unlinked bool
 }
@@ -86,6 +90,13 @@ func syscall_mmap(f *os.File, size uint64, access AccessFlags, truncate bool) (M
 func (self *syscall_based_mmap) Name() string {
 	return self.f.Name()
 }
+func (self *syscall_based_mmap) Stat() (fs.FileInfo, error) {
+	return self.f.Stat()
+}
+
+func (self *syscall_based_mmap) Flush() error {
+	return unix.Msync(self.region, unix.MS_SYNC)
+}
 
 func (self *syscall_based_mmap) Slice() []byte {
 	return self.region
@@ -108,6 +119,26 @@ func (self *syscall_based_mmap) Unlink() (err error) {
 	return shm_unlink(self.Name())
 }
 
+func (self *syscall_based_mmap) Seek(offset int64, whence int) (ret int64, err error) {
+	switch whence {
+	case io.SeekStart:
+		self.pos = offset
+	case os.SEEK_END:
+		self.pos = int64(len(self.region)) + offset
+	case os.SEEK_CUR:
+		self.pos += offset
+	}
+	return self.pos, nil
+}
+
+func (self *syscall_based_mmap) Read(b []byte) (n int, err error) {
+	return Read(self, b)
+}
+
+func (self *syscall_based_mmap) Write(b []byte) (n int, err error) {
+	return Write(self, b)
+}
+
 func (self *syscall_based_mmap) IsFileSystemBacked() bool { return false }
 func (self *syscall_based_mmap) FileSystemName() string   { return "" }
 
@@ -124,7 +155,7 @@ func create_temp(pattern string, size uint64) (ans MMap, err error) {
 	var f *os.File
 	try := 0
 	for {
-		name := prefix + next_random() + suffix
+		name := prefix + utils.RandomFilename() + suffix
 		if len(name) > SHM_NAME_MAX {
 			return nil, ErrPatternTooLong
 		}
@@ -148,6 +179,14 @@ func Open(name string, size uint64) (MMap, error) {
 	ans, err := shm_open(name, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
+	}
+	if size == 0 {
+		s, err := ans.Stat()
+		if err != nil {
+			ans.Close()
+			return nil, fmt.Errorf("Failed to stat SHM file with error: %w", err)
+		}
+		size = uint64(s.Size())
 	}
 	return syscall_mmap(ans, size, READ, false)
 }

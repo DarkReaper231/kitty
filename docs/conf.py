@@ -65,6 +65,10 @@ extensions = [
 
 # URL for OpenGraph tags
 ogp_site_url = website_url()
+# OGP needs a PNG image because of: https://github.com/wpilibsuite/sphinxext-opengraph/issues/96
+ogp_social_cards = {
+    'image': '../logo/kitty.png'
+}
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -102,8 +106,17 @@ rst_prolog = '''
 '''.replace('VERSION', str_version)
 smartquotes_action = 'qe'  # educate quotes and ellipses but not dashes
 
+def go_version(go_mod_path: str) -> str:  # {{{
+    with open(go_mod_path) as f:
+        for line in f:
+            if line.startswith('go '):
+                return line.strip().split()[1]
+    raise SystemExit(f'No Go version in {go_mod_path}')
+# }}}
+
 string_replacements = {
     '_kitty_install_cmd': 'curl -L https://sw.kovidgoyal.net/kitty/installer.sh | sh /dev/stdin',
+    '_build_go_version': go_version('../go.mod'),
 }
 
 
@@ -213,15 +226,16 @@ def commit_role(
 
 # CLI docs {{{
 def write_cli_docs(all_kitten_names: Iterable[str]) -> None:
-    from kittens.ssh.copy import option_text
-    from kittens.ssh.options.definition import copy_message
+    from kittens.ssh.main import copy_message, option_text
     from kitty.cli import option_spec_as_rst
-    from kitty.launch import options_spec as launch_options_spec
     with open('generated/ssh-copy.rst', 'w') as f:
         f.write(option_spec_as_rst(
             appname='copy', ospec=option_text, heading_char='^',
             usage='file-or-dir-to-copy ...', message=copy_message
         ))
+    del sys.modules['kittens.ssh.main']
+
+    from kitty.launch import options_spec as launch_options_spec
     with open('generated/launch.rst', 'w') as f:
         f.write(option_spec_as_rst(
             appname='launch', ospec=launch_options_spec, heading_char='_',
@@ -504,7 +518,7 @@ def write_conf_docs(app: Any, all_kitten_names: Iterable[str]) -> None:
 
         conf_name = re.sub(r'^kitten-', '', name) + '.conf'
         with open(f'generated/conf/{conf_name}', 'w', encoding='utf-8') as f:
-            text = '\n'.join(definition.as_conf())
+            text = '\n'.join(definition.as_conf(commented=True))
             print(text, file=f)
 
     from kitty.options.definition import definition
@@ -512,9 +526,9 @@ def write_conf_docs(app: Any, all_kitten_names: Iterable[str]) -> None:
 
     from kittens.runner import get_kitten_conf_docs
     for kitten in all_kitten_names:
-        definition = get_kitten_conf_docs(kitten)
-        if definition:
-            generate_default_config(definition, f'kitten-{kitten}')
+        defn = get_kitten_conf_docs(kitten)
+        if defn is not None:
+            generate_default_config(defn, f'kitten-{kitten}')
 
     from kitty.actions import as_rst
     with open('generated/actions.rst', 'w', encoding='utf-8') as f:

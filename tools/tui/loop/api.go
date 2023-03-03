@@ -58,7 +58,8 @@ type Loop struct {
 	pending_writes                         []*write_msg
 	on_SIGTSTP                             func() error
 
-	// Send strings to this channel to queue writes in a thread safe way
+	// Suspend the loop restoring terminal state. Call the return resume function to restore the loop
+	Suspend func() (func() error, error)
 
 	// Callbacks
 
@@ -193,6 +194,14 @@ func (self *Loop) KillIfSignalled() {
 func (self *Loop) Println(args ...any) {
 	self.QueueWriteString(fmt.Sprint(args...))
 	self.QueueWriteString("\r\n")
+}
+
+func (self *Loop) SaveCursorPosition() {
+	self.QueueWriteString("\x1b7")
+}
+
+func (self *Loop) RestoreCursorPosition() {
+	self.QueueWriteString("\x1b8")
 }
 
 func (self *Loop) Printf(format string, args ...any) {
@@ -333,8 +342,18 @@ func (self *Loop) AllowLineWrapping(allow bool) {
 	}
 }
 
+func (self *Loop) SetWindowTitle(title string) {
+	title = strings.ReplaceAll(title, "\033", "")
+	title = strings.ReplaceAll(title, "\x9c", "")
+	self.QueueWriteString("\033]2;" + title + "\033\\")
+}
+
 func (self *Loop) ClearScreen() {
 	self.QueueWriteString("\x1b[H\x1b[2J")
+}
+
+func (self *Loop) SendOverlayReady() {
+	self.QueueWriteString("\x1bP@kitty-overlay-ready|\x1b\\")
 }
 
 func (self *Loop) Quit(exit_code int) {

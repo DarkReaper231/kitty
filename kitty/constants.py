@@ -22,7 +22,7 @@ class Version(NamedTuple):
 
 appname: str = 'kitty'
 kitty_face = '🐱'
-version: Version = Version(0, 26, 5)
+version: Version = Version(0, 27, 1)
 str_version: str = '.'.join(map(str, version))
 _plat = sys.platform.lower()
 is_macos: bool = 'darwin' in _plat
@@ -79,6 +79,7 @@ def kitty_exe() -> str:
     return os.path.join(rpath, 'kitty')
 
 
+@run_once
 def kitten_exe() -> str:
     return os.path.join(os.path.dirname(kitty_exe()), 'kitten')
 

@@ -39,7 +39,7 @@ check_for_gl_error(void UNUSED *ret, const char *name, GLADapiproc UNUSED funcpt
 }
 
 void
-gl_init() {
+gl_init(void) {
     static bool glad_loaded = false;
     if (!glad_loaded) {
         int gl_version = gladLoadGL(glfwGetProcAddress);
@@ -71,7 +71,7 @@ update_surface_size(int w, int h, GLuint offscreen_texture_id) {
     glViewport(0, 0, w, h);
     if (offscreen_texture_id) {
         glBindTexture(GL_TEXTURE_2D, offscreen_texture_id);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB_ALPHA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
     }
 }
 
@@ -306,7 +306,7 @@ add_located_attribute_to_vao(ssize_t vao_idx, GLint aloc, GLint size, GLenum dat
             break;
     }
     if (divisor) {
-        glVertexAttribDivisor(aloc, divisor);
+        glVertexAttribDivisorARB(aloc, divisor);
     }
     unbind_buffer(buf);
 }

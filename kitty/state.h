@@ -15,6 +15,7 @@
 typedef enum { LEFT_EDGE, TOP_EDGE, RIGHT_EDGE, BOTTOM_EDGE } Edge;
 typedef enum { RESIZE_DRAW_STATIC, RESIZE_DRAW_SCALED, RESIZE_DRAW_BLANK, RESIZE_DRAW_SIZE } ResizeDrawStrategy;
 typedef enum { REPEAT_MIRROR, REPEAT_CLAMP, REPEAT_DEFAULT } RepeatStrategy;
+typedef enum { WINDOW_NORMAL, WINDOW_FULLSCREEN, WINDOW_MAXIMIZED, WINDOW_MINIMIZED } WindowState;
 
 typedef struct {
     char_type string[16];
@@ -47,6 +48,8 @@ typedef struct {
     WindowTitleIn macos_show_window_title_in;
     char *bell_path;
     float background_opacity, dim_opacity;
+    float text_contrast, text_gamma_adjustment;
+    bool text_old_gamma;
 
     char *background_image, *default_window_logo;
     BackgroundImageLayout background_image_layout;
@@ -282,6 +285,7 @@ void focus_os_window(OSWindow *w, bool also_raise, const char *activation_token)
 void run_with_activation_token_in_os_window(OSWindow *w, PyObject *callback);
 void set_os_window_title(OSWindow *w, const char *title);
 OSWindow* os_window_for_kitty_window(id_type);
+OSWindow* os_window_for_id(id_type);
 OSWindow* add_os_window(void);
 OSWindow* current_os_window(void);
 void os_window_regions(OSWindow*, Region *main, Region *tab_bar);

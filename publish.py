@@ -20,7 +20,7 @@ import tempfile
 import time
 from contextlib import contextmanager, suppress
 from http.client import HTTPResponse, HTTPSConnection
-from typing import Any, Callable, Dict, Generator, Iterable, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple, Union
 from urllib.parse import urlencode, urlparse
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -62,6 +62,10 @@ def call(*cmd: str, cwd: Optional[str] = None, echo: bool = False) -> None:
 
 
 def run_build(args: Any) -> None:
+    import runpy
+
+    m = runpy.run_path('./setup.py', run_name='__publish__')
+    vcs_rev: str = m['get_vcs_rev']()
 
     def run_with_retry(cmd: str) -> None:
         try:
@@ -78,9 +82,9 @@ def run_build(args: Any) -> None:
 
     for x in ('64', '32', 'arm64'):
         prefix = f'python ../bypy linux --arch {x} '
-        run_with_retry(prefix + 'program --non-interactive')
+        run_with_retry(prefix + f'program --non-interactive --extra-program-data "{vcs_rev}"')
         call(prefix + 'shutdown', echo=True)
-    run_with_retry('python ../bypy macos program --sign-installers --notarize --non-interactive')
+    run_with_retry(f'python ../bypy macos program --sign-installers --notarize --non-interactive --extra-program-data "{vcs_rev}"')
     call('python ../bypy macos shutdown', echo=True)
     call('./setup.py build-static-binaries')
 
@@ -183,11 +187,12 @@ def run_sdist(args: Any) -> None:
 
 class ReadFileWithProgressReporting(io.FileIO):  # {{{
     def __init__(self, path: str):
-        io.FileIO.__init__(self, path, 'rb')
+        super().__init__(path, 'rb')
         self.seek(0, os.SEEK_END)
         self._total = self.tell()
         self.seek(0)
         self.start_time = time.monotonic()
+        print('Starting upload of:', os.path.basename(path), 'size:', self._total)
 
     def __len__(self) -> int:
         return self._total
@@ -257,6 +262,7 @@ class GitHub:  # {{{
             'Authorization': self.auth,
             'Accept': 'application/vnd.github+json',
             'User-Agent': 'kitty',
+            'X-GitHub-Api-Version': '2022-11-28',
         }
         if params:
             url += '?' + urlencode(params)
@@ -304,7 +310,7 @@ class GitHub:  # {{{
                 self.error(failure_msg, 'with error:', e)
             self.error(f'Retrying after {sleep_between_tries} seconds')
             time.sleep(sleep_between_tries)
-        return None
+        raise SystemExit('All retries failed, giving up')
 
     def patch(self, url: str, fail_msg: str, **data: str) -> None:
         self.make_request_with_retries(url, data, method='PATCH', failure_msg=fail_msg)
@@ -319,66 +325,44 @@ class GitHub:  # {{{
             ' For how to install nightly builds, see: https://sw.kovidgoyal.net/kitty/binary/#customizing-the-installation'
         )
 
-    def delete_asset(self, url: str, fname: str) -> None:
-        self.make_request_with_retries(
-            url, method='DELETE', num_tries=5, sleep_between_tries=2,
-            success_codes=(204, 404),
-            failure_msg=f'Failed to delete {fname} from GitHub')
-
     def __call__(self) -> None:
         # See https://docs.github.com/en/rest/releases/assets#upload-a-release-asset
-        # self.clean_older_releases(releases)
         release = self.create_release()
         upload_url = release['upload_url'].partition('{')[0]
-        asset_url = f'{self.url_base}/assets/{{}}'
-        existing_assets = self.existing_assets(release['id'])
+        all_assest_for_release = self.existing_assets_for_release(release)
+        assets_by_fname = {a['name']:a for a in all_assest_for_release}
 
-        def delete_asset(asset_id: str) -> None:
-            self.delete_asset(asset_url.format(asset_id), fname)
+        def delete_asset(asset: Dict[str, Any], allow_not_found: bool = True) -> None:
+            success_codes = [204]
+            if allow_not_found:
+                success_codes.append(404)
+            self.make_request_with_retries(
+                asset['url'], method='DELETE', num_tries=5, sleep_between_tries=2, success_codes=tuple(success_codes),
+                failure_msg=f'Failed to delete {fname} from GitHub')
 
         def upload_with_retries(path: str, desc: str, num_tries: int = 8, sleep_time: float = 60.0) -> None:
             fname = os.path.basename(path)
             if self.is_nightly:
                 fname = fname.replace(version, 'nightly')
-            if fname in existing_assets:
-                self.info(f'Deleting {fname} from GitHub with id: {existing_assets[fname]}')
-                delete_asset(existing_assets.pop(fname))
+            if fname in assets_by_fname:
+                self.info(f'Deleting {fname} from GitHub with id: {assets_by_fname[fname]["id"]}')
+                delete_asset(assets_by_fname.pop(fname))
             params = {'name': fname, 'label': desc}
-
-            def handle_failure(r: HTTPResponse) -> None:
-                try:
-                    asset_id = json.loads(r.read())['id']
-                except Exception:
-                    try:
-                        asset_id = self.existing_assets(release['id'])[fname]
-                    except KeyError:
-                        asset_id = 0
-                if asset_id:
-                    self.info(f'Deleting {fname} from GitHub with id: {asset_id}')
-                    delete_asset(asset_id)
-
 
             self.make_request_with_retries(
                 upload_url, upload_path=path, params=params, num_tries=num_tries, sleep_between_tries=sleep_time,
-                failure_msg=f'Failed to upload file: {fname}', success_codes=(201,), failure_callback=handle_failure
+                failure_msg=f'Failed to upload file: {fname}', success_codes=(201,),
             )
 
         if self.is_nightly:
-            for fname in tuple(existing_assets):
-                self.info(f'Deleting {fname} from GitHub with id: {existing_assets[fname]}')
-                delete_asset(existing_assets.pop(fname))
-            self.update_nightly_description(release['id'])
+            for fname in tuple(assets_by_fname):
+                self.info(f'Deleting {fname} from GitHub with id: {assets_by_fname[fname]["id"]}')
+                delete_asset(assets_by_fname.pop(fname), allow_not_found=False)
         for path, desc in self.files.items():
             self.info('')
             upload_with_retries(path, desc)
-
-    def clean_older_releases(self, releases: Iterable[Dict[str, Any]]) -> None:
-        for release in releases:
-            if release.get('assets') and release['tag_name'] != self.current_tag_name:
-                self.info(f'\nDeleting old released installers from: {release["tag_name"]}')
-                for asset in release['assets']:
-                    self.delete_asset(
-                        f'{self.url_base}/assets/{asset["id"]}', asset['name'])
+        if self.is_nightly:
+            self.update_nightly_description(release['id'])
 
     def print_failed_response_details(self, r: HTTPResponse, msg: str) -> None:
         self.error(msg, f'\nStatus Code: {r.status} {r.reason}')
@@ -394,10 +378,13 @@ class GitHub:  # {{{
         self.print_failed_response_details(r, msg)
         raise SystemExit(1)
 
-    def existing_assets(self, release_id: str) -> Dict[str, str]:
-        url = f'{self.url_base}/{release_id}/assets'
-        d = self.make_request_with_retries(url, failure_msg='Failed to get assets for release', return_data=True)
-        return {asset['name']: asset['id'] for asset in d}
+    def existing_assets_for_release(self, release: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if 'assets' in release:
+            d: List[Dict[str, Any]] = release['assets']
+        else:
+            d = self.make_request_with_retries(
+                release['assets_url'], params={'per_page': '64'}, failure_msg='Failed to get assets for release', return_data=True)
+        return d
 
     def create_release(self) -> Dict[str, Any]:
         ' Create a release on GitHub or if it already exists, return the existing release '

@@ -46,6 +46,7 @@ class Launch(RemoteCommand):
     os_window_title/str: Title for OS Window
     os_window_name/str: WM_NAME for OS Window
     os_window_class/str: WM_CLASS for OS Window
+    os_window_state/choices.normal.fullscreen.maximized.minimized: The initial state for OS Window
     color/list.str: list of color specifications such as foreground=red
     watcher/list.str: list of paths to watcher files
     '''
@@ -91,7 +92,7 @@ instead of the active tab
             target_tab = tabs[0]
         elif payload_get('type') not in ('background', 'os-window', 'tab', 'window'):
             return None
-        w = do_launch(boss, opts, payload_get('args') or [], target_tab=target_tab)
+        w = do_launch(boss, opts, payload_get('args') or [], target_tab=target_tab, rc_from_window=window)
         return None if payload_get('no_response') else str(getattr(w, 'id', 0))
 
 
