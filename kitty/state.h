@@ -46,7 +46,7 @@ typedef struct {
     unsigned int macos_option_as_alt;
     float macos_thicken_font;
     WindowTitleIn macos_show_window_title_in;
-    char *bell_path;
+    char *bell_path, *bell_theme;
     float background_opacity, dim_opacity;
     float text_contrast, text_gamma_adjustment;
     bool text_old_gamma;

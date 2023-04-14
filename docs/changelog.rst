@@ -38,7 +38,17 @@ Detailed list of changes
 0.28.0 [future]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- Text rendering: Use sRGB correct linear gamma blending for nicer font rendering and better color accuracy with transparent windows. See the option :opt:`text_composition_strategy` for details. The obsolete :opt:`macos_thicken_font` will make the font too thick and needs to be removed manually if it is configured. (:pull:`5969`)
+- **Text rendering change**: Use sRGB correct linear gamma blending for nicer font
+  rendering and better color accuracy with transparent windows.
+  See the option :opt:`text_composition_strategy` for details.
+  The obsolete :opt:`macos_thicken_font` will make the font too thick and needs to be removed manually
+  if it is configured. (:pull:`5969`)
+
+- icat kitten: Support display of images inside tmux >= 3.3 (:pull:`5664`)
+
+- Graphics protocol: Add support for displaying images inside programs that do not support the protocol such as vim and tmux (:pull:`5664`)
+
+- diff kitten: Add support for selecting multi-line text with the mouse
 
 - Fix a regression in 0.27.0 that broke ``kitty @ set-font-size 0`` (:iss:`5992`)
 
@@ -46,7 +56,7 @@ Detailed list of changes
 
 - When changing the cursor color via escape codes or remote control to a fixed color, do not reset cursor_text_color (:iss:`5994`)
 
-- Input Method Extensions: Fix incorrect rendering of IME in-progress and committed text in some situations (:pull:`6049`)
+- Input Method Extensions: Fix incorrect rendering of IME in-progress and committed text in some situations (:pull:`6049`, :pull:`6087`)
 
 - Linux: Reduce minimum required OpenGL version from 3.3 to 3.1 + extensions (:iss:`2790`)
 
@@ -64,13 +74,25 @@ Detailed list of changes
 
 - macOS: Fix the maximized window not taking up full space when the title bar is hidden or when :opt:`resize_in_steps` is configured (:iss:`6021`)
 
+- Linux: A new option :opt:`linux_bell_theme` to control which sound theme is used for the bell sound (:pull:`4858`)
+
 - ssh kitten: Change the syntax of glob patterns slightly to match common usage
-  elsewhere. Now the syntax is the same a "extendedglob" in most shells.
+  elsewhere. Now the syntax is the same as "extendedglob" in most shells.
 
 - hints kitten: Allow copying matches to named buffers (:disc:`6073`)
 
 - Fix overlay windows not inheriting the per-window padding and margin settings
   of their parents (:iss:`6063`)
+
+- Wayland KDE: Fix selecting in un-focused OS window not working correctly (:iss:`6095`)
+
+- Linux X11: Fix a crash if the X server requests clipboard data after we have relinquished the clipboard (:iss:`5650`)
+
+- Allow stopping of URL detection at newlines via :opt:`url_excluded_characters` (:iss:`6122`)
+
+- Linux Wayland: Fix animated images not being animated continuously (:iss:`6126`)
+
+- Keyboard input: Fix text not being reported as unicode codepoints for multi-byte characters in the kitty keyboard protocol (:iss:`6167`)
 
 
 0.27.1 [2023-02-07]

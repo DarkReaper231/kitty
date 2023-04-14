@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"runtime/debug"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -24,7 +23,7 @@ func new_loop() *Loop {
 	l := Loop{controlling_term: nil, timers_temp: make([]*timer, 4)}
 	l.terminal_options.alternate_screen = true
 	l.terminal_options.restore_colors = true
-	l.terminal_options.kitty_keyboard_mode = 0b11111
+	l.terminal_options.kitty_keyboard_mode = DISAMBIGUATE_KEYS | REPORT_ALTERNATE_KEYS | REPORT_ALL_KEYS_AS_ESCAPE_CODES | REPORT_TEXT_WITH_KEYS
 	l.escape_code_parser.HandleCSI = l.handle_csi
 	l.escape_code_parser.HandleOSC = l.handle_osc
 	l.escape_code_parser.HandleDCS = l.handle_dcs
@@ -33,6 +32,8 @@ func new_loop() *Loop {
 	l.escape_code_parser.HandlePM = l.handle_pm
 	l.escape_code_parser.HandleRune = l.handle_rune
 	l.escape_code_parser.HandleEndOfBracketedPaste = l.handle_end_of_bracketed_paste
+	l.style_cache = make(map[string]func(...any) string)
+	l.style_ctx.AllowEscapeCodes = true
 	return &l
 }
 
@@ -44,10 +45,6 @@ func kill_self(sig unix.Signal) {
 	unix.Kill(os.Getpid(), sig)
 	// Give the signal time to be delivered
 	time.Sleep(20 * time.Millisecond)
-}
-
-func (self *Loop) print_stack() {
-	self.DebugPrintln(string(debug.Stack()))
 }
 
 func (self *Loop) update_screen_size() error {
@@ -73,8 +70,52 @@ func (self *Loop) handle_csi(raw []byte) error {
 	if ke != nil {
 		return self.handle_key_event(ke)
 	}
+	sz, err := self.ScreenSize()
+	if err == nil {
+		me := MouseEventFromCSI(csi, sz)
+		if me != nil {
+			return self.handle_mouse_event(me)
+		}
+	}
 	if self.OnEscapeCode != nil {
 		return self.OnEscapeCode(CSI, raw)
+	}
+	return nil
+}
+
+func is_click(a, b *MouseEvent) bool {
+	if a.Event_type != MOUSE_PRESS || b.Event_type != MOUSE_RELEASE {
+		return false
+	}
+	x := a.Cell.X - b.Cell.X
+	y := a.Cell.Y - b.Cell.Y
+	return x*x+y*y <= 4
+
+}
+
+func (self *Loop) handle_mouse_event(ev *MouseEvent) error {
+	if self.OnMouseEvent != nil {
+		err := self.OnMouseEvent(ev)
+		if err != nil {
+			return err
+		}
+		switch ev.Event_type {
+		case MOUSE_PRESS:
+			self.pending_mouse_events.WriteAllAndDiscardOld(*ev)
+		case MOUSE_RELEASE:
+			self.pending_mouse_events.WriteAllAndDiscardOld(*ev)
+			if self.pending_mouse_events.Len() > 1 {
+				events := self.pending_mouse_events.ReadAll()
+				if is_click(&events[len(events)-2], &events[len(events)-1]) {
+					e := events[len(events)-1]
+					e.Event_type = MOUSE_CLICK
+					err = self.OnMouseEvent(&e)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -229,6 +270,7 @@ func (self *Loop) run() (err error) {
 	}
 
 	self.keep_going = true
+	self.pending_mouse_events = utils.NewRingBuffer[MouseEvent](4)
 	tty_read_channel := make(chan []byte)
 	tty_write_channel := make(chan *write_msg, 1) // buffered so there is no race between initial queueing and startup of writer thread
 	write_done_channel := make(chan IdType)
@@ -239,6 +281,7 @@ func (self *Loop) run() (err error) {
 	self.death_signal = SIGNULL
 	self.escape_code_parser.Reset()
 	self.exit_code = 0
+	self.atomic_update_active = false
 	self.timers = make([]*timer, 0, 1)
 	no_timeout_channel := make(<-chan time.Time)
 	finalizer := ""

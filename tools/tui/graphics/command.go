@@ -8,32 +8,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 
 	"kitty/tools/tui/loop"
 	"kitty/tools/utils"
-	"kitty/tools/utils/shm"
 )
 
 var _ = fmt.Print
-
-const TempTemplate = "kitty-tty-graphics-protocol-*"
-
-func CreateTemp() (*os.File, error) {
-	return os.CreateTemp("", TempTemplate)
-}
-
-func CreateTempInRAM() (*os.File, error) {
-	if shm.SHM_DIR != "" {
-		f, err := os.CreateTemp(shm.SHM_DIR, TempTemplate)
-		if err == nil {
-			return f, err
-		}
-	}
-	return CreateTemp()
-}
 
 // Enums {{{
 type GRT_a int
@@ -258,6 +240,28 @@ func GRT_C_from_string(a string) (ans GRT_C, err error) {
 	return
 }
 
+type GRT_U int
+
+const (
+	GRT_no_unicode_placeholder GRT_U = iota
+	GRT_create_unicode_placeholder
+)
+
+func (self GRT_U) String() string {
+	return strconv.Itoa(int(self))
+}
+
+func GRT_U_from_string(a string) (ans GRT_U, err error) {
+	switch a {
+	case "0":
+	case "1":
+		ans = GRT_create_unicode_placeholder
+	default:
+		err = fmt.Errorf("Not a valid cursor movement value: %#v", a)
+	}
+	return
+}
+
 type CompositionMode int
 
 const (
@@ -437,12 +441,16 @@ type GraphicsCommand struct {
 	m GRT_m
 	C GRT_C
 	d GRT_d
+	U GRT_U
 
 	s, v, S, O, x, y, w, h, X, Y, c, r uint64
 
 	i, I, p uint32
 
 	z int32
+
+	WrapPrefix, WrapSuffix   string
+	EncodeSerializedDataFunc func(string) string
 
 	response_message string
 }
@@ -464,6 +472,7 @@ func (self *GraphicsCommand) serialize_non_default_fields() (ans []string) {
 	write_key('o', self.o, null.o)
 	write_key('m', self.m, null.m)
 	write_key('C', self.C, null.C)
+	write_key('U', self.U, null.U)
 	write_key('d', self.d, null.d)
 
 	write_key('s', self.s, null.s)
@@ -488,27 +497,46 @@ func (self *GraphicsCommand) serialize_non_default_fields() (ans []string) {
 }
 
 func (self GraphicsCommand) String() string {
-	return "GraphicsCommand(" + strings.Join(self.serialize_non_default_fields(), ", ") + ")"
-}
-
-func (self *GraphicsCommand) WriteMetadata(o io.StringWriter) (err error) {
-	items := self.serialize_non_default_fields()
-	_, err = o.WriteString(strings.Join(items, ","))
-	return
+	ans := "GraphicsCommand(" + strings.Join(self.serialize_non_default_fields(), ", ")
+	if self.response_message != "" {
+		ans += fmt.Sprintf(", response=%#v", self.response_message)
+	}
+	return ans + ")"
 }
 
 func (self *GraphicsCommand) serialize_to(buf io.StringWriter, chunk string) (err error) {
-	ws := func(s string) {
-		_, err = buf.WriteString(s)
+	var ws func(string)
+	if self.EncodeSerializedDataFunc == nil {
+		ws = func(s string) {
+			_, err = buf.WriteString(s)
+		}
+	} else {
+		ws = func(s string) {
+			_, err = buf.WriteString(self.EncodeSerializedDataFunc(s))
+		}
+	}
+	if self.WrapPrefix != "" {
+		_, err = buf.WriteString(self.WrapPrefix)
+		if err != nil {
+			return err
+		}
+		if self.WrapSuffix != "" {
+			defer func() {
+				if err == nil {
+					_, err = buf.WriteString(self.WrapSuffix)
+				}
+			}()
+		}
 	}
 	ws("\033_G")
 	if err == nil {
-		err = self.WriteMetadata(buf)
+		items := self.serialize_non_default_fields()
+		ws(strings.Join(items, ","))
 		if err == nil {
 			if len(chunk) > 0 {
 				ws(";")
 				if err == nil {
-					_, err = buf.WriteString(chunk)
+					ws(chunk)
 				}
 			}
 			if err == nil {
@@ -569,7 +597,9 @@ func (self *GraphicsCommand) WriteWithPayloadTo(o io.StringWriter, payload []byt
 		if err != nil {
 			return err
 		}
-		gc = GraphicsCommand{q: self.q, a: self.a}
+		gc = GraphicsCommand{
+			q: self.q, a: self.a, WrapPrefix: self.WrapPrefix, WrapSuffix: self.WrapSuffix,
+			EncodeSerializedDataFunc: self.EncodeSerializedDataFunc}
 	}
 	return
 }
@@ -637,6 +667,8 @@ func (self *GraphicsCommand) SetString(key byte, value string) (err error) {
 		err = set_val(&self.m, GRT_m_from_string, value)
 	case 'C':
 		err = set_val(&self.C, GRT_C_from_string, value)
+	case 'U':
+		err = set_val(&self.U, GRT_U_from_string, value)
 	case 'd':
 		err = set_val(&self.d, GRT_d_from_string, value)
 	case 's':
@@ -776,6 +808,15 @@ func (self *GraphicsCommand) SetCursorMovement(c GRT_C) *GraphicsCommand {
 	return self
 }
 
+func (self *GraphicsCommand) UnicodePlaceholder() GRT_U {
+	return self.U
+}
+
+func (self *GraphicsCommand) SetUnicodePlaceholder(U GRT_U) *GraphicsCommand {
+	self.U = U
+	return self
+}
+
 func (self *GraphicsCommand) Format() GRT_f {
 	return self.f
 }
@@ -881,15 +922,6 @@ func (self *GraphicsCommand) TopEdge() uint64 {
 
 func (self *GraphicsCommand) SetTopEdge(y uint64) *GraphicsCommand {
 	self.y = y
-	return self
-}
-
-func (self *GraphicsCommand) SourceLeftEdge() uint64 {
-	return self.X
-}
-
-func (self *GraphicsCommand) SetSourceLeftEdge(x uint64) *GraphicsCommand {
-	self.X = x
 	return self
 }
 

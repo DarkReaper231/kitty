@@ -4,7 +4,6 @@ package utils
 
 import (
 	"fmt"
-	"sort"
 
 	"golang.org/x/exp/constraints"
 	"golang.org/x/exp/slices"
@@ -57,40 +56,58 @@ func Filter[T any](s []T, f func(x T) bool) []T {
 	return ans
 }
 
-func Map[T any](s []T, f func(x T) T) []T {
-	ans := make([]T, 0, len(s))
+func Map[T any, O any](f func(x T) O, s []T) []O {
+	ans := make([]O, 0, len(s))
 	for _, x := range s {
 		ans = append(ans, f(x))
 	}
 	return ans
 }
 
+func Repeat[T any](x T, n int) []T {
+	ans := make([]T, n)
+	for i := 0; i < n; i++ {
+		ans[i] = x
+	}
+	return ans
+}
+
 func Sort[T any](s []T, less func(a, b T) bool) []T {
-	sort.Slice(s, func(i, j int) bool { return less(s[i], s[j]) })
+	slices.SortFunc(s, less)
 	return s
 }
 
 func StableSort[T any](s []T, less func(a, b T) bool) []T {
-	sort.SliceStable(s, func(i, j int) bool { return less(s[i], s[j]) })
+	slices.SortStableFunc(s, less)
+	return s
+}
+
+func sort_with_key[T any, C constraints.Ordered](stable bool, s []T, key func(a T) C) []T {
+	type t struct {
+		key C
+		val T
+	}
+	temp := make([]t, len(s))
+	for i, x := range s {
+		temp[i].val, temp[i].key = x, key(x)
+	}
+	if stable {
+		slices.SortStableFunc(temp, func(a, b t) bool { return a.key < b.key })
+	} else {
+		slices.SortFunc(temp, func(a, b t) bool { return a.key < b.key })
+	}
+	for i, x := range temp {
+		s[i] = x.val
+	}
 	return s
 }
 
 func SortWithKey[T any, C constraints.Ordered](s []T, key func(a T) C) []T {
-	mem := make([]C, len(s))
-	for i, x := range s {
-		mem[i] = key(x)
-	}
-	sort.Slice(s, func(i, j int) bool { return mem[i] < mem[j] })
-	return s
+	return sort_with_key(false, s, key)
 }
 
 func StableSortWithKey[T any, C constraints.Ordered](s []T, key func(a T) C) []T {
-	mem := make([]C, len(s))
-	for i, x := range s {
-		mem[i] = key(x)
-	}
-	sort.SliceStable(s, func(i, j int) bool { return mem[i] < mem[j] })
-	return s
+	return sort_with_key(true, s, key)
 }
 
 func Max[T constraints.Ordered](a T, items ...T) (ans T) {
@@ -111,43 +128,6 @@ func Min[T constraints.Ordered](a T, items ...T) (ans T) {
 		}
 	}
 	return ans
-}
-
-func Index[T comparable](haystack []T, needle T) int {
-	for i, x := range haystack {
-		if x == needle {
-			return i
-		}
-	}
-	return -1
-}
-
-func Contains[T comparable](haystack []T, needle T) bool {
-	return Index(haystack, needle) > -1
-}
-
-// Keys returns the keys of the map m.
-// The keys will be an indeterminate order.
-func Keys[M ~map[K]V, K comparable, V any](m M) []K {
-	r := make([]K, len(m))
-	i := 0
-	for k := range m {
-		r[i] = k
-		i++
-	}
-	return r
-}
-
-// Values returns the values of the map m.
-// The values will be an indeterminate order.
-func Values[M ~map[K]V, K comparable, V any](m M) []V {
-	r := make([]V, len(m))
-	i := 0
-	for _, v := range m {
-		r[i] = v
-		i++
-	}
-	return r
 }
 
 func Memset[T any](dest []T, pattern ...T) []T {

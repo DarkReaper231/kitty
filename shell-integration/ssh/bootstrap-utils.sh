@@ -67,12 +67,12 @@ using_id() {
 }
 
 using_python() {
-    detect_python && output=$(command "$python" -c "import pwd, os; print(pwd.getpwuid(os.geteuid()).pw_shell)") \
+    detect_python && output=$(command "$python" -c "import pwd, os; print(pwd.getpwuid(os.geteuid()).pw_shell)" 2>/dev/null) \
     && login_shell="$output" && login_shell_is_ok
 }
 
 using_perl() {
-    detect_perl && output=$(command "$perl" -e 'my $shell = (getpwuid($<))[8]; print $shell') \
+    detect_perl && output=$(command "$perl" -e 'my $shell = (getpwuid($<))[8]; print $shell' 2>/dev/null) \
     && login_shell="$output" && login_shell_is_ok
 }
 
@@ -226,7 +226,7 @@ exec_login_shell() {
             ;;
         (*)
             # not blank
-            printf "%s" "$KITTY_SHELL_INTEGRATION" | command grep '\bno-rc\b' || exec_with_shell_integration
+            printf "%s" "$KITTY_SHELL_INTEGRATION" | command grep -q '\bno-rc\b' || exec_with_shell_integration
             # either no-rc or exec failed
             unset KITTY_SHELL_INTEGRATION
             ;;

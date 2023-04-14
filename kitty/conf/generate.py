@@ -442,8 +442,15 @@ def write_output(loc: str, defn: Definition) -> None:
             f.write(f'{c}\n')
 
 
-def go_type_data(parser_func: ParserFuncType, ctype: str) -> Tuple[str, str]:
+def go_type_data(parser_func: ParserFuncType, ctype: str, is_multiple: bool = False) -> Tuple[str, str]:
     if ctype:
+        if ctype == 'string':
+            if is_multiple:
+                return 'string', '[]string{val}, nil'
+            return 'string', 'val, nil'
+        if ctype.startswith('strdict_'):
+            _, rsep, fsep = ctype.split('_', 2)
+            return 'map[string]string', f'config.ParseStrDict(val, `{rsep}`, `{fsep}`)'
         return f'*{ctype}', f'Parse{ctype}(val)'
     p = parser_func.__name__
     if p == 'int':
@@ -454,15 +461,66 @@ def go_type_data(parser_func: ParserFuncType, ctype: str) -> Tuple[str, str]:
         return 'float64', 'strconv.ParseFloat(val, 10, 64)'
     if p == 'to_bool':
         return 'bool', 'config.StringToBool(val), nil'
+    if p == 'to_color':
+        return 'style.RGBA', 'style.ParseColor(val)'
+    if p == 'to_color_or_none':
+        return 'style.NullableColor', 'style.ParseColorOrNone(val)'
+    if p == 'positive_int':
+        return 'uint64', 'strconv.ParseUint(val, 10, 64)'
+    if p == 'positive_float':
+        return 'float64', 'config.PositiveFloat(val, 10, 64)'
+    if p == 'unit_float':
+        return 'float64', 'config.UnitFloat(val, 10, 64)'
+    if p == 'python_string':
+        return 'string', 'config.StringLiteral(val)'
     th = get_type_hints(parser_func)
     rettype = th['return']
     return {int: 'int64', str: 'string', float: 'float64'}[rettype], f'{p}(val)'
 
 
+mod_map = {
+		"shift":     "shift",
+		"⇧":         "shift",
+		"alt":       "alt",
+		"option":    "alt",
+		"opt":       "alt",
+		"⌥":         "alt",
+		"super":     "super",
+		"command":   "super",
+		"cmd":       "super",
+		"⌘":         "super",
+		"control":   "ctrl",
+		"ctrl":      "ctrl",
+		"⌃":         "ctrl",
+		"hyper":     "hyper",
+		"meta":      "meta",
+		"num_lock":  "num_lock",
+		"caps_lock": "caps_lock",
+}
+
+def normalize_shortcut(spec: str) -> str:
+    if spec.endswith('+'):
+        spec = spec[:-1] + 'plus'
+    parts = spec.lower().split('+')
+    key = parts[-1]
+    if len(parts) == 1:
+        return key
+    mods = parts[:-1]
+    return '+'.join(mod_map.get(x, x) for x in mods) + '+' + key
+
+
+def normalize_shortcuts(spec: str) -> Iterator[str]:
+    spec = spec.replace('++', '+plus')
+    spec = re.sub(r'([^+])>', '\\1\0', spec)
+    for x in spec.split('\0'):
+        yield normalize_shortcut(x)
+
+
 def gen_go_code(defn: Definition) -> str:
-    lines = ['import "fmt"', 'import "strconv"', 'import "kitty/tools/config"',
-             'var _ = fmt.Println', 'var _ = config.StringToBool', 'var _ = strconv.Atoi']
+    lines = ['import "fmt"', 'import "strconv"', 'import "kitty/tools/config"', 'import "kitty/tools/utils/style"',
+             'var _ = fmt.Println', 'var _ = config.StringToBool', 'var _ = strconv.Atoi', 'var _ = style.ParseColor']
     a = lines.append
+    keyboard_shortcuts = tuple(defn.iter_all_maps())
     choices = {}
     go_types = {}
     go_parsers = {}
@@ -471,7 +529,7 @@ def gen_go_code(defn: Definition) -> str:
     for option in sorted(defn.iter_all_options(), key=lambda a: natural_keys(a.name)):
         name = option.name.capitalize()
         if isinstance(option, MultiOption):
-            go_types[name], go_parsers[name] = go_type_data(option.parser_func, option.ctype)
+            go_types[name], go_parsers[name] = go_type_data(option.parser_func, option.ctype, True)
             multiopts.add(name)
         else:
             defaults[name] = option.parser_func(option.defval_as_string)
@@ -490,6 +548,8 @@ def gen_go_code(defn: Definition) -> str:
             a(f'{name} []{gotype}')
         else:
             a(f'{name} {gotype}')
+    if keyboard_shortcuts:
+        a('KeyboardShortcuts []*config.KeyAction')
     a('}')
 
     def cval(x: str) -> str:
@@ -497,6 +557,8 @@ def gen_go_code(defn: Definition) -> str:
 
     a('func NewConfig() *Config {')
     a('return &Config{')
+    from kitty.cli import serialize_as_go_string
+    from kitty.fast_data_types import Color
     for name, pname in go_parsers.items():
         if name in multiopts:
             continue
@@ -507,9 +569,28 @@ def gen_go_code(defn: Definition) -> str:
             dval = f'{name}_{cval(d)}' if name in choices else f'`{d}`'
         elif isinstance(d, bool):
             dval = repr(d).lower()
+        elif isinstance(d, dict):
+            dval = 'map[string]string{'
+            for k, v in d.items():
+                dval += f'"{serialize_as_go_string(k)}": "{serialize_as_go_string(v)}",'
+            dval += '}'
+        elif isinstance(d, Color):
+            dval = f'style.RGBA{{Red:{d.red}, Green: {d.green}, Blue: {d.blue}}}'
+            if 'NullableColor' in go_types[name]:
+                dval = f'style.NullableColor{{IsSet: true, Color:{dval}}}'
         else:
             dval = repr(d)
         a(f'{name}: {dval},')
+    if keyboard_shortcuts:
+        a('KeyboardShortcuts: []*config.KeyAction{')
+        for sc in keyboard_shortcuts:
+            aname, aargs = map(serialize_as_go_string, sc.action_def.partition(' ')[::2])
+            a('{'f'Name: "{aname}", Args: "{aargs}", Normalized_keys: []string''{')
+            ns = normalize_shortcuts(sc.key_text)
+            a(', '.join(f'"{serialize_as_go_string(x)}"' for x in ns) + ',')
+            a('}''},')
+        a('},')
+
     a('}''}')
 
     for oname, choice_vals in choices.items():
@@ -552,6 +633,11 @@ def gen_go_code(defn: Definition) -> str:
             a(f'c.{oname} = append(c.{oname}, temp_val...)')
         else:
             a(f'c.{oname} = temp_val')
+    if keyboard_shortcuts:
+        a('case "map":')
+        a('tempsc, err := config.ParseMap(val)')
+        a('if err != nil { return fmt.Errorf("Failed to parse map = %#v with error: %w", val, err) }')
+        a('c.KeyboardShortcuts = append(c.KeyboardShortcuts, tempsc)')
     a('}')
     a('return}')
     return '\n'.join(lines)

@@ -21,6 +21,7 @@ from kitty.options.types import Options
 from kitty.types import SignalInfo
 
 # Constants {{{
+IMAGE_PLACEHOLDER_CHAR: int
 GLFW_PRIMARY_SELECTION: int
 GLFW_CLIPBOARD: int
 CLD_KILLED: int
@@ -1231,7 +1232,6 @@ class ChildMonitor:
         dump_callback: Optional[Callable[[bytes], None]],
         talk_fd: int = -1,
         listen_fd: int = -1,
-        prewarm_fd: int = -1,
     ):
         pass
 

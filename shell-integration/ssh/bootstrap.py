@@ -20,7 +20,11 @@ echo_on = int('ECHO_ON')
 data_dir = shell_integration_dir = ''
 request_data = int('REQUEST_DATA')
 leading_data = b''
-login_shell = pwd.getpwuid(os.geteuid()).pw_shell or os.environ.get('SHELL') or 'sh'
+login_shell = os.environ.get('SHELL') or '/bin/sh'
+try:
+    login_shell = pwd.getpwuid(os.geteuid()).pw_shell
+except KeyError:
+    pass
 export_home_cmd = b'EXPORT_HOME_CMD'
 if export_home_cmd:
     HOME = base64.standard_b64decode(export_home_cmd).decode('utf-8')

@@ -53,6 +53,11 @@ get_platform_dependent_config_values(void *glfw_window) {
 }
 
 static void
+on_system_color_scheme_change(int appearance) {
+    call_boss(on_system_color_scheme_change, "i", appearance);
+}
+
+static void
 strip_csi_(const char *title, char *buf, size_t bufsz) {
     enum { NORMAL, IN_ESC, IN_CSI} state = NORMAL;
     char *dest = buf, *last = &buf[bufsz-1];
@@ -434,8 +439,19 @@ static id_type focus_counter = 0;
 
 static void
 window_focus_callback(GLFWwindow *w, int focused) {
-    global_state.active_drag_in_window = 0;
     if (!set_callback_window(w)) return;
+    if (OPT(debug_keyboard)) {
+        fprintf(stderr, "\x1b[35mon_focus_change\x1b[m: window id: 0x%llu focused: %d\n", global_state.callback_os_window->id, focused);
+    }
+    // There exist some numbnut Wayland compositors, like kwin, that send mouse
+    // press events before focus gained events. So only clear the active drag
+    // window if it is not the focused window. See https://github.com/kovidgoyal/kitty/issues/6095
+    if (
+            (!focused && global_state.callback_os_window->id == global_state.active_drag_in_window) ||
+            (focused && global_state.callback_os_window->id != global_state.active_drag_in_window)
+    ) {
+        global_state.active_drag_in_window = 0;
+    }
     global_state.callback_os_window->is_focused = focused ? true : false;
     if (focused) {
         show_mouse_cursor(w);
@@ -858,6 +874,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         glfwSetCurrentSelectionCallback(get_current_selection);
         glfwSetHasCurrentSelectionCallback(has_current_selection);
         glfwSetIMECursorPositionCallback(get_ime_cursor_position);
+        glfwSetSystemColorThemeChangeCallback(on_system_color_scheme_change);
 #ifdef __APPLE__
         cocoa_set_activation_policy(OPT(macos_hide_from_tasks));
         glfwWindowHint(GLFW_COCOA_GRAPHICS_SWITCHING, true);
@@ -1376,8 +1393,8 @@ ring_audio_bell(void) {
 #ifdef __APPLE__
     cocoa_system_beep(OPT(bell_path));
 #else
-    if (OPT(bell_path)) play_canberra_sound(OPT(bell_path), "kitty bell", true, "event");
-    else play_canberra_sound("bell", "kitty bell", false, "event");
+    if (OPT(bell_path)) play_canberra_sound(OPT(bell_path), "kitty bell", true, "event", OPT(bell_theme));
+    else play_canberra_sound("bell", "kitty bell", false, "event", OPT(bell_theme));
 #endif
 }
 

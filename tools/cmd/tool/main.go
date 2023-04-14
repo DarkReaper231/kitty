@@ -5,14 +5,19 @@ package tool
 import (
 	"fmt"
 
+	"kitty/kittens/ask"
+	"kitty/kittens/clipboard"
+	"kitty/kittens/diff"
+	"kitty/kittens/hints"
+	"kitty/kittens/hyperlinked_grep"
+	"kitty/kittens/icat"
+	"kitty/kittens/ssh"
+	"kitty/kittens/themes"
+	"kitty/kittens/unicode_input"
 	"kitty/tools/cli"
 	"kitty/tools/cmd/at"
-	"kitty/tools/cmd/clipboard"
 	"kitty/tools/cmd/edit_in_kitty"
-	"kitty/tools/cmd/icat"
 	"kitty/tools/cmd/pytest"
-	"kitty/tools/cmd/ssh"
-	"kitty/tools/cmd/unicode_input"
 	"kitty/tools/cmd/update_self"
 	"kitty/tools/tui"
 )
@@ -36,6 +41,16 @@ func KittyToolEntryPoints(root *cli.Command) {
 	ssh.EntryPoint(root)
 	// unicode_input
 	unicode_input.EntryPoint(root)
+	// hyperlinked_grep
+	hyperlinked_grep.EntryPoint(root)
+	// ask
+	ask.EntryPoint(root)
+	// hints
+	hints.EntryPoint(root)
+	// hints
+	diff.EntryPoint(root)
+	// themes
+	themes.EntryPoint(root)
 	// __pytest__
 	pytest.EntryPoint(root)
 	// __hold_till_enter__

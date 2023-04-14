@@ -3,7 +3,6 @@
 package cli
 
 import (
-	"bufio"
 	"fmt"
 	"kitty/tools/cli/markup"
 	"kitty/tools/tty"
@@ -38,7 +37,7 @@ func shell_input_parser(data []byte, shell_state map[string]string) ([][]string,
 	raw := string(data)
 	new_word := strings.HasSuffix(raw, "\n\n")
 	raw = strings.TrimRight(raw, "\n \t")
-	scanner := bufio.NewScanner(strings.NewReader(raw))
+	scanner := utils.NewLineScanner(raw)
 	words := make([]string, 0, 32)
 	for scanner.Scan() {
 		words = append(words, scanner.Text())
@@ -76,7 +75,7 @@ func (self *Match) FormatForCompletionList(max_word_len int, f *markup.Context, 
 		return word
 	}
 	word_len := wcswidth.Stringwidth(word)
-	line, _, _ := utils.Cut(strings.TrimSpace(desc), "\n")
+	line, _, _ := strings.Cut(strings.TrimSpace(desc), "\n")
 	desc = f.Prettify(line)
 
 	multiline := false
@@ -87,7 +86,7 @@ func (self *Match) FormatForCompletionList(max_word_len int, f *markup.Context, 
 		word += strings.Repeat(" ", max_word_len-word_len)
 	}
 	if wcswidth.Stringwidth(desc) > max_desc_len {
-		desc = style.WrapTextAsLines(desc, "", max_desc_len-2)[0] + "…"
+		desc = style.WrapTextAsLines(desc, max_desc_len-2, style.WrapOptions{})[0] + "…"
 	}
 	if multiline {
 		return word + "\n" + strings.Repeat(" ", max_word_len+2) + desc

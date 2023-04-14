@@ -3,8 +3,8 @@
 # isort: skip_file
 import typing
 from kitty.conf.utils import (
-    merge_dicts, positive_float, positive_int, to_bool, to_cmdline, to_color, to_color_or_none,
-    unit_float
+    merge_dicts, positive_float, positive_int, python_string, to_bool, to_cmdline, to_color,
+    to_color_or_none, unit_float
 )
 from kitty.options.utils import (
     action_alias, active_tab_title_template, allow_hyperlinks, bell_on_tab, box_drawing_scale,
@@ -1024,6 +1024,9 @@ class Parser:
     def kitty_mod(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['kitty_mod'] = to_modifiers(val)
 
+    def linux_bell_theme(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        ans['linux_bell_theme'] = str(val)
+
     def linux_display_server(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         val = val.lower()
         if val not in self.choices_for_linux_display_server:
@@ -1299,7 +1302,7 @@ class Parser:
         ans['url_color'] = to_color(val)
 
     def url_excluded_characters(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
-        ans['url_excluded_characters'] = str(val)
+        ans['url_excluded_characters'] = python_string(val)
 
     def url_prefixes(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['url_prefixes'] = url_prefixes(val)

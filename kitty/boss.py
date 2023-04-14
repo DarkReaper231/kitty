@@ -120,7 +120,6 @@ from .notify import notification_activated
 from .options.types import Options
 from .options.utils import MINIMUM_FONT_SIZE, KeyMap, SubSequenceMap
 from .os_window_size import initial_window_size_func
-from .prewarm import PrewarmProcess
 from .rgb import color_from_int
 from .session import Session, create_sessions, get_os_window_sizing_data
 from .tabs import SpecialWindow, SpecialWindowInstance, Tab, TabDict, TabManager
@@ -320,7 +319,6 @@ class Boss:
         args: CLIOptions,
         cached_values: Dict[str, Any],
         global_shortcuts: Dict[str, SingleKey],
-        prewarm: PrewarmProcess,
     ):
         set_layout_options(opts)
         self.clipboard = Clipboard()
@@ -357,11 +355,10 @@ class Boss:
         if args.listen_on and self.allow_remote_control in ('y', 'socket', 'socket-only', 'password'):
             listen_fd = listen_on(args.listen_on)
             self.listening_on = args.listen_on
-        self.prewarm = prewarm
         self.child_monitor = ChildMonitor(
             self.on_child_death,
             DumpCommands(args) if args.dump_commands or args.dump_bytes else None,
-            talk_fd, listen_fd, self.prewarm.take_from_worker_fd()
+            talk_fd, listen_fd,
         )
         set_boss(self)
         self.args = args
@@ -766,8 +763,11 @@ class Boss:
             args.args = rest
             opts = create_opts(args)
             if data['session_data']:
-                from .session import PreReadSession
-                args.session = PreReadSession(data['session_data'], data['environ'])
+                if data['session_data'] == 'none':
+                    args.session = 'none'
+                else:
+                    from .session import PreReadSession
+                    args.session = PreReadSession(data['session_data'], data['environ'])
             else:
                 args.session = ''
             if not os.path.isabs(args.directory):
@@ -1711,6 +1711,7 @@ class Boss:
         orig_args, args = list(args), list(args)
         from kittens.runner import create_kitten_handler
         end_kitten = create_kitten_handler(kitten, orig_args)
+        is_wrapped = kitten in wrapped_kitten_names()
         if window is None:
             w = self.active_window
             tab = self.active_tab
@@ -1721,7 +1722,8 @@ class Boss:
             return end_kitten(None, getattr(w, 'id', None), self)
 
         if w is not None and tab is not None:
-            args[0:0] = [config_dir, kitten]
+            if not is_wrapped:
+                args[0:0] = [config_dir, kitten]
             if input_data is None:
                 type_of_input = end_kitten.type_of_input
                 q = type_of_input.split('-') if type_of_input else []
@@ -1755,9 +1757,10 @@ class Boss:
                 'OVERLAID_WINDOW_LINES': str(w.screen.lines),
                 'OVERLAID_WINDOW_COLS': str(w.screen.columns),
             }
-            if kitten in wrapped_kitten_names():
+            if is_wrapped:
                 cmd = [kitten_exe(), kitten]
                 env['KITTEN_RUNNING_AS_UI'] = '1'
+                env['KITTY_CONFIG_DIRECTORY'] = config_dir
             else:
                 cmd = [kitty_exe(), '+runpy', 'from kittens.runner import main; main()']
                 env['PYTHONWARNINGS'] = 'ignore'
@@ -2399,7 +2402,6 @@ class Boss:
         for w in self.all_windows:
             self.default_bg_changed_for(w.id)
             w.refresh(reload_all_gpu_data=True)
-        self.prewarm.reload_kitty_config()
 
     @ac('misc', '''
         Reload the config file
@@ -2767,3 +2769,6 @@ class Boss:
 
     def sanitize_url_for_dispay_to_user(self, url: str) -> str:
         return sanitize_url_for_dispay_to_user(url)
+
+    def on_system_color_scheme_change(self, appearance: int) -> None:
+        log_error('system color theme changed:', appearance)

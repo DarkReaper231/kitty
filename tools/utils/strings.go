@@ -3,7 +3,6 @@
 package utils
 
 import (
-	"bufio"
 	"fmt"
 	"strings"
 	"unicode/utf8"
@@ -23,7 +22,7 @@ func Capitalize(x string) string {
 type ScanLines struct {
 	entries []string
 
-	scanner *bufio.Scanner
+	scanner *StringScanner
 }
 
 func NewScanLines(entries ...string) *ScanLines {
@@ -35,7 +34,7 @@ func (self *ScanLines) Scan() bool {
 		if len(self.entries) == 0 {
 			return false
 		}
-		self.scanner = bufio.NewScanner(strings.NewReader(self.entries[0]))
+		self.scanner = NewLineScanner(self.entries[0])
 		self.entries = self.entries[1:]
 		return self.Scan()
 	} else {
@@ -54,15 +53,117 @@ func (self *ScanLines) Text() string {
 	return self.scanner.Text()
 }
 
-func Splitlines(x string, expected_number_of_lines ...int) (ans []string) {
-	if len(expected_number_of_lines) > 0 {
-		ans = make([]string, 0, expected_number_of_lines[0])
+type StringScannerScanFunc = func(data string) (remaining_data, token string)
+type StringScannerPostprocessFunc = func(token string) string
+
+func ScanFuncForSeparator(sep string) StringScannerScanFunc {
+	if len(sep) == 1 {
+		sb := sep[0]
+		return func(data string) (remaining_data, token string) {
+			idx := strings.IndexByte(data, sb)
+			if idx < 0 {
+				return "", data
+			}
+			return data[idx+len(sep):], data[:idx]
+		}
+
+	}
+	return func(data string) (remaining_data, token string) {
+		idx := strings.Index(data, sep)
+		if idx < 0 {
+			return "", data
+		}
+		return data[idx+len(sep):], data[:idx]
+	}
+}
+
+// Faster, better designed, zero-allocation version of bufio.Scanner for strings
+type StringScanner struct {
+	ScanFunc             StringScannerScanFunc
+	PostProcessTokenFunc StringScannerPostprocessFunc
+
+	data  string
+	token string
+}
+
+func (self *StringScanner) Scan() bool {
+	if self.data == "" {
+		self.token = ""
+		return false
+	}
+	self.data, self.token = self.ScanFunc(self.data)
+	if self.PostProcessTokenFunc != nil {
+		self.token = self.PostProcessTokenFunc(self.token)
+	}
+	return true
+}
+
+func (self *StringScanner) Err() error { return nil }
+
+func (self *StringScanner) Text() string {
+	return self.token
+}
+
+func (self *StringScanner) Split(data string, expected_number ...int) (ans []string) {
+	if len(expected_number) != 0 {
+		ans = make([]string, 0, expected_number[0])
 	} else {
-		ans = make([]string, 0, 8)
+		ans = []string{}
 	}
-	scanner := bufio.NewScanner(strings.NewReader(x))
-	for scanner.Scan() {
-		ans = append(ans, scanner.Text())
+	self.data = data
+	for self.Scan() {
+		ans = append(ans, self.Text())
 	}
-	return ans
+	return
+}
+
+func NewLineScanner(text string) *StringScanner {
+	return &StringScanner{
+		data: text, ScanFunc: ScanFuncForSeparator("\n"),
+		PostProcessTokenFunc: func(s string) string {
+			if len(s) > 0 && s[len(s)-1] == '\r' {
+				s = s[:len(s)-1]
+			}
+			return s
+		},
+	}
+}
+
+func NewSeparatorScanner(text, separator string) *StringScanner {
+	return &StringScanner{
+		data: text, ScanFunc: ScanFuncForSeparator(separator),
+	}
+}
+
+func Splitlines(x string, expected_number_of_lines ...int) (ans []string) {
+	return NewLineScanner("").Split(x, expected_number_of_lines...)
+}
+
+// Return a function that can be called sequentially with rune based offsets
+// converting them to byte based offsets. The rune offsets must be monotonic,
+// otherwise the function returns -1
+func RuneOffsetsToByteOffsets(text string) func(int) int {
+	self := struct {
+		char_offset, byte_offset, last int
+		bytes                          []byte
+	}{bytes: UnsafeStringToBytes(text)}
+	return func(x int) (sz int) {
+		switch {
+		case x == self.last:
+			return self.byte_offset
+		case x < self.last:
+			return -1
+		}
+		self.last = x
+		x -= self.char_offset
+		for x > 0 {
+			_, d := utf8.DecodeRune(self.bytes)
+			sz += d
+			self.bytes = self.bytes[d:]
+			x--
+			self.char_offset++
+		}
+		self.byte_offset += sz
+		return self.byte_offset
+	}
 }

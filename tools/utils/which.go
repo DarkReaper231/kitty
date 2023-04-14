@@ -13,6 +13,17 @@ import (
 
 var _ = fmt.Print
 
+var DefaultExeSearchPaths = (&Once[[]string]{Run: func() []string {
+	candidates := [...]string{"/usr/local/bin", "/opt/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+	ans := make([]string, 0, len(candidates))
+	for _, x := range candidates {
+		if s, err := os.Stat(x); err == nil && s.IsDir() {
+			ans = append(ans, x)
+		}
+	}
+	return ans
+}}).Get
+
 func Which(cmd string, paths ...string) string {
 	if strings.Contains(cmd, string(os.PathSeparator)) {
 		return ""
@@ -35,4 +46,16 @@ func Which(cmd string, paths ...string) string {
 
 	}
 	return ""
+}
+
+func FindExe(name string) string {
+	ans := Which(name)
+	if ans != "" {
+		return ans
+	}
+	ans = Which(name, DefaultExeSearchPaths()...)
+	if ans == "" {
+		ans = name
+	}
+	return ans
 }

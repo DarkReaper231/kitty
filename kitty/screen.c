@@ -388,6 +388,7 @@ screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
     if (is_main) setup_cursor(cursor);
     /* printf("old_cursor: (%u, %u) new_cursor: (%u, %u) beyond_content: %d\n", self->cursor->x, self->cursor->y, cursor.after.x, cursor.after.y, cursor.is_beyond_content); */
     setup_cursor(main_saved_cursor);
+    grman_remove_all_cell_images(self->main_grman);
     grman_resize(self->main_grman, self->lines, lines, self->columns, columns);
 
     // Resize alt linebuf
@@ -396,6 +397,7 @@ screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
     Py_CLEAR(self->alt_linebuf); self->alt_linebuf = n;
     if (!is_main) setup_cursor(cursor);
     setup_cursor(alt_saved_cursor);
+    grman_remove_all_cell_images(self->alt_grman);
     grman_resize(self->alt_grman, self->lines, lines, self->columns, columns);
 #undef setup_cursor
 
@@ -445,6 +447,8 @@ screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
 
 void
 screen_rescale_images(Screen *self) {
+    grman_remove_all_cell_images(self->main_grman);
+    grman_remove_all_cell_images(self->alt_grman);
     grman_rescale(self->main_grman, self->cell_size);
     grman_rescale(self->alt_grman, self->cell_size);
 }
@@ -722,6 +726,9 @@ draw_codepoint(Screen *self, char_type och, bool from_input_stream) {
         line_set_char(self->linebuf->line, self->cursor->x, 0, 0, self->cursor, self->active_hyperlink_id);
         self->cursor->x++;
     }
+    if (UNLIKELY(ch == IMAGE_PLACEHOLDER_CHAR)) {
+        linebuf_set_line_has_image_placeholders(self->linebuf, self->cursor->y, true);
+    }
     self->is_dirty = true;
     if (selection_has_screen_line(&self->selections, self->cursor->y)) clear_selection(&self->selections);
     linebuf_mark_line_dirty(self->linebuf, self->cursor->y);
@@ -777,12 +784,19 @@ select_graphic_rendition(Screen *self, int *params, unsigned int count, Region *
             }
         } else {
             index_type x, num;
-            for (index_type y = region.top; y < MIN(region.bottom + 1, self->lines); y++) {
-                if (y == region.top) { x = MIN(region.left, self->columns - 1); num = self->columns - x; }
-                else if (y == region.bottom) { x = 0; num = MIN(region.right + 1, self->columns); }
-                else { x = 0; num = self->columns; }
-                linebuf_init_line(self->linebuf, y);
+            if (region.top == region.bottom) {
+                linebuf_init_line(self->linebuf, region.top);
+                x = MIN(region.left, self->columns-1);
+                num = MIN(self->columns - x, region.right - x + 1);
                 apply_sgr_to_cells(self->linebuf->line->gpu_cells + x, num, params, count);
+            } else {
+                for (index_type y = region.top; y < MIN(region.bottom + 1, self->lines); y++) {
+                    if (y == region.top) { x = MIN(region.left, self->columns - 1); num = self->columns - x; }
+                    else if (y == region.bottom) { x = 0; num = MIN(region.right + 1, self->columns); }
+                    else { x = 0; num = self->columns; }
+                    linebuf_init_line(self->linebuf, y);
+                    apply_sgr_to_cells(self->linebuf->line->gpu_cells + x, num, params, count);
+                }
             }
         }
     } else cursor_from_sgr(self->cursor, params, count);
@@ -872,6 +886,25 @@ cursor_within_margins(Screen *self) {
     return self->margin_top <= self->cursor->y && self->cursor->y <= self->margin_bottom;
 }
 
+// Remove all cell images from a portion of the screen and mark lines that
+// contain image placeholders as dirty to make sure they are redrawn. This is
+// needed when we perform commands that may move some lines without marking them
+// as dirty (like screen_insert_lines) and at the same time don't move image
+// references (i.e. unlike screen_scroll, which moves everything).
+static void
+screen_dirty_line_graphics(Screen *self, unsigned int top, unsigned int bottom) {
+    bool need_to_remove = false;
+    for (unsigned int y = top; y <= bottom; y++) {
+        if (self->linebuf->line_attrs[y].has_image_placeholders) {
+            need_to_remove = true;
+            linebuf_mark_line_dirty(self->linebuf, y);
+            self->is_dirty = true;
+        }
+    }
+    if (need_to_remove)
+        grman_remove_cell_images(self->grman, top, bottom);
+}
+
 void
 screen_handle_graphics_command(Screen *self, const GraphicsCommand *cmd, const uint8_t *payload) {
     unsigned int x = self->cursor->x, y = self->cursor->y;
@@ -882,6 +915,10 @@ screen_handle_graphics_command(Screen *self, const GraphicsCommand *cmd, const u
         if (self->cursor->x >= self->columns) { self->cursor->x = 0; self->cursor->y++; }
         if (self->cursor->y > self->margin_bottom) screen_scroll(self, self->cursor->y - self->margin_bottom);
         screen_ensure_bounds(self, false, in_margins);
+    }
+    if (cmd->unicode_placement) {
+        // Make sure the placeholders are redrawn if we add or change a virtual placement.
+        screen_dirty_line_graphics(self, 0, self->lines);
     }
 }
 // }}}
@@ -1569,6 +1606,7 @@ screen_erase_in_line(Screen *self, unsigned int how, bool private) {
             break;
     }
     if (n > 0) {
+        screen_dirty_line_graphics(self, self->cursor->y, self->cursor->y);
         linebuf_init_line(self->linebuf, self->cursor->y);
         if (private) {
             line_clear_text(self->linebuf->line, s, n, BLANK_CHAR);
@@ -1619,6 +1657,7 @@ screen_erase_in_display(Screen *self, unsigned int how, bool private) {
             return;
     }
     if (b > a) {
+        if (how != 3) screen_dirty_line_graphics(self, a, b);
         for (unsigned int i=a; i < b; i++) {
             linebuf_init_line(self->linebuf, i);
             if (private) {
@@ -1646,6 +1685,7 @@ screen_insert_lines(Screen *self, unsigned int count) {
     unsigned int top = self->margin_top, bottom = self->margin_bottom;
     if (count == 0) count = 1;
     if (top <= self->cursor->y && self->cursor->y <= bottom) {
+        screen_dirty_line_graphics(self, top, bottom);
         linebuf_insert_lines(self->linebuf, count, self->cursor->y, bottom);
         self->is_dirty = true;
         clear_selection(&self->selections);
@@ -1671,6 +1711,7 @@ screen_delete_lines(Screen *self, unsigned int count) {
     unsigned int top = self->margin_top, bottom = self->margin_bottom;
     if (count == 0) count = 1;
     if (top <= self->cursor->y && self->cursor->y <= bottom) {
+        screen_dirty_line_graphics(self, top, bottom);
         linebuf_delete_lines(self->linebuf, count, self->cursor->y, bottom);
         self->is_dirty = true;
         clear_selection(&self->selections);
@@ -2195,6 +2236,134 @@ screen_has_marker(Screen *self) {
     return self->marker != NULL;
 }
 
+static uint32_t diacritic_to_rowcolumn(combining_type m) {
+    char_type c = codepoint_for_mark(m);
+    return diacritic_to_num(c);
+}
+
+static uint32_t color_to_id(color_type c) {
+    // Just take 24 most significant bits of the color. This works both for
+    // 24-bit and 8-bit colors.
+    return (c >> 8) & 0xffffff;
+}
+
+// Scan the line and create cell images in place of unicode placeholders
+// reserved for image placement.
+static void
+screen_render_line_graphics(Screen *self, Line *line, int32_t row) {
+    // If there are no image placeholders now, no need to rescan the line.
+    if (!line->attrs.has_image_placeholders)
+        return;
+    // Remove existing images.
+    grman_remove_cell_images(self->grman, row, row);
+    // The placeholders might be erased. We will update the attribute.
+    line->attrs.has_image_placeholders = false;
+    index_type i;
+    uint32_t run_length = 0;
+    uint32_t prev_img_id_lower24bits = 0;
+    uint32_t prev_placement_id = 0;
+    // Note that the following values are 1-based, zero means unknown or incorrect.
+    uint32_t prev_img_id_higher8bits = 0;
+    uint32_t prev_img_row = 0;
+    uint32_t prev_img_col = 0;
+    for (i = 0; i < line->xnum; i++) {
+        CPUCell *cpu_cell = line->cpu_cells + i;
+        GPUCell *gpu_cell = line->gpu_cells + i;
+        uint32_t cur_img_id_lower24bits = 0;
+        uint32_t cur_placement_id = 0;
+        uint32_t cur_img_id_higher8bits = 0;
+        uint32_t cur_img_row = 0;
+        uint32_t cur_img_col = 0;
+        if (cpu_cell->ch == IMAGE_PLACEHOLDER_CHAR) {
+            line->attrs.has_image_placeholders = true;
+            // The lower 24 bits of the image id are encoded in the foreground
+            // color, and the placement id is (optionally) in the underline color.
+            cur_img_id_lower24bits = color_to_id(gpu_cell->fg);
+            cur_placement_id = color_to_id(gpu_cell->decoration_fg);
+            // If the char has diacritics, use them as row and column indices.
+            if (cpu_cell->cc_idx[0])
+                cur_img_row = diacritic_to_rowcolumn(cpu_cell->cc_idx[0]);
+            if (cpu_cell->cc_idx[1])
+                cur_img_col = diacritic_to_rowcolumn(cpu_cell->cc_idx[1]);
+            // The third diacritic is used to encode the higher 8 bits of the
+            // image id (optional).
+            if (cpu_cell->cc_idx[2])
+                cur_img_id_higher8bits = diacritic_to_rowcolumn(cpu_cell->cc_idx[2]);
+        }
+        // The current run is continued if the lower 24 bits of the image id and
+        // the placement id are the same as in the previous cell and everything
+        // else is unknown or compatible with the previous cell.
+        if (run_length > 0 && cur_img_id_lower24bits == prev_img_id_lower24bits &&
+            cur_placement_id == prev_placement_id &&
+            (!cur_img_row || cur_img_row == prev_img_row) &&
+            (!cur_img_col || cur_img_col == prev_img_col + 1) &&
+            (!cur_img_id_higher8bits || cur_img_id_higher8bits == prev_img_id_higher8bits)) {
+            // This cell continues the current run.
+            run_length++;
+            // If some values are unknown, infer them from the previous cell.
+            cur_img_row = MAX(prev_img_row, 1u);
+            cur_img_col = prev_img_col + 1;
+            cur_img_id_higher8bits = MAX(prev_img_id_higher8bits, 1u);
+        } else {
+            // This cell breaks the current run. Render the current run if it
+            // has a non-zero length.
+            if (run_length > 0) {
+                uint32_t img_id = prev_img_id_lower24bits | (prev_img_id_higher8bits - 1) << 24;
+                grman_put_cell_image(
+                    self->grman, row, i - run_length, img_id,
+                    prev_placement_id, prev_img_col - run_length,
+                    prev_img_row - 1, run_length, 1, self->cell_size);
+            }
+            // Start a new run.
+            if (cpu_cell->ch == IMAGE_PLACEHOLDER_CHAR) {
+                run_length = 1;
+                if (!cur_img_col) cur_img_col = 1;
+                if (!cur_img_row) cur_img_row = 1;
+                if (!cur_img_id_higher8bits) cur_img_id_higher8bits = 1;
+            }
+        }
+        prev_img_id_lower24bits = cur_img_id_lower24bits;
+        prev_img_id_higher8bits = cur_img_id_higher8bits;
+        prev_placement_id = cur_placement_id;
+        prev_img_row = cur_img_row;
+        prev_img_col = cur_img_col;
+    }
+    if (run_length > 0) {
+        // Render the last run.
+        uint32_t img_id = prev_img_id_lower24bits | (prev_img_id_higher8bits - 1) << 24;
+        grman_put_cell_image(self->grman, row, i - run_length, img_id,
+                             prev_placement_id, prev_img_col - run_length,
+                             prev_img_row - 1, run_length, 1, self->cell_size);
+    }
+}
+
+// This functions is similar to screen_update_cell_data, but it only updates
+// line graphics (cell images) and then marks lines as clean. It's used
+// exclusively for testing unicode placeholders.
+static void
+screen_update_only_line_graphics_data(Screen *self) {
+    unsigned int history_line_added_count = self->history_line_added_count;
+    index_type lnum;
+    if (self->scrolled_by) self->scrolled_by = MIN(self->scrolled_by + history_line_added_count, self->historybuf->count);
+    screen_reset_dirty(self);
+    self->scroll_changed = false;
+    for (index_type y = 0; y < MIN(self->lines, self->scrolled_by); y++) {
+        lnum = self->scrolled_by - 1 - y;
+        historybuf_init_line(self->historybuf, lnum, self->historybuf->line);
+        screen_render_line_graphics(self, self->historybuf->line, y - self->scrolled_by);
+        if (self->historybuf->line->attrs.has_dirty_text) {
+            historybuf_mark_line_clean(self->historybuf, lnum);
+        }
+    }
+    for (index_type y = self->scrolled_by; y < self->lines; y++) {
+        lnum = y - self->scrolled_by;
+        linebuf_init_line(self->linebuf, lnum);
+        if (self->linebuf->line->attrs.has_dirty_text) {
+            screen_render_line_graphics(self, self->linebuf->line, y - self->scrolled_by);
+            linebuf_mark_line_clean(self->linebuf, lnum);
+        }
+    }
+}
 
 void
 screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_data, bool cursor_has_moved) {
@@ -2209,6 +2378,9 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
     for (index_type y = 0; y < MIN(self->lines, self->scrolled_by); y++) {
         lnum = self->scrolled_by - 1 - y;
         historybuf_init_line(self->historybuf, lnum, self->historybuf->line);
+        // we render line graphics even if the line is not dirty as graphics commands received after
+        // the unicode placeholder was first scanned can alter it.
+        screen_render_line_graphics(self, self->historybuf->line, y - self->scrolled_by);
         if (self->historybuf->line->attrs.has_dirty_text) {
             render_line(fonts_data, self->historybuf->line, lnum, self->cursor, self->disable_ligatures);
             if (screen_has_marker(self)) mark_text_in_line(self->marker, self->historybuf->line);
@@ -2222,6 +2394,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
         if (self->linebuf->line->attrs.has_dirty_text ||
             (cursor_has_moved && (self->cursor->y == lnum || self->last_rendered.cursor_y == lnum))) {
             render_line(fonts_data, self->linebuf->line, lnum, self->cursor, self->disable_ligatures);
+            screen_render_line_graphics(self, self->linebuf->line, y - self->scrolled_by);
             if (self->linebuf->line->attrs.has_dirty_text && screen_has_marker(self)) mark_text_in_line(self->marker, self->linebuf->line);
             if (is_overlay_active && lnum == self->overlay_line.ynum) render_overlay_line(self, self->linebuf->line, fonts_data);
             linebuf_mark_line_clean(self->linebuf, lnum);
@@ -2627,17 +2800,21 @@ screen_open_url(Screen *self) {
 
 // URLs {{{
 static void
-extend_url(Screen *screen, Line *line, index_type *x, index_type *y, char_type sentinel) {
+extend_url(Screen *screen, Line *line, index_type *x, index_type *y, char_type sentinel, bool newlines_allowed) {
     unsigned int count = 0;
+    bool has_newline = false;
     while(count++ < 10) {
-        if (*x != line->xnum - 1) break;
+        has_newline = !line->gpu_cells[line->xnum-1].attrs.next_char_was_wrapped;
+        if (*x != line->xnum - 1 || (!newlines_allowed && has_newline)) break;
         bool next_line_starts_with_url_chars = false;
         line = screen_visual_line(screen, *y + 2);
-        if (line) next_line_starts_with_url_chars = line_startswith_url_chars(line);
+        if (line) {
+            next_line_starts_with_url_chars = line_startswith_url_chars(line);
+            has_newline = !line->attrs.is_continued;
+            if (next_line_starts_with_url_chars && has_newline && !newlines_allowed) next_line_starts_with_url_chars = false;
+        }
         line = screen_visual_line(screen, *y + 1);
         if (!line) break;
-        // we deliberately allow non-continued lines as some programs, like
-        // mutt split URLs with newlines at line boundaries
         index_type new_x = line_url_end_at(line, 0, false, sentinel, next_line_starts_with_url_chars);
         if (!new_x && !line_startswith_url_chars(line)) break;
         *y += 1; *x = new_x;
@@ -2679,6 +2856,7 @@ screen_detect_url(Screen *screen, unsigned int x, unsigned int y) {
         return hid;
     }
     char_type sentinel = 0;
+    bool newlines_allowed = !is_excluded_from_url('\n');
     if (line) {
         url_start = line_url_start_at(line, x);
         if (url_start < line->xnum) {
@@ -2686,6 +2864,7 @@ screen_detect_url(Screen *screen, unsigned int x, unsigned int y) {
             if (y < screen->lines - 1) {
                 line = screen_visual_line(screen, y+1);
                 next_line_starts_with_url_chars = line_startswith_url_chars(line);
+                if (next_line_starts_with_url_chars && !newlines_allowed && !line->attrs.is_continued) next_line_starts_with_url_chars = false;
                 line = screen_visual_line(screen, y);
             }
             sentinel = get_url_sentinel(line, url_start);
@@ -2695,7 +2874,7 @@ screen_detect_url(Screen *screen, unsigned int x, unsigned int y) {
     }
     if (has_url) {
         index_type y_extended = y;
-        extend_url(screen, line, &url_end, &y_extended, sentinel);
+        extend_url(screen, line, &url_end, &y_extended, sentinel, newlines_allowed);
         screen_mark_url(screen, url_start, y, url_end, y_extended);
     } else {
         screen_mark_url(screen, 0, 0, 0, 0);
@@ -2738,6 +2917,7 @@ screen_update_overlay_text(Screen *self, const char *utf8_text) {
     self->overlay_line.is_dirty = true;
     self->overlay_line.xstart = self->cursor->x;
     self->overlay_line.xnum = !text_len ? 0 : PyLong_AsLong(text_len);
+    self->overlay_line.text_len = self->overlay_line.xnum;
     self->overlay_line.cursor_x = MIN(self->overlay_line.xstart + self->overlay_line.xnum, self->columns);
     self->overlay_line.ynum = self->cursor->y;
     cursor_copy_to(self->cursor, &(self->overlay_line.original_line.cursor));
@@ -2753,7 +2933,10 @@ screen_update_overlay_text(Screen *self, const char *utf8_text) {
 static void
 screen_draw_overlay_line(Screen *self) {
     if (!self->overlay_line.overlay_text) return;
-    self->overlay_line.xnum = 0;
+    // Right-align the overlay to ensure that the pre-edit text just entered is visible when the cursor is near the end of the line.
+    index_type xstart = self->overlay_line.text_len <= self->columns ? self->columns - self->overlay_line.text_len : 0;
+    if (self->overlay_line.xstart < xstart) xstart = self->overlay_line.xstart;
+    index_type columns_exceeded = self->overlay_line.text_len <= self->columns ? 0 : self->overlay_line.text_len - self->columns;
     bool orig_line_wrap_mode = self->modes.mDECAWM;
     bool orig_cursor_enable_mode = self->modes.mDECTCEM;
     bool orig_insert_replace_mode = self->modes.mIRM;
@@ -2763,9 +2946,15 @@ screen_draw_overlay_line(Screen *self) {
     Cursor *orig_cursor = self->cursor;
     self->cursor = &(self->overlay_line.original_line.cursor);
     self->cursor->reverse ^= true;
-    self->cursor->x = self->overlay_line.xstart;
+    self->cursor->x = xstart;
     self->cursor->y = self->overlay_line.ynum;
     self->overlay_line.xnum = 0;
+    if (xstart > 0) {
+        // When the cursor is on the second cell of a full-width character for whatever reason,
+        // make sure the first character in the overlay is visible.
+        GPUCell *g = self->linebuf->line->gpu_cells + (xstart - 1);
+        if (g->attrs.width > 1) line_set_char(self->linebuf->line, xstart - 1, 0, 0, NULL, 0);
+    }
     index_type before;
     const int kind = PyUnicode_KIND(self->overlay_line.overlay_text);
     const void *data = PyUnicode_DATA(self->overlay_line.overlay_text);
@@ -2773,7 +2962,24 @@ screen_draw_overlay_line(Screen *self) {
     for (Py_ssize_t pos = 0; pos < sz; pos++) {
         before = self->cursor->x;
         draw_codepoint(self, PyUnicode_READ(kind, data, pos), false);
-        self->overlay_line.xnum += self->cursor->x - before;
+        index_type len = self->cursor->x - before;
+        if (columns_exceeded > 0) {
+            // Reset the cursor to maintain right alignment when the overlay exceeds the screen width.
+            if (columns_exceeded > len) {
+                columns_exceeded -= len;
+                len = 0;
+            } else {
+                len = len > columns_exceeded ? len - columns_exceeded : 0;
+                columns_exceeded = 0;
+                if (len > 0) {
+                    // When the last character is full width and only half moved out, make sure the next character is visible.
+                    GPUCell *g = self->linebuf->line->gpu_cells + (len - 1);
+                    if (g->attrs.width > 1) line_set_char(self->linebuf->line, len - 1, 0, 0, NULL, 0);
+                }
+            }
+            self->cursor->x = len;
+        }
+        self->overlay_line.xnum += len;
     }
     self->overlay_line.cursor_x = self->cursor->x;
     self->cursor->reverse ^= true;
@@ -4100,6 +4306,8 @@ line_edge_colors(Screen *self, PyObject *a UNUSED) {
     return Py_BuildValue("kk", (unsigned long)left, (unsigned long)right);
 }
 
+WRAP0(update_only_line_graphics_data)
+
 
 #define MND(name, args) {#name, (PyCFunction)name, args, #name},
 #define MODEFUNC(name) MND(name, METH_NOARGS) MND(set_##name, METH_O)
@@ -4186,6 +4394,7 @@ static PyMethodDef methods[] = {
     MND(set_marker, METH_VARARGS)
     MND(marked_cells, METH_NOARGS)
     MND(scroll_to_next_mark, METH_VARARGS)
+    MND(update_only_line_graphics_data, METH_NOARGS)
     {"select_graphic_rendition", (PyCFunction)_select_graphic_rendition, METH_VARARGS, ""},
 
     {NULL}  /* Sentinel */

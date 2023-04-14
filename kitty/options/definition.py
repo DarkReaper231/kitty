@@ -262,6 +262,11 @@ backgrounds is affected very little.
 The second number is an additional multiplicative contrast. It is percentage
 ranging from :code:`0` to :code:`100`. The default value is :code:`0` on Linux
 and :code:`30` on macOS.
+
+If you wish to achieve similar looking thickness in light and dark themes, a good way
+to experiment is start by setting the value to :code:`1.0 0` and use a dark theme.
+Then adjust the second parameter until it looks good. Then switch to a light theme
+and adjust the first parameter until the perceived thickness matches the dark theme.
 ''')
 
 egr()  # }}}
@@ -469,10 +474,15 @@ are still clickable.
     )
 
 opt('url_excluded_characters', '',
-    ctype='!url_excluded_characters',
+    option_type='python_string', ctype='!url_excluded_characters',
     long_text='''
 Additional characters to be disallowed from URLs, when detecting URLs under the
 mouse cursor. By default, all characters that are legal in URLs are allowed.
+Additionally, newlines are allowed (but stripped). This is to accommodate
+programs such as mutt that add hard line breaks even for continued lines.
+:code:`\\\\n` can be added to this option to disable this behavior. Special
+characters can be specified using backslash escapes, to specify a backslash use
+a double backslash.
 '''
     )
 
@@ -513,7 +523,7 @@ The supported paste actions are:
     If the text being pasted is a URL and the cursor is at a shell prompt,
     automatically quote the URL (needs :opt:`shell_integration`).
 :code:`confirm`:
-    Confirm the paste if bracketed paste mode is not active or there is more
+    Confirm the paste if bracketed paste mode is not active or there is
     a large amount of text being pasted.
 :code:`filter`:
     Run the filter_paste() function from the file :file:`paste-actions.py` in
@@ -856,6 +866,12 @@ system default bell sound is used. Must be in a format supported by the
 operating systems sound API, such as WAV or OGA on Linux (libcanberra) or AIFF,
 MP3 or WAV on macOS (NSSound)
 '''
+    )
+
+opt('linux_bell_theme', '__custom', ctype='!bell_theme',
+    long_text='The XDG Sound Theme kitty will use to play the bell sound.'
+    ' Defaults to the custom theme name used by GNOME and Budgie, falling back to the default freedesktop theme if it does not exist.'
+    ' This option may be removed if Linux ever provides desktop-agnostic support for setting system sound themes.'
     )
 
 egr()  # }}}
@@ -2927,7 +2943,7 @@ opt('startup_session', 'none',
     option_type='config_or_absolute_path',
     long_text='''
 Path to a session file to use for all kitty instances. Can be overridden by
-using the :option:`kitty --session` command line option for individual
+using the :option:`kitty --session` :code:`=none` command line option for individual
 instances. See :ref:`sessions` in the kitty documentation for details. Note that
 relative paths are interpreted with respect to the kitty config directory.
 Environment variables in the path are expanded. Changing this option by

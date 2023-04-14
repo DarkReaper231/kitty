@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"kitty/tools/utils/shlex"
 )
@@ -81,6 +82,10 @@ func (self *RGBA) AsRGB() uint32 {
 	return uint32(self.Blue) | (uint32(self.Green) << 8) | (uint32(self.Red) << 16)
 }
 
+func (self *RGBA) IsDark() bool {
+	return self.Red < 155 && self.Green < 155 && self.Blue < 155
+}
+
 func (self *RGBA) FromRGB(col uint32) {
 	self.Red = uint8((col >> 16) & 0xff)
 	self.Green = uint8((col >> 8) & 0xff)
@@ -154,6 +159,20 @@ func ParseColor(color string) (RGBA, error) {
 		return parse_rgb(raw[4:])
 	}
 	return RGBA{}, fmt.Errorf("Not a valid color name: %#v", color)
+}
+
+type NullableColor struct {
+	Color RGBA
+	IsSet bool
+}
+
+func ParseColorOrNone(color string) (NullableColor, error) {
+	raw := strings.TrimSpace(strings.ToLower(color))
+	if raw == "none" {
+		return NullableColor{}, nil
+	}
+	c, err := ParseColor(raw)
+	return NullableColor{Color: c}, err
 }
 
 var named_colors = map[string]uint8{
@@ -292,8 +311,8 @@ func (self url_code) is_empty() bool {
 func (self *sgr_code) update() {
 	p := make([]string, 0, 1)
 	s := make([]string, 0, 1)
-	p, s = self.bold.as_sgr("1", "22", p, s)
-	p, s = self.dim.as_sgr("2", "22", p, s)
+	p, s = self.bold.as_sgr("1", "221", p, s)
+	p, s = self.dim.as_sgr("2", "222", p, s)
 	p, s = self.italic.as_sgr("3", "23", p, s)
 	p, s = self.reverse.as_sgr("7", "27", p, s)
 	p, s = self.strikethrough.as_sgr("9", "29", p, s)
@@ -318,13 +337,9 @@ func parse_spec(spec string) []escape_code {
 	sgr := sgr_code{}
 	sparts, _ := shlex.Split(spec)
 	for _, p := range sparts {
-		parts := strings.SplitN(p, "=", 2)
-		key := parts[0]
-		val := ""
-		if len(parts) == 1 {
+		key, val, found := strings.Cut(p, "=")
+		if !found {
 			val = "true"
-		} else {
-			val = parts[1]
 		}
 		switch key {
 		case "fg":
@@ -355,8 +370,11 @@ func parse_spec(spec string) []escape_code {
 }
 
 var parsed_spec_cache = make(map[string][]escape_code)
+var parsed_spec_cache_mutex = sync.Mutex{}
 
 func cached_parse_spec(spec string) []escape_code {
+	parsed_spec_cache_mutex.Lock()
+	defer parsed_spec_cache_mutex.Unlock()
 	if val, ok := parsed_spec_cache[spec]; ok {
 		return val
 	}

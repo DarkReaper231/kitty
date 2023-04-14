@@ -81,6 +81,9 @@ typedef struct ImageAnchorPosition {
 #define DECORATION_FG_CODE 58
 #define CHAR_IS_BLANK(ch) ((ch) == 32 || (ch) == 0)
 
+// PUA character used as an image placeholder.
+#define IMAGE_PLACEHOLDER_CHAR 0x10EEEE
+
 #define FG 1
 #define BG 2
 
@@ -192,6 +195,7 @@ typedef union LineAttrs {
     struct {
         uint8_t is_continued : 1;
         uint8_t has_dirty_text : 1;
+        uint8_t has_image_placeholders : 1;
         PromptKind prompt_kind : 2;
     };
     uint8_t val;
@@ -382,7 +386,7 @@ void scroll_event(double, double, int, int);
 void on_key_input(GLFWkeyevent *ev);
 void request_window_attention(id_type, bool);
 #ifndef __APPLE__
-void play_canberra_sound(const char *which_sound, const char *event_id, bool is_path, const char *role);
+void play_canberra_sound(const char *which_sound, const char *event_id, bool is_path, const char *role, const char *theme_name);
 #endif
 SPRITE_MAP_HANDLE alloc_sprite_map(unsigned int, unsigned int);
 SPRITE_MAP_HANDLE free_sprite_map(SPRITE_MAP_HANDLE);

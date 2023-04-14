@@ -300,8 +300,8 @@ class Tab:  # {{{
     def create_layout_object(self, name: str) -> Layout:
         return create_layout_object_for(name, self.os_window_id, self.id)
 
-    @ac('lay', 'Go to the next enabled layout')
-    def next_layout(self) -> None:
+    @ac('lay', 'Go to the next enabled layout. Can optionally supply an integer to jump by the specified number.')
+    def next_layout(self, delta: int = 1) -> None:
         if len(self.enabled_layouts) > 1:
             for i, layout_name in enumerate(self.enabled_layouts):
                 if layout_name == self.current_layout.full_name:
@@ -309,7 +309,10 @@ class Tab:  # {{{
                     break
             else:
                 idx = -1
-            nl = self.enabled_layouts[(idx + 1) % len(self.enabled_layouts)]
+            if abs(delta) >= len(self.enabled_layouts):
+                mult = -1 if delta < 0 else 1
+                delta = mult * (abs(delta) % len(self.enabled_layouts))
+            nl = self.enabled_layouts[(idx + delta + len(self.enabled_layouts)) % len(self.enabled_layouts)]
             self._set_current_layout(nl)
             self.relayout()
 
@@ -321,20 +324,47 @@ class Tab:  # {{{
 
     @ac('lay', '''
         Switch to the named layout
+        In case there are multiple layouts with the same name and different options,
+        specify the full layout definition or a unique prefix of the full definition.
 
         For example::
 
             map f1 goto_layout tall
+            map f2 goto_layout fat:bias=20
         ''')
     def goto_layout(self, layout_name: str, raise_exception: bool = False) -> None:
         layout_name = layout_name.lower()
-        if layout_name not in self.enabled_layouts:
-            if raise_exception:
-                raise ValueError(layout_name)
-            log_error(f'Unknown or disabled layout: {layout_name}')
-            return
-        self._set_current_layout(layout_name)
-        self.relayout()
+        q, has_colon, rest = layout_name.partition(':')
+        matches = []
+        prefix_matches = []
+        matched_layout = ''
+        for candidate in self.enabled_layouts:
+            x, _, _ = candidate.partition(':')
+            if x == q:
+                if candidate == layout_name:
+                    matched_layout = candidate
+                    break
+                if candidate.startswith(layout_name):
+                    prefix_matches.append(candidate)
+                matches.append(x)
+
+        if not matched_layout:
+            if len(prefix_matches) == 1:
+                matched_layout = prefix_matches[0]
+            elif len(matches) == 1:
+                matched_layout = matches[0]
+        if matched_layout:
+            self._set_current_layout(matched_layout)
+            self.relayout()
+        else:
+            if len(matches) == 0:
+                if raise_exception:
+                    raise ValueError(layout_name)
+                log_error(f'Unknown or disabled layout: {layout_name}')
+            elif len(matches) != 1:
+                if raise_exception:
+                    raise ValueError(layout_name)
+                log_error(f'Multiple layouts match: {layout_name}')
 
     @ac('lay', '''
         Toggle the named layout
@@ -434,6 +464,8 @@ class Tab:  # {{{
                         cmd = resolved_shell(get_options())
                     elif not is_executable:
                         import shlex
+
+                        from .utils import which
                         with suppress(OSError):
                             with open(old_exe) as f:
                                 if f.read(2) == '#!':
