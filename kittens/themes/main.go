@@ -3,7 +3,11 @@
 package themes
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -95,4 +99,49 @@ func main(_ *cli.Command, opts *Options, args []string) (rc int, err error) {
 
 func EntryPoint(parent *cli.Command) {
 	create_cmd(parent, main)
+}
+
+func parse_theme_metadata() error {
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return err
+	}
+	paths := utils.Splitlines(utils.UnsafeBytesToString(raw))
+	ans := make([]*themes.ThemeMetadata, 0, len(paths))
+	for _, path := range paths {
+		if path != "" {
+			metadata, _, err := themes.ParseThemeMetadata(path)
+			if metadata.Name == "" {
+				metadata.Name = themes.ThemeNameFromFileName(filepath.Base(path))
+			}
+			if err != nil {
+				return err
+			}
+			ans = append(ans, metadata)
+		}
+	}
+	raw, err = json.Marshal(ans)
+	if err != nil {
+		return err
+	}
+	_, err = os.Stdout.Write(raw)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func ParseEntryPoint(parent *cli.Command) {
+	parent.AddSubCommand(&cli.Command{
+		Name:   "__parse_theme_metadata__",
+		Hidden: true,
+		Run: func(cmd *cli.Command, args []string) (rc int, err error) {
+			err = parse_theme_metadata()
+			if err != nil {
+				rc = 1
+			}
+			return
+		},
+	})
+
 }

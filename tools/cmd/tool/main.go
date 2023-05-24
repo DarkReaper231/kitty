@@ -11,6 +11,7 @@ import (
 	"kitty/kittens/hints"
 	"kitty/kittens/hyperlinked_grep"
 	"kitty/kittens/icat"
+	"kitty/kittens/show_key"
 	"kitty/kittens/ssh"
 	"kitty/kittens/themes"
 	"kitty/kittens/unicode_input"
@@ -41,6 +42,8 @@ func KittyToolEntryPoints(root *cli.Command) {
 	ssh.EntryPoint(root)
 	// unicode_input
 	unicode_input.EntryPoint(root)
+	// show_key
+	show_key.EntryPoint(root)
 	// hyperlinked_grep
 	hyperlinked_grep.EntryPoint(root)
 	// ask
@@ -51,6 +54,7 @@ func KittyToolEntryPoints(root *cli.Command) {
 	diff.EntryPoint(root)
 	// themes
 	themes.EntryPoint(root)
+	themes.ParseEntryPoint(root)
 	// __pytest__
 	pytest.EntryPoint(root)
 	// __hold_till_enter__
@@ -61,6 +65,15 @@ func KittyToolEntryPoints(root *cli.Command) {
 		Run: func(cmd *cli.Command, args []string) (rc int, err error) {
 			tui.ExecAndHoldTillEnter(args)
 			return
+		},
+	})
+	// __confirm_and_run_shebang__
+	root.AddSubCommand(&cli.Command{
+		Name:            "__confirm_and_run_shebang__",
+		Hidden:          true,
+		OnlyArgsAllowed: true,
+		Run: func(cmd *cli.Command, args []string) (rc int, err error) {
+			return confirm_and_run_shebang(args)
 		},
 	})
 }

@@ -561,6 +561,7 @@ handle_add_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_
             img->root_frame_data_loaded = false;
             img->is_drawn = false;
             img->current_frame_shown_at = 0;
+            img->extra_framecnt = 0;
             free_image(self, img);
             *is_dirty = true;
             self->layers_dirty = true;
@@ -1790,8 +1791,20 @@ handle_delete_command(GraphicsManager *self, const GraphicsCommand *g, Cursor *c
 // }}}
 
 void
-grman_resize(GraphicsManager *self, index_type UNUSED old_lines, index_type UNUSED lines, index_type UNUSED old_columns, index_type UNUSED columns) {
+grman_resize(GraphicsManager *self, index_type old_lines UNUSED, index_type lines UNUSED, index_type old_columns, index_type columns, index_type num_content_lines_before, index_type num_content_lines_after) {
+    ImageRef *ref; Image *img;
     self->layers_dirty = true;
+    if (columns == old_columns && num_content_lines_before > num_content_lines_after) {
+        const unsigned int vertical_shrink_size = num_content_lines_before - num_content_lines_after;
+        for (size_t i = self->image_count; i-- > 0;) {
+            img = self->images + i;
+            for (size_t j = img->refcnt; j-- > 0;) {
+                ref = img->refs + j;
+                if (ref->is_virtual_ref || ref->is_cell_image) continue;
+                ref->start_row -= vertical_shrink_size;
+            }
+        }
+    }
 }
 
 void

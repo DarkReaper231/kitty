@@ -374,8 +374,25 @@ def multi_replace(src: str, **replacements: Any) -> str:
 
 class LoadShaderPrograms:
 
-    def __call__(self, semi_transparent: bool = False) -> None:
-        compile_program(BLIT_PROGRAM, *load_shaders('blit'))
+    text_fg_override_threshold: float = 0
+    text_old_gamma: bool = False
+    semi_transparent: bool = False
+
+    @property
+    def needs_recompile(self) -> bool:
+        opts = get_options()
+        return opts.text_fg_override_threshold != self.text_fg_override_threshold or (opts.text_composition_strategy == 'legacy') != self.text_old_gamma
+
+    def recompile_if_needed(self) -> None:
+        if self.needs_recompile:
+            self(self.semi_transparent, allow_recompile=True)
+
+    def __call__(self, semi_transparent: bool = False, allow_recompile: bool = False) -> None:
+        self.semi_transparent = semi_transparent
+        opts = get_options()
+        self.text_old_gamma = opts.text_composition_strategy == 'legacy'
+        self.text_fg_override_threshold = max(0, min(opts.text_fg_override_threshold, 100)) * 0.01
+        compile_program(BLIT_PROGRAM, *load_shaders('blit'), allow_recompile)
         v, f = load_shaders('cell')
 
         for which, p in {
@@ -397,10 +414,14 @@ class LoadShaderPrograms:
                 DECORATION_MASK=DECORATION_MASK,
                 STRIKE_SPRITE_INDEX=NUM_UNDERLINE_STYLES + 1,
             )
+            if self.text_fg_override_threshold != 0.:
+                ff = ff.replace('#define NO_FG_OVERRIDE', f'#define FG_OVERRIDE {self.text_fg_override_threshold}')
+            if self.text_old_gamma:
+                ff = ff.replace('#define TEXT_NEW_GAMMA', '#define TEXT_OLD_GAMMA')
             if semi_transparent:
                 vv = vv.replace('#define NOT_TRANSPARENT', '#define TRANSPARENT')
                 ff = ff.replace('#define NOT_TRANSPARENT', '#define TRANSPARENT')
-            compile_program(p, vv, ff)
+            compile_program(p, vv, ff, allow_recompile)
 
         v, f = load_shaders('graphics')
         for which, p in {
@@ -409,12 +430,12 @@ class LoadShaderPrograms:
                 'ALPHA_MASK': GRAPHICS_ALPHA_MASK_PROGRAM,
         }.items():
             ff = f.replace('ALPHA_TYPE', which)
-            compile_program(p, v, ff)
+            compile_program(p, v, ff, allow_recompile)
 
         v, f = load_shaders('bgimage')
-        compile_program(BGIMAGE_PROGRAM, v, f)
+        compile_program(BGIMAGE_PROGRAM, v, f, allow_recompile)
         v, f = load_shaders('tint')
-        compile_program(TINT_PROGRAM, v, f)
+        compile_program(TINT_PROGRAM, v, f, allow_recompile)
         init_cell_program()
 
 
@@ -597,6 +618,7 @@ class Window:
         self.default_title = os.path.basename(child.argv[0] or appname)
         self.child_title = self.default_title
         self.title_stack: Deque[str] = deque(maxlen=10)
+        self.user_vars: Dict[str, bytes] = {}
         self.id: int = add_window(tab.os_window_id, tab.id, self.title)
         self.clipboard_request_manager = ClipboardRequestManager(self.id)
         self.margin = EdgeWidths()
@@ -922,7 +944,27 @@ class Window:
         self.override_title = title or None
         self.title_updated()
 
+    def set_user_var(self, key: str, val: Optional[bytes]) -> None:
+        self.user_vars.pop(key, None)  # ensure key will be newest in user_vars even if already present
+        if len(self.user_vars) > 64:  # dont store too many user vars
+            oldest_key = next(iter(self.user_vars))
+            self.user_vars.pop(oldest_key)
+        if val is not None:
+            self.user_vars[key] = val
+
+    # screen callbacks {{{
+
+    def osc_1337(self, raw_data: str) -> None:
+        for record in raw_data.split(';'):
+            key, _, val = record.partition('=')
+            if key == 'SetUserVar':
+                from base64 import standard_b64decode
+                ukey, has_equal, uval = val.partition('=')
+                self.set_user_var(ukey, (standard_b64decode(uval) if uval else b'') if has_equal == '=' else None)
+
     def desktop_notify(self, osc_code: int, raw_data: str) -> None:
+        if osc_code == 1337:
+            self.osc_1337(raw_data)
         if osc_code == 777:
             if not raw_data.startswith('notify;'):
                 log_error(f'Ignoring unknown OSC 777: {raw_data}')
@@ -932,7 +974,6 @@ class Window:
         if cmd is not None and osc_code == 99:
             self.prev_osc99_cmd = cmd
 
-    # screen callbacks {{{
     def use_utf8(self, on: bool) -> None:
         get_boss().child_monitor.set_iutf8_winid(self.id, on)
 
@@ -1004,7 +1045,7 @@ class Window:
             '--ssh-connection-data', json.dumps(conn_data)
         )
 
-    def send_signal_for_key(self, key_num: int) -> bool:
+    def send_signal_for_key(self, key_num: bytes) -> bool:
         try:
             return self.child.send_signal_for_key(key_num)
         except OSError as err:

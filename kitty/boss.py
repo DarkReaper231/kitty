@@ -10,6 +10,7 @@ import sys
 from contextlib import contextmanager, suppress
 from functools import partial
 from gettext import gettext as _
+from gettext import ngettext
 from time import monotonic, sleep
 from typing import (
     TYPE_CHECKING,
@@ -146,7 +147,7 @@ from .utils import (
     startup_notification_handler,
     which,
 )
-from .window import CommandOutput, CwdRequest, Window
+from .window import CommandOutput, CwdRequest, Window, load_shader_programs
 
 if TYPE_CHECKING:
     from .rc.base import ResponseType
@@ -1010,9 +1011,8 @@ class Boss:
             tm = tab.tab_manager_ref()
             if tm is not None:
                 tm.set_active_tab(tab)
-        self.confirm(_(
-            'Are you sure you want to close this tab, it has {}'
-            ' windows running?').format(num),
+        self.confirm(ngettext('Are you sure you want to close this tab, it has one window running?',
+                              'Are you sure you want to close this tab, it has {} windows running?', num).format(num),
             self.handle_close_tab_confirmation, tab.id,
             window=tab.active_window,
         )
@@ -1602,8 +1602,8 @@ class Boss:
         if tm is not None:
             w = tm.active_window
             self.confirm(
-                _('Are you sure you want to close this OS window, it has {}'
-                  ' windows running?').format(num),
+                ngettext('Are you sure you want to close this OS window, it has one window running?',
+                         'Are you sure you want to close this OS window, it has {} windows running', num).format(num),
                 self.handle_close_os_window_confirmation, os_window_id,
                 window=w,
             )
@@ -1642,7 +1642,8 @@ class Boss:
             return
         assert tm is not None
         self.confirm(
-            _('Are you sure you want to quit kitty, it has {} windows running?').format(num),
+            ngettext('Are you sure you want to quit kitty, it has one window running?',
+                     'Are you sure you want to quit kitty, it has {} windows running?', num).format(num),
             self.handle_quit_confirmation,
             window=tm.active_window,
         )
@@ -1812,7 +1813,8 @@ class Boss:
         'tab', '''
         Change the title of the active tab interactively, by typing in the new title.
         If you specify an argument to this action then that is used as the title instead of asking for it.
-        Use the empty string ("") to reset the title to default. For example::
+        Use the empty string ("") to reset the title to default. Use a space (" ") to indicate that the
+        prompt should not be pre-filled. For example::
 
             # interactive usage
             map f1 set_tab_title
@@ -1820,19 +1822,24 @@ class Boss:
             map f2 set_tab_title some title
             # reset to default
             map f3 set_tab_title ""
+            # interactive usage without prefilled prompt
+            map f3 set_tab_title " "
         '''
     )
     def set_tab_title(self, title: Optional[str] = None) -> None:
         tab = self.active_tab
         if tab:
-            if title is not None:
+            if title is not None and title not in ('" "', "' '"):
                 if title in ('""', "''"):
                     title = ''
                 tab.set_title(title)
                 return
+            prefilled = tab.name or tab.title
+            if title in ('" "', "' '"):
+                prefilled = ''
             args = [
                 '--name=tab-title', '--message', _('Enter the new title for this tab below.'),
-                '--default', tab.name or tab.title, 'do_set_tab_title', str(tab.id)]
+                '--default', prefilled, 'do_set_tab_title', str(tab.id)]
             self.run_kitten_with_metadata('ask', args)
 
     def do_set_tab_title(self, title: str, tab_id: int) -> None:
@@ -2402,6 +2409,7 @@ class Boss:
         for w in self.all_windows:
             self.default_bg_changed_for(w.id)
             w.refresh(reload_all_gpu_data=True)
+        load_shader_programs.recompile_if_needed()
 
     @ac('misc', '''
         Reload the config file
@@ -2628,7 +2636,7 @@ class Boss:
             where = 'new' if args[0] == 'new-tab' else args[0][4:]
             return self._move_window_to(target_tab_id=where)
         ct = self.active_tab
-        items: List[Tuple[Union[str, int], str]] = [(t.id, t.title) for t in self.all_tabs if t is not ct]
+        items: List[Tuple[Union[str, int], str]] = [(t.id, t.effective_title) for t in self.all_tabs if t is not ct]
         items.append(('new_tab', 'New tab'))
         items.append(('new_os_window', 'New OS Window'))
         target_window = self.active_window

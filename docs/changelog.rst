@@ -35,7 +35,50 @@ mouse anywhere in the current command to move the cursor there. See
 Detailed list of changes
 -------------------------------------
 
-0.28.0 [future]
+0.28.2 [future]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- A new escape code ``<ESC>[22J`` that moves the current contents of the screen into the scrollback before clearing it
+
+- A new option :opt:`text_fg_override_threshold` to force text colors to have high contrast regardless of color scheme (:pull:`6283`)
+
+- unicode_input kitten: Fix a regression in 0.28.0 that caused the order of recent and favorites entries to not be respected (:iss:`6214`)
+
+- unicode_input kitten: Fix a regression in 0.28.0 that caused editing of favorites to sometimes hang
+
+- clipboard kitten: Fix a bug causing the last MIME type available on the clipboard not being recognized when pasting
+
+- Fix regression in 0.28.0 causing color fringing when rendering in transparent windows on light backgrounds (:iss:`6209`)
+
+- show_key kitten: In kitty mode show the actual bytes sent by the terminal rather than a re-encoding of the parsed key event
+
+- hints kitten: Fix a regression in 0.28.0 that broke using sub-groups in regexp captures (:iss:`6228`)
+
+- hints kitten: Fix a regression in 0.28.0 that broke using lookahead/lookbehind in regexp captures (:iss:`6265`)
+
+- diff kitten: Fix a regression in 0.28.0 that broke using relative paths as arguments to the kitten (:iss:`6325`)
+
+- Fix re-using the image id of an animated image for a still image causing a crash (:iss:`6244`)
+
+- kitty +open: Ask for permission before executing script files that are not marked as executable. This prevents accidental execution
+  of script files via MIME type association from programs that unconditionally "open" attachments/downloaded files
+
+- edit-in-kitty: Fix running edit-in-kitty with elevated privileges to edit a restricted file not working (:disc:`6245`)
+
+- ssh kitten: Fix a regression in 0.28.0 that caused interrupt during setup to not be handled gracefully (:iss:`6254`)
+
+- Graphics: Move images up along with text when the window is shrunk vertically (:iss:`6278`)
+
+0.28.1 [2023-04-21]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Fix a regression in the previous release that broke the remote file kitten (:iss:`6186`)
+
+- Fix a regression in the previous release that broke handling of some keyboard shortcuts in some kittens on some keyboard layouts (:iss:`6189`)
+
+- Fix a regression in the previous release that broke usage of custom themes (:iss:`6191`)
+
+0.28.0 [2023-04-15]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - **Text rendering change**: Use sRGB correct linear gamma blending for nicer font

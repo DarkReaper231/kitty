@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path"
 	"path/filepath"
@@ -669,6 +670,9 @@ func run_ssh(ssh_args, server_args, found_extra_args []string) (rc int, err erro
 	if err != nil {
 		return 1, err
 	}
+	sigs := make(chan os.Signal, 8)
+	signal.Notify(sigs, unix.SIGINT, unix.SIGTERM)
+
 	if !cd.request_data {
 		rq := fmt.Sprintf("id=%s:pwfile=%s:pw=%s", cd.replacements["REQUEST_ID"], cd.replacements["PASSWORD_FILENAME"], cd.replacements["DATA_PASSWORD"])
 		err := term.ApplyOperations(tty.TCSANOW, tty.SetNoEcho)
@@ -685,11 +689,22 @@ func run_ssh(ssh_args, server_args, found_extra_args []string) (rc int, err erro
 			return 1, err
 		}
 	}
+	go func() {
+		_ = <-sigs
+		// ignore any interrupt and terminate signals as they will usually be sent to the ssh child process as well
+		// and we are waiting on that.
+	}()
 	err = c.Wait()
 	drain_potential_tty_garbage(term)
+	signal.Reset(unix.SIGINT, unix.SIGTERM)
 	if err != nil {
 		var exit_err *exec.ExitError
 		if errors.As(err, &exit_err) {
+			if state := exit_err.ProcessState.String(); state == "signal: interrupt" {
+				unix.Kill(os.Getpid(), unix.SIGINT)
+				// Give the signal time to be delivered
+				time.Sleep(20 * time.Millisecond)
+			}
 			return exit_err.ExitCode(), nil
 		}
 		return 1, err

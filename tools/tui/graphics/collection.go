@@ -86,6 +86,9 @@ func (self *ImageCollection) GetSizeIfAvailable(key string, page_size Size) (Siz
 	}
 	ans := img.renderings[page_size]
 	if ans == nil {
+		if img.err != nil {
+			return Size{}, img.err
+		}
 		return Size{}, ErrNotFound
 	}
 	return Size{ans.img.Width, ans.img.Height}, img.err
@@ -138,7 +141,9 @@ func (self *ImageCollection) ResizeForPageSize(width, height int) {
 	ctx.Parallel(0, len(keys), func(nums <-chan int) {
 		for i := range nums {
 			img := self.images[keys[i]]
-			img.ResizeForPageSize(width, height)
+			if img.src.loaded && img.err == nil {
+				img.ResizeForPageSize(width, height)
+			}
 		}
 	})
 }
@@ -298,6 +303,7 @@ func (self *ImageCollection) LoadAll() {
 				if img.err == nil {
 					img.src.size.Width, img.src.size.Height = img.src.data.Width, img.src.data.Height
 				}
+				img.src.loaded = true
 			}
 		}
 	})

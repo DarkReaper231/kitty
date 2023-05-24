@@ -70,7 +70,7 @@ words "HELLO WORLD" display in kitty as "WORLD HELLO", and if you try to select
 a substring of an RTL-shaped string, you will get the character that would be
 there had the the string been LTR. For example, assuming the Hebrew word
 ירושלים, selecting the character that on the screen appears to be ם actually
-writes into the selection buffer the character י.  kitty's default behavior is
+writes into the selection buffer the character י. kitty's default behavior is
 useful in conjunction with a filter to reverse the word order, however, if you
 wish to manipulate RTL glyphs, it can be very challenging to work with, so this
 option is provided to turn it off. Furthermore, this option can be used with the
@@ -249,7 +249,7 @@ light text on dark backgrounds thinner. It might also make some text appear like
 the strokes are uneven.
 
 You can fine tune the actual contrast curve used for glyph composition by
-specifying two space separated numbers for this setting.
+specifying up to two space-separated numbers for this setting.
 
 The first number is the gamma adjustment, which controls the thickness of dark
 text on light backgrounds. Increasing the value will make text appear thicker.
@@ -267,6 +267,18 @@ If you wish to achieve similar looking thickness in light and dark themes, a goo
 to experiment is start by setting the value to :code:`1.0 0` and use a dark theme.
 Then adjust the second parameter until it looks good. Then switch to a light theme
 and adjust the first parameter until the perceived thickness matches the dark theme.
+''')
+
+opt('text_fg_override_threshold', 0, option_type='float', long_text='''
+The minimum accepted difference in luminance between the foreground and background
+color, below which kitty will override the foreground color. It is percentage
+ranging from :code:`0` to :code:`100`. If the difference in luminance of the
+foreground and background is below this threshold, the foreground color will be set
+to white if the background is dark or black if the background is light. The default
+value is :code:`0`, which means no overriding is performed. Useful when working with applications
+that use colors that do not contrast well with your preferred color scheme. Note that this
+will not work in situations where kitty has to render in multiple passes, for example,
+when rendering with images under text or with non-opaque background and images.
 ''')
 
 egr()  # }}}
@@ -1252,7 +1264,7 @@ use :code:`{sup.index}`. All data available is:
 :code:`num_windows`
     The number of windows in the tab.
 :code:`num_window_groups`
-    The number of window groups (not counting overlay windows) in the tab.
+    The number of window groups (a window group is a window and all of its overlay windows) in the tab.
 :code:`tab.active_wd`
     The working directory of the currently active window in the tab
     (expensive, requires syscall). Use :code:`active_oldest_wd` to get
@@ -3990,18 +4002,31 @@ You can create shortcuts to clear/reset the terminal. For example::
 If you want to operate on all kitty windows instead of just the current one, use
 :italic:`all` instead of :italic:`active`.
 
-It is also possible to remap :kbd:`Ctrl+L` to both scroll the current screen
+Some useful functions that can be defined in the shell rc files to perform various kinds of
+clearing of the current window:
+
+.. code-block:: sh
+
+    clear-only-screen() {
+        printf "\e[H\e[2J"
+    }
+
+    clear-screen-and-scrollback() {
+        printf "\e[H\e[3J"
+    }
+
+    clear-screen-saving-contents-in-scrollback() {
+        printf "\e[H\e[22J"
+    }
+
+For instance, using these functions, it is possible to remap :kbd:`Ctrl+L` to both scroll the current screen
 contents into the scrollback buffer and clear the screen, instead of just
-clearing the screen, for example, for ZSH add the following to :file:`~/.zshrc`:
+clearing the screen. For ZSH, in :file:`~/.zshrc` after the above functions, add:
 
 .. code-block:: zsh
 
-    scroll-and-clear-screen() {
-        printf '\\n%.0s' {1..$LINES}
-        zle clear-screen
-    }
-    zle -N scroll-and-clear-screen
-    bindkey '^l' scroll-and-clear-screen
+    zle -N clear-screen-saving-contents-in-scrollback
+    bindkey '^l' clear-screen-saving-contents-in-scrollback
 
 '''
     )

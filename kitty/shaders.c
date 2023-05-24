@@ -434,8 +434,13 @@ draw_bg(OSWindow *w) {
 
     glUniform1i(bgimage_program_layout.image_location, BGIMAGE_UNIT);
     glUniform1f(bgimage_program_layout.opacity_location, OPT(background_opacity));
+#ifdef __APPLE__
+    int window_width = w->window_width, window_height = w->window_height;
+#else
+    int window_width = w->viewport_width, window_height = w->viewport_height;
+#endif
     glUniform4f(bgimage_program_layout.sizes_location,
-        (GLfloat)w->viewport_width, (GLfloat)w->viewport_height, (GLfloat)w->bgimage->width, (GLfloat)w->bgimage->height);
+        (GLfloat)window_width, (GLfloat)window_height, (GLfloat)w->bgimage->width, (GLfloat)w->bgimage->height);
     glUniform1f(bgimage_program_layout.premult_location, w->is_semi_transparent ? 1.f : 0.f);
     GLfloat tiled = 0.f;;
     GLfloat left = -1.0, top = 1.0, right = 1.0, bottom = -1.0;
@@ -446,12 +451,12 @@ draw_bg(OSWindow *w) {
             tiled = 0.f; break;
         case CENTER_CLAMPED:
             tiled = 1.f;
-            if (w->viewport_width > (int)w->bgimage->width) {
-                GLfloat frac = (w->viewport_width - w->bgimage->width) / (GLfloat)w->viewport_width;
+            if (window_width > (int)w->bgimage->width) {
+                GLfloat frac = (window_width - w->bgimage->width) / (GLfloat)window_width;
                 left += frac; right += frac;
             }
-            if (w->viewport_height > (int)w->bgimage->height) {
-                GLfloat frac = (w->viewport_height - w->bgimage->height) / (GLfloat)w->viewport_height;
+            if (window_height > (int)w->bgimage->height) {
+                GLfloat frac = (window_height - w->bgimage->height) / (GLfloat)window_height;
                 top -= frac; bottom -= frac;
             }
             break;
@@ -565,8 +570,6 @@ set_cell_uniforms(float current_inactive_text_alpha, bool force) {
         S(CELL_PROGRAM, sprites, SPRITE_MAP_UNIT, 1i); S(CELL_FG_PROGRAM, sprites, SPRITE_MAP_UNIT, 1i);
         S(CELL_PROGRAM, dim_opacity, OPT(dim_opacity), 1f); S(CELL_FG_PROGRAM, dim_opacity, OPT(dim_opacity), 1f);
         S(CELL_BG_PROGRAM, defaultbg, OPT(background), 1f);
-        int text_old_gamma = OPT(text_old_gamma) ? 1 : 0;
-        S(CELL_PROGRAM, text_old_gamma, text_old_gamma, 1i); S(CELL_FG_PROGRAM, text_old_gamma, text_old_gamma, 1i);
         float text_contrast = 1.0f + OPT(text_contrast) * 0.01f;
         S(CELL_PROGRAM, text_contrast, text_contrast, 1f); S(CELL_FG_PROGRAM, text_contrast, text_contrast, 1f);
         float text_gamma_adjustment = OPT(text_gamma_adjustment) < 0.01f ? 1.0f : 1.0f / OPT(text_gamma_adjustment);
@@ -979,7 +982,7 @@ draw_cells(ssize_t vao_idx, ssize_t gvao_idx, const ScreenRenderData *srd, float
 // }}}
 
 // Borders {{{
-enum BorderUniforms { BORDER_viewport, BORDER_background_opacity, BORDER_tint_opacity, BORDER_tint_premult, BORDER_colors, BORDER_gamma_lut, NUM_BORDER_UNIFORMS };
+enum BorderUniforms { BORDER_viewport, BORDER_background_opacity, BORDER_tint_opacity, BORDER_tint_premult, BORDER_colors, BORDER_gamma_lut, BORDER_do_srgb_correction, NUM_BORDER_UNIFORMS };
 static GLint border_uniform_locations[NUM_BORDER_UNIFORMS] = {0};
 
 static void
@@ -989,6 +992,7 @@ init_borders_program(void) {
         SET_LOC(background_opacity)
         SET_LOC(tint_opacity)
         SET_LOC(tint_premult)
+        SET_LOC(do_srgb_correction)
         SET_LOC(colors)
         SET_LOC(gamma_lut)
 #undef SET_LOC
@@ -1012,6 +1016,7 @@ draw_borders(ssize_t vao_idx, unsigned int num_border_rects, BorderRect *rect_bu
     float background_opacity = w->is_semi_transparent ? w->background_opacity: 1.0f;
     float tint_opacity = background_opacity;
     float tint_premult = background_opacity;
+    float do_srgb_correction = 1.0f;
     if (has_bgimage(w)) {
         glEnable(GL_BLEND);
         BLEND_ONTO_OPAQUE;
@@ -1020,6 +1025,7 @@ draw_borders(ssize_t vao_idx, unsigned int num_border_rects, BorderRect *rect_bu
         background_opacity = 1.0f;
         tint_opacity = OPT(background_tint) * OPT(background_tint_gaps);
         tint_premult = w->is_semi_transparent ? OPT(background_tint) : 1.0f;
+        do_srgb_correction = 0.0f;
     }
 
     if (num_border_rects) {
@@ -1041,6 +1047,7 @@ draw_borders(ssize_t vao_idx, unsigned int num_border_rects, BorderRect *rect_bu
         glUniform1f(border_uniform_locations[BORDER_background_opacity], background_opacity);
         glUniform1f(border_uniform_locations[BORDER_tint_opacity], tint_opacity);
         glUniform1f(border_uniform_locations[BORDER_tint_premult], tint_premult);
+        glUniform1f(border_uniform_locations[BORDER_do_srgb_correction], do_srgb_correction);
         glUniform2ui(border_uniform_locations[BORDER_viewport], viewport_width, viewport_height);
         glUniform1fv(border_uniform_locations[BORDER_gamma_lut], 256, srgb_lut);
         if (has_bgimage(w)) {
@@ -1060,12 +1067,15 @@ draw_borders(ssize_t vao_idx, unsigned int num_border_rects, BorderRect *rect_bu
 static PyObject*
 compile_program(PyObject UNUSED *self, PyObject *args) {
     const char *vertex_shader, *fragment_shader;
-    int which;
+    int which, allow_recompile = 0;
     GLuint vertex_shader_id = 0, fragment_shader_id = 0;
-    if (!PyArg_ParseTuple(args, "iss", &which, &vertex_shader, &fragment_shader)) return NULL;
+    if (!PyArg_ParseTuple(args, "iss|p", &which, &vertex_shader, &fragment_shader, &allow_recompile)) return NULL;
     if (which < 0 || which >= NUM_PROGRAMS) { PyErr_Format(PyExc_ValueError, "Unknown program: %d", which); return NULL; }
     Program *program = program_ptr(which);
-    if (program->id != 0) { PyErr_SetString(PyExc_ValueError, "program already compiled"); return NULL; }
+    if (program->id != 0) {
+        if (allow_recompile) { glDeleteProgram(program->id); program->id = 0; }
+        else { PyErr_SetString(PyExc_ValueError, "program already compiled"); return NULL; }
+    }
     program->id = glCreateProgram();
     vertex_shader_id = compile_shader(GL_VERTEX_SHADER, vertex_shader);
     fragment_shader_id = compile_shader(GL_FRAGMENT_SHADER, fragment_shader);

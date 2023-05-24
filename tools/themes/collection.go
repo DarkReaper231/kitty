@@ -463,7 +463,7 @@ type ThemeMetadata struct {
 	Author       string `json:"author"`
 }
 
-func parse_theme_metadata(path string) (*ThemeMetadata, map[string]string, error) {
+func ParseThemeMetadata(path string) (*ThemeMetadata, map[string]string, error) {
 	var in_metadata, in_blurb, finished_metadata bool
 	ans := ThemeMetadata{}
 	settings := map[string]string{}
@@ -507,7 +507,9 @@ func parse_theme_metadata(path string) (*ThemeMetadata, map[string]string, error
 		val = strings.TrimSpace(val)
 		switch key {
 		case "name":
-			ans.Name = val
+			if val != "The name of the theme (if not present, derived from filename)" {
+				ans.Name = val
+			}
 		case "author":
 			ans.Author = val
 		case "upstream":
@@ -532,10 +534,11 @@ func parse_theme_metadata(path string) (*ThemeMetadata, map[string]string, error
 type Theme struct {
 	metadata *ThemeMetadata
 
-	code            string
-	settings        map[string]string
-	zip_reader      *zip.File
-	is_user_defined bool
+	code                        string
+	settings                    map[string]string
+	zip_reader                  *zip.File
+	is_user_defined             bool
+	path_for_user_defined_theme string
 }
 
 func (self *Theme) Name() string        { return self.metadata.Name }
@@ -557,6 +560,13 @@ func (self *Theme) load_code() (string, error) {
 			return "", err
 		}
 		self.code = utils.UnsafeBytesToString(data)
+	}
+	if self.is_user_defined && self.path_for_user_defined_theme != "" && self.code == "" {
+		raw, err := os.ReadFile(self.path_for_user_defined_theme)
+		if err != nil {
+			return "", err
+		}
+		self.code = utils.UnsafeBytesToString(raw)
 	}
 	return self.code, nil
 }
@@ -774,7 +784,7 @@ var camel_case_pat = (&utils.Once[*regexp.Regexp]{Run: func() *regexp.Regexp {
 	return regexp.MustCompile(`([a-z])([A-Z])`)
 }}).Get
 
-func theme_name_from_file_name(fname string) string {
+func ThemeNameFromFileName(fname string) string {
 	fname = fname[:len(fname)-len(path.Ext(fname))]
 	fname = strings.ReplaceAll(fname, "_", " ")
 	fname = camel_case_pat().ReplaceAllString(fname, "$1 $2")
@@ -806,14 +816,14 @@ func (self *Themes) Filtered(is_ok func(*Theme) bool) *Themes {
 }
 
 func (self *Themes) AddFromFile(path string) (*Theme, error) {
-	m, conf, err := parse_theme_metadata(path)
+	m, conf, err := ParseThemeMetadata(path)
 	if err != nil {
 		return nil, err
 	}
 	if m.Name == "" {
-		m.Name = theme_name_from_file_name(filepath.Base(path))
+		m.Name = ThemeNameFromFileName(filepath.Base(path))
 	}
-	t := Theme{metadata: m, is_user_defined: true, settings: conf}
+	t := Theme{metadata: m, is_user_defined: true, settings: conf, path_for_user_defined_theme: path}
 	self.name_map[m.Name] = &t
 	return &t, nil
 
@@ -829,7 +839,13 @@ func (self *Themes) add_from_dir(dirpath string) error {
 	}
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".conf") {
-			if _, err = self.AddFromFile(filepath.Join(dirpath, e.Name())); err != nil {
+			path := filepath.Join(dirpath, e.Name())
+			// ignore files if they are the STDOUT of the current processes
+			// allows using kitten theme --dump-theme name > ~/.config/kitty/themes/name.conf
+			if utils.Samefile(path, os.Stdout) {
+				continue
+			}
+			if _, err = self.AddFromFile(path); err != nil {
 				return err
 			}
 		}

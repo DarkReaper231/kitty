@@ -47,7 +47,7 @@ func TestHintMarking(t *testing.T) {
 		for _, m := range marks {
 			q := strings.NewReplacer("\n", "", "\r", "", "\x00", "").Replace(ptext[m.Start:m.End])
 			if diff := cmp.Diff(m.Text, q); diff != "" {
-				t.Fatalf("Mark start and end dont point to correct offset in text for %#v\n%s", text, diff)
+				t.Fatalf("Mark start (%d) and end (%d) dont point to correct offset in text for %#v\n%s", m.Start, m.End, text, diff)
 			}
 		}
 		return
@@ -106,6 +106,18 @@ func TestHintMarking(t *testing.T) {
 	r(`::1`, `::1`)
 	r(`255.255.255.256`)
 	r(`:1`)
+
+	reset()
+	opts.Type = "regex"
+	opts.Regex = `(?ms)^[*]?\s(\S+)`
+	r(`* 2b687c2 - test1`, `2b687c2`)
+	opts.Regex = `(?<=got:    )sha256.{4}`
+	r(`got:    sha256-L8=`, `sha256-L8=`)
+
+	reset()
+	opts.Type = "word"
+	r(`#one (two) 😍 a-1b `, `#one`, `two`, `a-1b`)
+	r("fōtiz час a\u0310b ", `fōtiz`, `час`, "a\u0310b")
 
 	reset()
 	tdir := t.TempDir()
