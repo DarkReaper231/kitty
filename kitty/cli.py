@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2017, Kovid Goyal <kovid at kovidgoyal.net>
 
 import os
 import re
-import shlex
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -17,6 +16,7 @@ from .fast_data_types import wcswidth
 from .options.types import Options as KittyOpts
 from .types import run_once
 from .typing import BadLineType, TypedDict
+from .utils import shlex_split
 
 
 class CompletionType(Enum):
@@ -45,7 +45,7 @@ class CompletionSpec:
     @staticmethod
     def from_string(raw: str) -> 'CompletionSpec':
         self = CompletionSpec()
-        for x in shlex.split(raw):
+        for x in shlex_split(raw):
             ck, vv = x.split(':', 1)
             if ck == 'type':
                 self.type = getattr(CompletionType, vv)
@@ -847,7 +847,7 @@ def parse_cmdline(oc: Options, disabled: OptionSpecSeq, ans: Any, args: Optional
 def options_spec() -> str:
     if not hasattr(options_spec, 'ans'):
         OPTIONS = '''
---class
+--class --app-id
 dest=cls
 default={appname}
 condition=not is_macos
@@ -889,24 +889,27 @@ Change to the specified directory when launching.
 --detach
 type=bool-set
 condition=not is_macos
-Detach from the controlling terminal, if any. Not available on macOS.
+Detach from the controlling terminal, if any. Not available on macOS. On macOS
+use :code:`open -a kitty.app -n` instead.
 
 
 --session
 completion=type:file ext:session relative:conf group:"Session files"
 Path to a file containing the startup :italic:`session` (tabs, windows, layout,
-programs). Use - to read from STDIN. See the :file:`README` file for details and
+programs). Use - to read from STDIN. See :ref:`sessions` for details and
 an example. Environment variables in the file name are expanded,
 relative paths are resolved relative to the kitty configuration directory.
 The special value :code:`none` means no session will be used, even if
 the :opt:`startup_session` option has been specified in kitty.conf.
+Note that using this option means the command line arguments to kitty specifying
+a program to run are ignored.
 
 
 --hold
 type=bool-set
-Remain open after child process exits. Note that this only affects the first
-window. You can quit by either using the close window shortcut or pressing any
-key.
+Remain open, at a shell prompt, after child process exits. Note that this only
+affects the first window. You can quit by either using the close window
+shortcut or running the exit command.
 
 
 --single-instance -1
@@ -943,13 +946,13 @@ Listen on the specified socket address for control messages. For example,
 UNIX sockets, not associated with a file, like this: :option:`{appname}
 --listen-on`=unix:@mykitty. Environment variables are expanded and relative
 paths are resolved with respect to the temporary directory. To control kitty,
-you can send commands to it with :italic:`{appname} @` using the
-:option:`{appname} @ --to` option to specify this address. Note that if you run
-:italic:`{appname} @` within a kitty window, there is no need to specify the
-:option:`{appname} @ --to` option as it will automatically read from the
+you can send commands to it with :italic:`kitten @` using the
+:option:`kitten @ --to` option to specify this address. Note that if you run
+:italic:`kitten @` within a kitty window, there is no need to specify the
+:option:`kitten @ --to` option as it will automatically read from the
 environment. Note that this will be ignored unless :opt:`allow_remote_control`
-is set to either: :code:`yes`, :code:`socket` or :code:`socket-only`.  For UNIX
-sockets, this can also be specified in :file:`{conf_name}.conf`.
+is set to either: :code:`yes`, :code:`socket` or :code:`socket-only`. This can
+also be specified in :file:`kitty.conf`.
 
 
 --start-as
@@ -1065,12 +1068,20 @@ def default_config_paths(conf_paths: Sequence[str]) -> Tuple[str, ...]:
     return tuple(resolve_config(SYSTEM_CONF, defconf, conf_paths))
 
 
+@run_once
+def override_pat() -> 're.Pattern[str]':
+    return re.compile(r'^([a-zA-Z0-9_]+)[ \t]*=')
+
+
+def parse_override(x: str) -> str:
+    # Does not cover the case where `name =` when `=` is the value.
+    return override_pat().sub(r'\1 ', x.lstrip())
+
+
 def create_opts(args: CLIOptions, accumulate_bad_lines: Optional[List[BadLineType]] = None) -> KittyOpts:
     from .config import load_config
     config = default_config_paths(args.config)
-    # Does not cover the case where `name =` when `=` is the value.
-    pat = re.compile(r'^([a-zA-Z0-9_]+)[ \t]*=')
-    overrides = (pat.sub(r'\1 ', a.lstrip()) for a in args.override or ())
+    overrides = map(parse_override, args.override or ())
     opts = load_config(*config, overrides=overrides, accumulate_bad_lines=accumulate_bad_lines)
     return opts
 

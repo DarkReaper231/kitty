@@ -2,10 +2,31 @@
 # License: GPLv3 Copyright: 2021, Kovid Goyal <kovid at kovidgoyal.net>
 
 
+import enum
 import re
 import sys
+from collections import defaultdict
+from dataclasses import dataclass, fields
 from functools import lru_cache
-from typing import Any, Callable, Container, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Container,
+    Dict,
+    FrozenSet,
+    Generic,
+    Iterable,
+    Iterator,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+    get_args,
+)
 
 import kitty.fast_data_types as defines
 from kitty.conf.utils import (
@@ -23,18 +44,16 @@ from kitty.conf.utils import (
     unit_float,
 )
 from kitty.constants import is_macos
-from kitty.fast_data_types import CURSOR_BEAM, CURSOR_BLOCK, CURSOR_UNDERLINE, Color, SingleKey
-from kitty.fonts import FontFeature, FontModification, ModificationType, ModificationUnit, ModificationValue
+from kitty.fast_data_types import CURSOR_BEAM, CURSOR_BLOCK, CURSOR_UNDERLINE, NO_CURSOR_SHAPE, Color, Shlex, SingleKey
+from kitty.fonts import FontModification, FontSpec, ModificationType, ModificationUnit, ModificationValue
 from kitty.key_names import character_key_name_aliases, functional_key_name_aliases, get_key_name_lookup
 from kitty.rgb import color_as_int
 from kitty.types import FloatEdges, MouseEvent
-from kitty.utils import expandvars, log_error, resolve_abs_or_config_path
+from kitty.utils import expandvars, log_error, resolve_abs_or_config_path, shlex_split
 
-KeyMap = Dict[SingleKey, str]
+KeyMap = Dict[SingleKey, List['KeyDefinition']]
 MouseMap = Dict[MouseEvent, str]
 KeySequence = Tuple[SingleKey, ...]
-SubSequenceMap = Dict[KeySequence, str]
-SequenceMap = Dict[SingleKey, SubSequenceMap]
 MINIMUM_FONT_SIZE = 4
 default_tab_separator = ' ┇'
 mod_map = {'⌃': 'CONTROL', 'CTRL': 'CONTROL', '⇧': 'SHIFT', '⌥': 'ALT', 'OPTION': 'ALT', 'OPT': 'ALT',
@@ -50,6 +69,12 @@ func_with_args = KeyFuncWrapper[FuncArgsType]()
 DELETE_ENV_VAR = '_delete_this_env_var_'
 
 
+class MapType(enum.Enum):
+    MAP = 'map'
+    MOUSE_MAP = 'mouse_map'
+    OPEN_ACTION = 'open_action'
+
+
 class InvalidMods(ValueError):
     pass
 
@@ -58,7 +83,7 @@ class InvalidMods(ValueError):
 @func_with_args(
     'pass_selection_to_program', 'new_window', 'new_tab', 'new_os_window',
     'new_window_with_cwd', 'new_tab_with_cwd', 'new_os_window_with_cwd',
-    'launch', 'mouse_handle_click'
+    'launch', 'mouse_handle_click', 'show_error',
     )
 def shlex_parse(func: str, rest: str) -> FuncArgsType:
     return func, to_cmdline(rest)
@@ -66,6 +91,11 @@ def shlex_parse(func: str, rest: str) -> FuncArgsType:
 
 def parse_send_text_bytes(text: str) -> bytes:
     return defines.expand_ansi_c_escapes(text).encode('utf-8')
+
+
+@func_with_args('scroll_prompt_to_top')
+def scroll_prompt_to_top(func: str, rest: str) -> FuncArgsType:
+    return func, [to_bool(rest) if rest else False]
 
 
 @func_with_args('send_text')
@@ -80,6 +110,11 @@ def send_text_parse(func: str, rest: str) -> FuncArgsType:
         except Exception:
             log_error('Ignoring invalid send_text string: ' + args[1])
     return func, [mode, data]
+
+
+@func_with_args('send_key')
+def send_key(func: str, rest: str) -> FuncArgsType:
+    return func, rest.split()
 
 
 @func_with_args('run_kitten', 'run_simple_kitten', 'kitten')
@@ -114,7 +149,7 @@ def goto_tab_parse(func: str, rest: str) -> FuncArgsType:
 
 @func_with_args('detach_window')
 def detach_window_parse(func: str, rest: str) -> FuncArgsType:
-    if rest not in ('new', 'new-tab', 'ask', 'tab-prev', 'tab-left', 'tab-right'):
+    if rest not in ('new', 'new-tab', 'new-tab-left', 'new-tab-right', 'ask', 'tab-prev', 'tab-left', 'tab-right'):
         log_error(f'Ignoring invalid detach_window argument: {rest}')
         rest = 'new'
     return func, (rest,)
@@ -134,7 +169,7 @@ def detach_tab_parse(func: str, rest: str) -> FuncArgsType:
     return func, (rest,)
 
 
-@func_with_args('set_background_opacity', 'goto_layout', 'toggle_layout', 'kitty_shell', 'show_kitty_doc', 'set_tab_title')
+@func_with_args('set_background_opacity', 'goto_layout', 'toggle_layout', 'toggle_tab', 'kitty_shell', 'show_kitty_doc', 'set_tab_title', 'push_keyboard_mode')
 def simple_parse(func: str, rest: str) -> FuncArgsType:
     return func, [rest]
 
@@ -181,7 +216,7 @@ def clear_terminal(func: str, rest: str) -> FuncArgsType:
         args = ['reset', True]
     else:
         action = vals[0].lower()
-        if action not in ('reset', 'scroll', 'scrollback', 'clear', 'to_cursor',):
+        if action not in ('reset', 'scroll', 'scrollback', 'clear', 'to_cursor', 'to_cursor_scroll'):
             log_error(f'{action} is unknown for clear_terminal, using reset')
             action = 'reset'
         args = [action, vals[1].lower() == 'active']
@@ -255,8 +290,7 @@ def move_window(func: str, rest: str) -> FuncArgsType:
 
 @func_with_args('pipe')
 def pipe(func: str, rest: str) -> FuncArgsType:
-    import shlex
-    r = shlex.split(rest)
+    r = list(shlex_split(rest))
     if len(r) < 3:
         log_error('Too few arguments to pipe function')
         r = ['none', 'none', 'true']
@@ -265,8 +299,7 @@ def pipe(func: str, rest: str) -> FuncArgsType:
 
 @func_with_args('set_colors')
 def set_colors(func: str, rest: str) -> FuncArgsType:
-    import shlex
-    r = shlex.split(rest)
+    r = list(shlex_split(rest))
     if len(r) < 1:
         log_error('Too few arguments to set_colors function')
     return func, r
@@ -277,6 +310,14 @@ def remote_control(func: str, rest: str) -> FuncArgsType:
     func, args = shlex_parse(func, rest)
     if len(args) < 1:
         log_error('Too few arguments to remote_control function')
+    return func, args
+
+
+@func_with_args('remote_control_script')
+def remote_control_script(func: str, rest: str) -> FuncArgsType:
+    func, args = shlex_parse(func, rest)
+    if len(args) < 1:
+        log_error('Too few arguments to remote_control_script function')
     return func, args
 
 
@@ -351,12 +392,11 @@ def parse_marker_spec(ftype: str, parts: Sequence[str]) -> Tuple[str, Union[str,
 
 @func_with_args('toggle_marker')
 def toggle_marker(func: str, rest: str) -> FuncArgsType:
-    import shlex
     parts = rest.split(maxsplit=1)
     if len(parts) != 2:
         raise ValueError(f'{rest} is not a valid marker specification')
     ftype, spec = parts
-    parts = shlex.split(spec)
+    parts = list(shlex_split(spec))
     return func, list(parse_marker_spec(ftype, parts))
 
 
@@ -388,6 +428,7 @@ def mouse_selection(func: str, rest: str) -> FuncArgsType:
             'word': defines.MOUSE_SELECTION_WORD,
             'line': defines.MOUSE_SELECTION_LINE,
             'line_from_point': defines.MOUSE_SELECTION_LINE_FROM_POINT,
+            'word_and_line_from_point': defines.MOUSE_SELECTION_WORD_AND_LINE_FROM_POINT,
         }
         setattr(mouse_selection, 'code_map', cmap)
     return func, [cmap[rest]]
@@ -395,8 +436,7 @@ def mouse_selection(func: str, rest: str) -> FuncArgsType:
 
 @func_with_args('load_config_file')
 def load_config_file(func: str, rest: str) -> FuncArgsType:
-    import shlex
-    return func, shlex.split(rest)
+    return func, list(shlex_split(rest))
 # }}}
 
 
@@ -484,6 +524,12 @@ cshapes = {
     'beam': CURSOR_BEAM,
     'underline': CURSOR_UNDERLINE
 }
+cshapes_unfocused = {
+    'block': CURSOR_BLOCK,
+    'beam': CURSOR_BEAM,
+    'underline': CURSOR_UNDERLINE,
+    'hollow': NO_CURSOR_SHAPE
+}
 
 
 def to_cursor_shape(x: str) -> int:
@@ -493,6 +539,17 @@ def to_cursor_shape(x: str) -> int:
         raise ValueError(
             'Invalid cursor shape: {} allowed values are {}'.format(
                 x, ', '.join(cshapes)
+            )
+        )
+
+
+def to_cursor_unfocused_shape(x: str) -> int:
+    try:
+        return cshapes_unfocused[x.lower()]
+    except KeyError:
+        raise ValueError(
+            'Invalid unfocused cursor shape: {} allowed values are {}'.format(
+                x, ', '.join(cshapes_unfocused)
             )
         )
 
@@ -594,6 +651,8 @@ def optional_edge_width(x: str) -> FloatEdges:
 def hide_window_decorations(x: str) -> int:
     if x == 'titlebar-only':
         return 0b10
+    if x == 'titlebar-and-corners':
+        return 0b100
     if to_bool(x):
         return 0b01
     return 0b00
@@ -604,9 +663,23 @@ def resize_draw_strategy(x: str) -> int:
     return cmap.get(x.lower(), 0)
 
 
+def window_logo_scale(x: str) -> Tuple[float, float]:
+    parts = x.split(maxsplit=1)
+    if len(parts) == 1:
+        return positive_float(parts[0]), -1.0
+    return positive_float(parts[0]), positive_float(parts[1])
+
+
+def resize_debounce_time(x: str) -> Tuple[float, float]:
+    parts = x.split(maxsplit=1)
+    if len(parts) == 1:
+        return positive_float(parts[0]), 0.5
+    return positive_float(parts[0]), positive_float(parts[1])
+
+
 def visual_window_select_characters(x: str) -> str:
     import string
-    valid_characters = string.digits + string.ascii_uppercase
+    valid_characters = string.digits + string.ascii_uppercase + "-=[]\\;',./`"
     ans = x.upper()
     ans_chars = set(ans)
     if not ans_chars.issubset(set(valid_characters)):
@@ -677,6 +750,35 @@ def active_tab_title_template(x: str) -> Optional[str]:
     return None if x == 'none' else x
 
 
+class NotifyOnCmdFinish(NamedTuple):
+    when: str
+    duration: float
+    action: str
+    cmdline: Tuple[str, ...]
+
+
+def notify_on_cmd_finish(x: str) -> NotifyOnCmdFinish:
+    parts = x.split(maxsplit=3)
+    if parts[0] not in ('never', 'unfocused', 'invisible', 'always'):
+        raise ValueError(f'Unknown notify_on_cmd_finish value: {parts[0]}')
+    when = parts[0]
+    duration = 5.0
+    if len(parts) > 1:
+        duration = float(parts[1])
+    action = 'notify'
+    cmdline: Tuple[str, ...] = ()
+    if len(parts) > 2:
+        if parts[2] not in ('notify', 'bell', 'command'):
+            raise ValueError(f'Unknown notify_on_cmd_finish action: {parts[2]}')
+        action = parts[2]
+        if action == 'command':
+            if len(parts) > 3:
+                cmdline = tuple(to_cmdline(parts[3]))
+            else:
+                raise ValueError('notify_on_cmd_finish `command` action needs a command line')
+    return NotifyOnCmdFinish(when, duration, action, cmdline)
+
+
 def config_or_absolute_path(x: str, env: Optional[Dict[str, str]] = None) -> Optional[str]:
     if not x or x.lower() == 'none':
         return None
@@ -692,7 +794,7 @@ def remote_control_password(val: str, current_val: Dict[str, str]) -> Iterable[T
             # line of remote_control_password
             raise ValueError('Passwords are not allowed to start with hyphens, ignoring this password')
         if len(parts) == 1:
-            yield parts[0], tuple()
+            yield "", (parts[0],)
         else:
             yield parts[0], tuple(parts[1:])
 
@@ -777,7 +879,7 @@ def clear_all_shortcuts(val: str, dict_with_parse_results: Optional[Dict[str, An
     return ans
 
 
-def font_features(val: str) -> Iterable[Tuple[str, Tuple[FontFeature, ...]]]:
+def font_features(val: str) -> Iterable[Tuple[str, Tuple[defines.ParsedFontFeature, ...]]]:
     if val == 'none':
         return
     parts = val.split()
@@ -788,11 +890,9 @@ def font_features(val: str) -> Iterable[Tuple[str, Tuple[FontFeature, ...]]]:
         features = []
         for feat in parts[1:]:
             try:
-                parsed = defines.parse_font_feature(feat)
+                features.append(defines.ParsedFontFeature(feat))
             except ValueError:
                 log_error(f'Ignoring invalid font feature: {feat}')
-            else:
-                features.append(FontFeature(feat, parsed))
         yield parts[0], tuple(features)
 
 
@@ -854,7 +954,27 @@ def store_multiple(val: str, current_val: Container[str]) -> Iterable[Tuple[str,
         yield val, val
 
 
-allowed_shell_integration_values = frozenset({'enabled', 'disabled', 'no-rc', 'no-cursor', 'no-title', 'no-prompt-mark', 'no-complete', 'no-cwd'})
+def menu_map(val: str, current_val: Container[str]) -> Iterable[Tuple[Tuple[str, ...], str]]:
+    parts = val.split(maxsplit=1)
+    if len(parts) != 2:
+        raise ValueError(f'Ignoring invalid menu action: {val}')
+    if parts[0] != 'global':
+        raise ValueError(f'Unknown menu type: {parts[0]}. Known types: global')
+    start = 0
+    if parts[1].startswith('"'):
+        start = 1
+        idx = parts[1].find('"', 1)
+        if idx == -1:
+            raise ValueError(f'The menu entry name in {val} must end with a double quote')
+    else:
+        idx = parts[1].find(' ')
+        if idx == -1:
+            raise ValueError(f'The menu entry {val} must have an action')
+    location = ('global',) + tuple(parts[1][start:idx].split('::'))
+    yield location, parts[1][idx+1:].lstrip()
+
+
+allowed_shell_integration_values = frozenset({'enabled', 'disabled', 'no-rc', 'no-cursor', 'no-title', 'no-prompt-mark', 'no-complete', 'no-cwd', 'no-sudo'})
 
 
 def shell_integration(x: str) -> FrozenSet[str]:
@@ -866,11 +986,10 @@ def shell_integration(x: str) -> FrozenSet[str]:
 
 
 def paste_actions(x: str) -> FrozenSet[str]:
-    s = frozenset({'quote-urls-at-prompt', 'confirm', 'filter'})
+    s = frozenset({'quote-urls-at-prompt', 'confirm', 'filter', 'confirm-if-large', 'replace-dangerous-control-codes', 'replace-newline', 'no-op'})
     q = frozenset(x.lower().split(','))
     if not q.issubset(s):
-        log_error(f'Invalid paste actions: {q - s}, ignoring')
-        return q & s or frozenset({'invalid'})
+        raise ValueError(f'Invalid paste actions: {q - s}, ignoring')
     return q
 
 
@@ -887,11 +1006,8 @@ kitten_alias = action_alias
 def symbol_map_parser(val: str, min_size: int = 2) -> Iterable[Tuple[Tuple[int, int], str]]:
     parts = val.split()
 
-    def abort() -> None:
-        log_error(f'Symbol map: {val} is invalid, ignoring')
-
     if len(parts) < min_size:
-        return abort()
+        raise ValueError('must have codepoints AND font name')
     family = ' '.join(parts[1:])
 
     def to_chr(x: str) -> int:
@@ -902,12 +1018,9 @@ def symbol_map_parser(val: str, min_size: int = 2) -> Iterable[Tuple[Tuple[int, 
     for x in parts[0].split(','):
         a_, b_ = x.replace('–', '-').partition('-')[::2]
         b_ = b_ or a_
-        try:
-            a, b = map(to_chr, (a_, b_))
-        except Exception:
-            return abort()
+        a, b = map(to_chr, (a_, b_))
         if b < a or max(a, b) > sys.maxunicode or min(a, b) < 1:
-            return abort()
+            raise ValueError(f'Invalid range: {a:x} - {b:x}')
         yield (a, b), family
 
 
@@ -920,7 +1033,7 @@ def narrow_symbols(val: str) -> Iterable[Tuple[Tuple[int, int], int]]:
         yield x, int(y or 1)
 
 
-def parse_key_action(action: str, action_type: str = 'map') -> KeyAction:
+def parse_key_action(action: str, action_type: MapType = MapType.MAP) -> KeyAction:
     parts = action.strip().split(maxsplit=1)
     func = parts[0]
     if len(parts) == 1:
@@ -951,7 +1064,7 @@ class AliasMap:
         self.aliases.update(aa.aliases)
 
     @lru_cache(maxsize=256)
-    def resolve_aliases(self, definition: str, map_type: str = 'map') -> Tuple[KeyAction, ...]:
+    def resolve_aliases(self, definition: str, map_type: MapType = MapType.MAP) -> Tuple[KeyAction, ...]:
         return tuple(resolve_aliases_and_parse_actions(definition, self.aliases, map_type))
 
 
@@ -967,7 +1080,7 @@ def build_action_aliases(raw: Dict[str, str], first_arg_replacement: str = '') -
 
 
 def resolve_aliases_and_parse_actions(
-    defn: str, aliases: Dict[str, List[ActionAlias]], map_type: str
+    defn: str, aliases: Dict[str, List[ActionAlias]], map_type: MapType
 ) -> Iterator[KeyAction]:
     parts = defn.split(maxsplit=1)
     if len(parts) == 1:
@@ -1007,16 +1120,14 @@ def resolve_aliases_and_parse_actions(
 
 class BaseDefinition:
     no_op_actions = frozenset(('noop', 'no-op', 'no_op'))
-    map_type: str = 'map'
+    map_type: MapType = MapType.MAP
     definition_location: CurrentlyParsing
 
     def __init__(self, definition: str = '') -> None:
+        if definition in BaseDefinition.no_op_actions:
+            definition = ''
         self.definition = definition
         self.definition_location = currently_parsing.__copy__()
-
-    @property
-    def is_no_op(self) -> bool:
-        return self.definition in self.no_op_actions
 
     def pretty_repr(self, *fields: str) -> str:
         kwds = []
@@ -1035,7 +1146,7 @@ def resolve_key_mods(kitty_mod: int, mods: int) -> int:
 
 
 class MouseMapping(BaseDefinition):
-    map_type: str = 'mouse_map'
+    map_type: MapType = MapType.MOUSE_MAP
 
     def __init__(
         self, button: int = 0, mods: int = 0, repeat_count: int = 1, grabbed: bool = False,
@@ -1062,38 +1173,147 @@ class MouseMapping(BaseDefinition):
         return MouseEvent(self.button, self.mods, self.repeat_count, self.grabbed)
 
 
+T = TypeVar('T')
+
+
+class LiteralField(Generic[T]):
+    def __init__(self, vals: Tuple[T, ...]):
+        self._vals = vals
+
+    def __set_name__(self, owner: object, name: str) -> None:
+        self._name = "_" + name
+
+    def __get__(self, obj: object, type: Optional[type] = None) -> T:
+        if obj is None:
+            return self._vals[0]
+        return getattr(obj, self._name, self._vals[0])
+
+    def __set__(self, obj: object, value: str) -> None:
+        if value not in self._vals:
+            raise KeyError(f'Invalid value for {self._name[1:]}: {value!r}')
+        object.__setattr__(obj, self._name, value)
+
+
+OnUnknown = Literal['beep', 'end', 'ignore', 'passthrough']
+OnAction = Literal['keep', 'end']
+
+
+@dataclass(init=False, frozen=True)
+class KeyMapOptions:
+    when_focus_on: str = ''
+    new_mode: str = ''
+    mode: str = ''
+    on_unknown: LiteralField[OnUnknown] = LiteralField[OnUnknown](get_args(OnUnknown))
+    on_action: LiteralField[OnAction] = LiteralField[OnAction](get_args(OnAction))
+
+
+default_key_map_options = KeyMapOptions()
+allowed_key_map_options = frozenset(f.name for f in fields(KeyMapOptions))
+
+
 class KeyDefinition(BaseDefinition):
 
     def __init__(
         self, is_sequence: bool = False, trigger: SingleKey = SingleKey(),
-            rest: Tuple[SingleKey, ...] = (), definition: str = ''
+        rest: Tuple[SingleKey, ...] = (), definition: str = '',
+        options: KeyMapOptions = default_key_map_options
     ):
         super().__init__(definition)
         self.is_sequence = is_sequence
         self.trigger = trigger
         self.rest = rest
+        self.options = options
+
+    @property
+    def is_suitable_for_global_shortcut(self) -> bool:
+        return not self.options.when_focus_on and not self.options.mode and not self.options.new_mode and not self.is_sequence
+
+    @property
+    def full_key_sequence_to_trigger(self) -> Tuple[SingleKey, ...]:
+        return (self.trigger,) + self.rest
+
+    @property
+    def unique_identity_within_keymap(self) -> Tuple[Tuple[SingleKey, ...], str]:
+        return self.full_key_sequence_to_trigger, self.options.when_focus_on
 
     def __repr__(self) -> str:
-        return self.pretty_repr('is_sequence', 'trigger', 'rest')
+        return self.pretty_repr('is_sequence', 'trigger', 'rest', 'options')
+
+    def human_repr(self) -> str:
+        ans = self.definition or 'no-op'
+        if self.options.when_focus_on:
+            ans = f'[--when-focus-on={self.options.when_focus_on}]{ans}'
+        return ans
+
+    def shift_sequence_and_copy(self) -> 'KeyDefinition':
+        return KeyDefinition(self.is_sequence, self.trigger, self.rest[1:], self.definition, self.options)
 
     def resolve_and_copy(self, kitty_mod: int) -> 'KeyDefinition':
         def r(k: SingleKey) -> SingleKey:
             return k.resolve_kitty_mod(kitty_mod)
         ans = KeyDefinition(
             self.is_sequence, r(self.trigger), tuple(map(r, self.rest)),
-            self.definition
+            self.definition, self.options
         )
         ans.definition_location = self.definition_location
         return ans
 
 
+class KeyboardMode:
+
+    on_unknown: OnUnknown = get_args(OnUnknown)[0]
+    on_action : OnAction = get_args(OnAction)[0]
+    sequence_keys: Optional[List[defines.KeyEvent]] = None
+
+    def __init__(self, name: str = '') -> None:
+        self.name = name
+        self.keymap: KeyMap = defaultdict(list)
+
+
+KeyboardModeMap = Dict[str, KeyboardMode]
+
+
+def parse_options_for_map(val: str) -> Tuple[KeyMapOptions, str]:
+    expecting_arg = ''
+    ans = KeyMapOptions()
+    s = Shlex(val)
+    while (tok := s.next_word())[0] > -1:
+        x = tok[1]
+        if expecting_arg:
+            object.__setattr__(ans, expecting_arg, x)
+            expecting_arg = ''
+        elif x.startswith('--'):
+            expecting_arg = x[2:]
+            k, sep, v = expecting_arg.partition('=')
+            k = k.replace('-', '_')
+            expecting_arg = k
+            if expecting_arg not in allowed_key_map_options:
+                raise KeyError(f'The map option {x} is unknown. Allowed options: {", ".join(allowed_key_map_options)}')
+            if sep == '=':
+                object.__setattr__(ans, k, v)
+                expecting_arg = ''
+        else:
+            return ans, val[tok[0]:]
+    return ans, ''
+
+
 def parse_map(val: str) -> Iterable[KeyDefinition]:
     parts = val.split(maxsplit=1)
-    if len(parts) != 2:
-        return
-    sc, action = parts
+    options = default_key_map_options
+    if len(parts) == 2:
+        sc, action = parts
+        if sc.startswith('--'):
+            options, leftover = parse_options_for_map(val)
+            parts = leftover.split(maxsplit=1)
+            if len(parts) == 1:
+                sc, action = parts[0], ''
+            else:
+                sc = parts[0]
+                action = ' '.join(parts[1:])
+    else:
+        sc, action = val, ''
     sc, action = sc.strip().strip(sequence_sep), action.strip()
-    if not sc or not action:
+    if not sc:
         return
     is_sequence = sequence_sep in sc
     if is_sequence:
@@ -1124,18 +1344,22 @@ def parse_map(val: str) -> Iterable[KeyDefinition]:
             return
     if is_sequence:
         if trigger is not None:
-            yield KeyDefinition(True, trigger, rest, definition=action)
+            yield KeyDefinition(True, trigger, rest, definition=action, options=options)
     else:
         assert key is not None
-        yield KeyDefinition(False, SingleKey(mods, is_native, key), definition=action)
+        yield KeyDefinition(False, SingleKey(mods, is_native, key), definition=action, options=options)
 
 
 def parse_mouse_map(val: str) -> Iterable[MouseMapping]:
     parts = val.split(maxsplit=3)
-    if len(parts) != 4:
+    if len(parts) == 4:
+        xbutton, event, modes, action = parts
+    elif len(parts) > 2:
+        xbutton, event, modes = parts
+        action = ''
+    else:
         log_error(f'Ignoring invalid mouse action: {val}')
         return
-    xbutton, event, modes, action = parts
     kparts = xbutton.split('+')
     if len(kparts) > 1:
         mparts, obutton = kparts[:-1], kparts[-1].lower()
@@ -1162,6 +1386,10 @@ def parse_mouse_map(val: str) -> Iterable[MouseMapping]:
         return
     for mode in sorted(specified_modes):
         yield MouseMapping(button, mods, count, mode == 'grabbed', definition=action)
+
+
+def parse_font_spec(spec: str) -> FontSpec:
+    return FontSpec.from_setting(spec)
 
 
 def deprecated_hide_window_decorations_aliases(key: str, val: str, ans: Dict[str, Any]) -> None:

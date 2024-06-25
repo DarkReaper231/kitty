@@ -3,11 +3,16 @@
 package utils
 
 import (
+	"cmp"
 	"fmt"
 	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
+	"strconv"
 
 	"golang.org/x/exp/constraints"
-	"golang.org/x/exp/slices"
 )
 
 var _ = fmt.Print
@@ -30,6 +35,8 @@ func Reversed[T any](s []T) []T {
 func Remove[T comparable](s []T, q T) []T {
 	idx := slices.Index(s, q)
 	if idx > -1 {
+		var zero T
+		s[idx] = zero // if pointer this allows garbage collection
 		return slices.Delete(s, idx, idx+1)
 	}
 	return s
@@ -73,13 +80,13 @@ func Repeat[T any](x T, n int) []T {
 	return ans
 }
 
-func Sort[T any](s []T, less func(a, b T) bool) []T {
-	slices.SortFunc(s, less)
+func Sort[T any](s []T, cmp func(a, b T) int) []T {
+	slices.SortFunc(s, cmp)
 	return s
 }
 
-func StableSort[T any](s []T, less func(a, b T) bool) []T {
-	slices.SortStableFunc(s, less)
+func StableSort[T any](s []T, cmp func(a, b T) int) []T {
+	slices.SortStableFunc(s, cmp)
 	return s
 }
 
@@ -92,10 +99,13 @@ func sort_with_key[T any, C constraints.Ordered](stable bool, s []T, key func(a 
 	for i, x := range s {
 		temp[i].val, temp[i].key = x, key(x)
 	}
+	key_cmp := func(a, b t) int {
+		return cmp.Compare(a.key, b.key)
+	}
 	if stable {
-		slices.SortStableFunc(temp, func(a, b t) bool { return a.key < b.key })
+		slices.SortStableFunc(temp, key_cmp)
 	} else {
-		slices.SortFunc(temp, func(a, b t) bool { return a.key < b.key })
+		slices.SortFunc(temp, key_cmp)
 	}
 	for i, x := range temp {
 		s[i] = x.val
@@ -132,7 +142,8 @@ func Min[T constraints.Ordered](a T, items ...T) (ans T) {
 }
 
 func Memset[T any](dest []T, pattern ...T) []T {
-	if len(pattern) == 0 {
+	switch len(pattern) {
+	case 0:
 		var zero T
 		switch any(zero).(type) {
 		case byte: // special case this as the compiler can generate efficient code for memset of a byte slice to zero
@@ -146,11 +157,17 @@ func Memset[T any](dest []T, pattern ...T) []T {
 			}
 		}
 		return dest
-	}
-	bp := copy(dest, pattern)
-	for bp < len(dest) {
-		copy(dest[bp:], dest[:bp])
-		bp *= 2
+	case 1:
+		val := pattern[0]
+		for i := range dest {
+			dest[i] = val
+		}
+	default:
+		bp := copy(dest, pattern)
+		for bp < len(dest) {
+			copy(dest[bp:], dest[:bp])
+			bp *= 2
+		}
 	}
 	return dest
 }
@@ -200,4 +217,96 @@ func Samefile(a, b any) bool {
 	}
 
 	return os.SameFile(sta, stb)
+}
+
+func Concat[T any](slices ...[]T) []T {
+	var total int
+	for _, s := range slices {
+		total += len(s)
+	}
+	result := make([]T, total)
+	var i int
+	for _, s := range slices {
+		i += copy(result[i:], s)
+	}
+	return result
+}
+
+func ShiftLeft[T any](s []T, amt int) []T {
+	leftover := len(s) - amt
+	if leftover > 0 {
+		copy(s, s[amt:])
+	}
+	return s[:leftover]
+}
+
+func SetStructDefaults(v reflect.Value) (err error) {
+	for _, field := range reflect.VisibleFields(v.Type()) {
+		if defval := field.Tag.Get("default"); defval != "" {
+			val := v.FieldByIndex(field.Index)
+			if val.CanSet() {
+				switch field.Type.Kind() {
+				case reflect.String:
+					if val.String() != "" {
+						val.SetString(defval)
+					}
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					if d, err := strconv.ParseInt(defval, 10, 64); err == nil {
+						val.SetInt(d)
+					} else {
+						return fmt.Errorf("Could not parse default value for struct field: %#v with error: %s", field.Name, err)
+					}
+				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+					if d, err := strconv.ParseUint(defval, 10, 64); err == nil {
+						val.SetUint(d)
+					} else {
+						return fmt.Errorf("Could not parse default value for struct field: %#v with error: %s", field.Name, err)
+					}
+
+				}
+			}
+		}
+	}
+	return
+}
+
+func IfElse[T any](condition bool, if_val T, else_val T) T {
+	if condition {
+		return if_val
+	}
+	return else_val
+}
+
+func SourceLine(skip_frames ...int) int {
+	s := 1
+	if len(skip_frames) > 0 {
+		s += skip_frames[0]
+	}
+	if _, _, ans, ok := runtime.Caller(s); ok {
+		return ans
+	}
+	return -1
+}
+
+func SourceLoc(skip_frames ...int) string {
+	s := 1
+	if len(skip_frames) > 0 {
+		s += skip_frames[0]
+	}
+	if _, file, line, ok := runtime.Caller(s); ok {
+		return filepath.Base(file) + ":" + strconv.Itoa(line)
+	}
+	return "unknown"
+}
+
+func FunctionName(a any) string {
+	if a == nil {
+		return "<nil>"
+	}
+	p := reflect.ValueOf(a).Pointer()
+	f := runtime.FuncForPC(p)
+	if f != nil {
+		return f.Name()
+	}
+	return ""
 }

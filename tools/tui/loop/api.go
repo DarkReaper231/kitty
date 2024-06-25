@@ -4,9 +4,10 @@ package loop
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"os"
-	"runtime/debug"
+	"runtime"
 	"strings"
 	"time"
 
@@ -36,18 +37,6 @@ const (
 	PM
 )
 
-type timer struct {
-	interval time.Duration
-	deadline time.Time
-	repeats  bool
-	id       IdType
-	callback TimerCallback
-}
-
-func (self *timer) update_deadline(now time.Time) {
-	self.deadline = now.Add(self.interval)
-}
-
 type Loop struct {
 	controlling_term                       *tty.Term
 	terminal_options                       TerminalStateOptions
@@ -59,12 +48,14 @@ type Loop struct {
 	timers, timers_temp                    []*timer
 	timer_id_counter, write_msg_id_counter IdType
 	wakeup_channel                         chan byte
-	pending_writes                         []*write_msg
+	pending_writes                         []write_msg
+	tty_write_channel                      chan write_msg
 	pending_mouse_events                   *utils.RingBuffer[MouseEvent]
 	on_SIGTSTP                             func() error
 	style_cache                            map[string]func(...any) string
 	style_ctx                              style.Context
 	atomic_update_active                   bool
+	pointer_shapes                         []PointerShape
 
 	// Suspend the loop restoring terminal state, and run the provided function. When it returns terminal state is
 	// put back to what it was before suspending unless the function returns an error or an error occurs saving/restoring state.
@@ -94,10 +85,13 @@ type Loop struct {
 	OnResize func(old_size ScreenSize, new_size ScreenSize) error
 
 	// Called when writing is done
-	OnWriteComplete func(msg_id IdType) error
+	OnWriteComplete func(msg_id IdType, has_pending_writes bool) error
 
 	// Called when a response to an rc command is received
 	OnRCResponse func(data []byte) error
+
+	// Called when a response to a query command is received
+	OnQueryResponse func(key, val string, valid bool) error
 
 	// Called when any input from tty is received
 	OnReceivedData func(data []byte) error
@@ -110,6 +104,12 @@ type Loop struct {
 
 	// Called when main loop is woken up
 	OnWakeup func() error
+
+	// Called on SIGINT return true if you wish to handle it yourself
+	OnSIGINT func() (bool, error)
+
+	// Called on SIGTERM return true if you wish to handle it yourself
+	OnSIGTERM func() (bool, error)
 }
 
 func New(options ...func(self *Loop)) (*Loop, error) {
@@ -124,17 +124,21 @@ func (self *Loop) AddTimer(interval time.Duration, repeats bool, callback TimerC
 	return self.add_timer(interval, repeats, callback)
 }
 
+func (self *Loop) CallSoon(callback TimerCallback) (IdType, error) {
+	return self.add_timer(0, false, callback)
+}
+
 func (self *Loop) RemoveTimer(id IdType) bool {
 	return self.remove_timer(id)
 }
 
 func (self *Loop) NoAlternateScreen() *Loop {
-	self.terminal_options.alternate_screen = false
+	self.terminal_options.Alternate_screen = false
 	return self
 }
 
 func NoAlternateScreen(self *Loop) {
-	self.terminal_options.alternate_screen = false
+	self.terminal_options.Alternate_screen = false
 }
 
 func (self *Loop) OnlyDisambiguateKeys() *Loop {
@@ -144,6 +148,15 @@ func (self *Loop) OnlyDisambiguateKeys() *Loop {
 
 func OnlyDisambiguateKeys(self *Loop) {
 	self.terminal_options.kitty_keyboard_mode = DISAMBIGUATE_KEYS
+}
+
+func (self *Loop) NoKeyboardStateChange() *Loop {
+	self.terminal_options.kitty_keyboard_mode = NO_KEYBOARD_STATE_CHANGE
+	return self
+}
+
+func NoKeyboardStateChange(self *Loop) {
+	self.terminal_options.kitty_keyboard_mode = NO_KEYBOARD_STATE_CHANGE
 }
 
 func (self *Loop) FullKeyboardProtocol() *Loop {
@@ -204,8 +217,26 @@ func (self *Loop) KillIfSignalled() {
 }
 
 func (self *Loop) Println(args ...any) {
-	self.QueueWriteString(fmt.Sprint(args...))
-	self.QueueWriteString("\r\n")
+	self.QueueWriteString(fmt.Sprintln(args...))
+	self.QueueWriteString("\r")
+}
+
+func (self *Loop) style_region(style string, start_x, start_y, end_x, end_y int) string {
+	sgr := self.SprintStyled(style, "|")[2:]
+	sgr = sgr[:strings.IndexByte(sgr, 'm')]
+	return fmt.Sprintf("\x1b[%d;%d;%d;%d;%s$r", start_y+1, start_x+1, end_y+1, end_x+1, sgr)
+}
+
+// Apply the specified style to the specified region of the screen (0-based
+// indexing). The region is all cells from the start cell to the end cell. See
+// StyleRectangle to apply style to a rectangular area.
+func (self *Loop) StyleRegion(style string, start_x, start_y, end_x, end_y int) IdType {
+	return self.QueueWriteString(self.style_region(style, start_x, start_y, end_x, end_y))
+}
+
+// Apply the specified style to the specified rectangle of the screen (0-based indexing).
+func (self *Loop) StyleRectangle(style string, start_x, start_y, end_x, end_y int) IdType {
+	return self.QueueWriteString("\x1b[2*x" + self.style_region(style, start_x, start_y, end_x, end_y) + "\x1b[*x")
 }
 
 func (self *Loop) SprintStyled(style string, args ...any) string {
@@ -253,19 +284,28 @@ func (self *Loop) DebugPrintln(args ...any) {
 func (self *Loop) Run() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			stack := utils.Splitlines(string(debug.Stack()))
-			err = fmt.Errorf("Paniced: %s", r)
-			fmt.Fprintf(os.Stderr, "\r\nPaniced with error: %s\r\nStacktrace:\r\n", r)
-			for _, line := range stack {
-				fmt.Fprintf(os.Stderr, "%s\r\n", line)
+			pcs := make([]uintptr, 256)
+			n := runtime.Callers(2, pcs)
+			frames := runtime.CallersFrames(pcs[:n])
+			err = fmt.Errorf("Panicked: %s", r)
+			fmt.Fprintf(os.Stderr, "\r\nPanicked with error: %s\r\nStacktrace (most recent call first):\r\n", r)
+			found_first_frame := false
+			for frame, more := frames.Next(); more; frame, more = frames.Next() {
+				if !found_first_frame {
+					if strings.HasPrefix(frame.Function, "runtime.") {
+						continue
+					}
+					found_first_frame = true
+				}
+				fmt.Fprintf(os.Stderr, "%s\r\n\t%s:%d\r\n", frame.Function, frame.File, frame.Line)
 			}
-			if self.terminal_options.alternate_screen {
+			if self.terminal_options.Alternate_screen {
 				term, err := tty.OpenControllingTerm(tty.SetRaw)
 				if err == nil {
 					defer term.RestoreAndClose()
 					fmt.Println("Press any key to exit.\r")
 					buf := make([]byte, 16)
-					term.Read(buf)
+					_, _ = term.Read(buf)
 				}
 			}
 		}
@@ -285,7 +325,7 @@ func (self *Loop) WakeupMainThread() bool {
 func (self *Loop) QueueWriteString(data string) IdType {
 	self.write_msg_id_counter++
 	msg := write_msg{str: data, bytes: nil, id: self.write_msg_id_counter}
-	self.add_write_to_pending_queue(&msg)
+	self.add_write_to_pending_queue(msg)
 	return msg.id
 }
 
@@ -294,7 +334,7 @@ func (self *Loop) QueueWriteString(data string) IdType {
 func (self *Loop) UnsafeQueueWriteBytes(data []byte) IdType {
 	self.write_msg_id_counter++
 	msg := write_msg{bytes: data, id: self.write_msg_id_counter}
-	self.add_write_to_pending_queue(&msg)
+	self.add_write_to_pending_queue(msg)
 	return msg.id
 }
 
@@ -395,14 +435,21 @@ func (self *Loop) AllowLineWrapping(allow bool) {
 	}
 }
 
+func EscapeCodeToSetWindowTitle(title string) string {
+	title = wcswidth.StripEscapeCodes(title)
+	return "\033]2;" + title + "\033\\"
+}
+
 func (self *Loop) SetWindowTitle(title string) {
-	title = strings.ReplaceAll(title, "\033", "")
-	title = strings.ReplaceAll(title, "\x9c", "")
-	self.QueueWriteString("\033]2;" + title + "\033\\")
+	self.QueueWriteString(EscapeCodeToSetWindowTitle(title))
 }
 
 func (self *Loop) ClearScreen() {
 	self.QueueWriteString("\x1b[H\x1b[2J")
+}
+
+func (self *Loop) ClearScreenButNotGraphics() {
+	self.QueueWriteString("\x1b[H\x1b[J")
 }
 
 func (self *Loop) SendOverlayReady() {
@@ -418,10 +465,10 @@ type DefaultColor int
 
 const (
 	BACKGROUND   DefaultColor = 11
-	FOREGROUND                = 10
-	CURSOR                    = 12
-	SELECTION_BG              = 17
-	SELECTION_FG              = 19
+	FOREGROUND   DefaultColor = 10
+	CURSOR       DefaultColor = 12
+	SELECTION_BG DefaultColor = 17
+	SELECTION_FG DefaultColor = 19
 )
 
 func (self *Loop) SetDefaultColor(which DefaultColor, val style.RGBA) {
@@ -440,4 +487,46 @@ func (self *Loop) CopyTextToPrimarySelection(text string) {
 
 func (self *Loop) CopyTextToClipboard(text string) {
 	self.copy_text_to(text, "c")
+}
+
+func (self *Loop) QueryTerminal(fields ...string) IdType {
+	if len(fields) == 0 {
+		return 0
+	}
+	q := make([]string, len(fields))
+	for i, x := range fields {
+		q[i] = hex.EncodeToString(utils.UnsafeStringToBytes("kitty-query-" + x))
+	}
+	return self.QueueWriteString(fmt.Sprintf("\x1bP+q%s\a", strings.Join(q, ";")))
+}
+
+func (self *Loop) PushPointerShape(s PointerShape) {
+	self.pointer_shapes = append(self.pointer_shapes, s)
+	self.QueueWriteString("\x1b]22;" + s.String() + "\x1b\\")
+}
+
+func (self *Loop) PopPointerShape() {
+	if len(self.pointer_shapes) > 0 {
+		self.pointer_shapes = self.pointer_shapes[:len(self.pointer_shapes)-1]
+		self.QueueWriteString("\x1b]22;<\x1b\\")
+	}
+}
+
+// Remove all pointer shapes from the shape stack resetting to default pointer
+// shape. This is called automatically on loop termination.
+func (self *Loop) ClearPointerShapes() (ans []PointerShape) {
+	ans = self.pointer_shapes
+	for i := len(self.pointer_shapes) - 1; i >= 0; i-- {
+		self.QueueWriteString("\x1b]22;<\x1b\\")
+	}
+	self.pointer_shapes = nil
+	return ans
+}
+
+func (self *Loop) CurrentPointerShape() (ans PointerShape, has_shape bool) {
+	if len(self.pointer_shapes) > 0 {
+		has_shape = true
+		ans = self.pointer_shapes[len(self.pointer_shapes)-1]
+	}
+	return
 }

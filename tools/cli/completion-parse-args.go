@@ -11,12 +11,6 @@ import (
 var _ = fmt.Print
 var _ = os.Getenv
 
-func (self *Completions) add_group(group *MatchGroup) {
-	if len(group.Matches) > 0 {
-		self.Groups = append(self.Groups, group)
-	}
-}
-
 func (self *Completions) add_options_group(options []*Option, word string) {
 	group := self.AddMatchGroup("Options")
 	if strings.HasPrefix(word, "--") {
@@ -104,7 +98,7 @@ func complete_word(word string, completions *Completions, only_args_allowed bool
 				group.Title = "Sub-commands"
 			}
 			for _, sc := range cg.SubCommands {
-				if strings.HasPrefix(sc.Name, word) {
+				if !sc.Hidden && strings.HasPrefix(sc.Name, word) {
 					t := sc.ShortDescription
 					if t == "" {
 						t = sc.HelpText
@@ -122,7 +116,6 @@ func complete_word(word string, completions *Completions, only_args_allowed bool
 	if cmd.ArgCompleter != nil {
 		cmd.ArgCompleter(completions, word, arg_num)
 	}
-	return
 }
 
 func completion_parse_args(cmd *Command, words []string, completions *Completions) {

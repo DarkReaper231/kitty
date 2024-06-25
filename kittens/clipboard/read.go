@@ -7,8 +7,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"image"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -16,9 +18,6 @@ import (
 	"kitty/tools/tui/loop"
 	"kitty/tools/utils"
 	"kitty/tools/utils/images"
-
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
 )
 
 var _ = fmt.Print
@@ -110,7 +109,7 @@ func (self *Output) commit() {
 		return
 	}
 	if self.image_needs_conversion {
-		self.dest.Seek(0, os.SEEK_SET)
+		self.dest.Seek(0, io.SeekStart)
 		img, _, err := image.Decode(self.dest)
 		self.dest.Close()
 		os.Remove(self.dest.Name())
@@ -364,7 +363,7 @@ func run_get_loop(opts *Options, args []string) (err error) {
 					}
 				}
 				if len(requested_mimes) > 0 {
-					lp.QueueWriteString(encode(basic_metadata, strings.Join(maps.Keys(requested_mimes), " ")))
+					lp.QueueWriteString(encode(basic_metadata, strings.Join(utils.Keys(requested_mimes), " ")))
 				} else {
 					lp.Quit(0)
 				}

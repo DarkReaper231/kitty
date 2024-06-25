@@ -12,7 +12,6 @@ from .child import Child
 from .cli import parse_args
 from .cli_stub import LaunchCLIOptions
 from .clipboard import set_clipboard_string, set_primary_selection
-from .constants import kitten_exe, shell_path
 from .fast_data_types import add_timer, get_boss, get_options, get_os_window_title, patch_color_profiles
 from .options.utils import env as parse_env
 from .tabs import Tab, TabManager
@@ -31,9 +30,39 @@ class LaunchSpec(NamedTuple):
     args: List[str]
 
 
+env_docs = '''\
+type=list
+Environment variables to set in the child process. Can be specified multiple
+times to set different environment variables. Syntax: :code:`name=value`. Using
+:code:`name=` will set to empty string and just :code:`name` will remove the
+environment variable.
+'''
+
+
+remote_control_password_docs = '''\
+type=list
+Restrict the actions remote control is allowed to take. This works like
+:opt:`remote_control_password`. You can specify a password and list of actions
+just as for :opt:`remote_control_password`. For example::
+
+    --remote-control-password '"my passphrase" get-* set-colors'
+
+This password will be in effect for this window only.
+Note that any passwords you have defined for :opt:`remote_control_password`
+in :file:`kitty.conf` are also in effect. You can override them by using the same password here.
+You can also disable all :opt:`remote_control_password` global passwords for this window, by using::
+
+    --remote-control-password '!'
+
+This option only takes effect if :option:`--allow-remote-control`
+is also specified. Can be specified multiple times to create multiple passwords.
+This option was added to kitty in version 0.26.0
+'''
+
+
 @run_once
 def options_spec() -> str:
-    return '''
+    return f'''
 --window-title --title
 The title to set for the new window. By default, title is controlled by the
 child process. The special value :code:`current` will copy the title from the
@@ -72,7 +101,11 @@ Where to launch the child process:
     intended to run for a long time as a primary window.
 
 :code:`background`
-    The process will be run in the :italic:`background`, without a kitty window.
+    The process will be run in the :italic:`background`, without a kitty
+    window. Note that if :option:`kitten @ launch --allow-remote-control` is
+    specified the :envvar:`KITTY_LISTEN_ON` environment variable will be set to
+    a dedicated socket pair file descriptor that the process can use for remote
+    control.
 
 :code:`clipboard`, :code:`primary`
     These two are meant to work with :option:`--stdin-source <launch --stdin-source>` to copy
@@ -100,16 +133,19 @@ refers to the process that was originally started when the window was created.
 
 
 --env
+{env_docs}
+
+
+--var
 type=list
-Environment variables to set in the child process. Can be specified multiple
-times to set different environment variables. Syntax: :code:`name=value`. Using
-:code:`name=` will set to empty string and just :code:`name` will remove the
-environment variable.
+User variables to set in the created window. Can be specified multiple
+times to set different user variables. Syntax: :code:`name=value`. Using
+:code:`name=` will set to empty string.
 
 
 --hold
 type=bool-set
-Keep the window open even after the command being executed exits.
+Keep the window open even after the command being executed exits, at a shell prompt.
 
 
 --copy-colors
@@ -130,8 +166,7 @@ Copy the environment variables from the currently active window into the newly
 launched child process. Note that this only copies the environment when the
 window was first created, as it is not possible to get updated environment variables
 from arbitrary processes. To copy that environment, use either the :ref:`clone-in-kitty
-<clone_shell>` feature or the kitty remote control feature with :option:`kitty
-@ launch --copy-env`.
+<clone_shell>` feature or the kitty remote control feature with :option:`kitten @ launch --copy-env`.
 
 
 --location
@@ -162,24 +197,7 @@ remote control.
 
 
 --remote-control-password
-type=list
-Restrict the actions remote control is allowed to take. This works like
-:opt:`remote_control_password`. You can specify a password and list of actions
-just as for :opt:`remote_control_password`. For example::
-
-    --remote-control-password '"my passphrase" get-* set-colors'
-
-This password will be in effect for this window only.
-Note that any passwords you have defined for :opt:`remote_control_password`
-in :file:`kitty.conf` are also in effect. You can override them by using the same password here.
-You can also disable all :opt:`remote_control_password` global passwords for this window, by using::
-
-    --remote-control-password '!'
-
-This option only takes effect if :option:`--allow-remote-control`
-is also specified. Can be specified multiple times to create multiple passwords.
-This option was added to kitty in version 0.26.0
-
+{remote_control_password_docs}
 
 --stdin-source
 type=choices
@@ -312,14 +330,16 @@ def parse_launch_args(args: Optional[Sequence[str]] = None) -> LaunchSpec:
     try:
         opts, args = parse_args(result_class=LaunchCLIOptions, args=args, ospec=options_spec)
     except SystemExit as e:
-        raise ValueError from e
+        raise ValueError(str(e)) from e
     return LaunchSpec(opts, args)
 
 
-def get_env(opts: LaunchCLIOptions, active_child: Optional[Child] = None) -> Dict[str, str]:
+def get_env(opts: LaunchCLIOptions, active_child: Optional[Child] = None, base_env: Optional[Dict[str,str]] = None) -> Dict[str, str]:
     env: Dict[str, str] = {}
     if opts.copy_env and active_child:
         env.update(active_child.foreground_environ)
+    if base_env is not None:
+        env.update(base_env)
     for x in opts.env:
         for k, v in parse_env(x, env):
             env[k] = v
@@ -387,6 +407,15 @@ def load_watch_modules(watchers: Iterable[str]) -> Optional[Watchers]:
         w = m.get('on_focus_change')
         if callable(w):
             ans.on_focus_change.append(w)
+        w = m.get('on_set_user_var')
+        if callable(w):
+            ans.on_set_user_var.append(w)
+        w = m.get('on_title_change')
+        if callable(w):
+            ans.on_title_change.append(w)
+        w = m.get('on_cmd_startstop')
+        if callable(w):
+            ans.on_cmd_startstop.append(w)
     return ans
 
 
@@ -403,6 +432,7 @@ class LaunchKwds(TypedDict):
     cmd: Optional[List[str]]
     overlay_for: Optional[int]
     stdin: Optional[bytes]
+    hold: bool
 
 
 def apply_colors(window: Window, spec: Sequence[str]) -> None:
@@ -410,6 +440,12 @@ def apply_colors(window: Window, spec: Sequence[str]) -> None:
     colors = parse_colors(spec)
     profiles = window.screen.color_profile,
     patch_color_profiles(colors, profiles, True)
+
+
+def parse_var(defn: Iterable[str]) -> Iterator[Tuple[str, str]]:
+    for item in defn:
+        a, sep, b = item.partition('=')
+        yield a, b
 
 
 class ForceWindowLaunch:
@@ -435,6 +471,17 @@ force_window_launch = ForceWindowLaunch()
 non_window_launch_types = 'background', 'clipboard', 'primary'
 
 
+def parse_remote_control_passwords(allow_remote_control: bool, passwords: Sequence[str]) -> Optional[Dict[str, Sequence[str]]]:
+    remote_control_restrictions: Optional[Dict[str, Sequence[str]]] = None
+    if allow_remote_control and passwords:
+        from kitty.options.utils import remote_control_password
+        remote_control_restrictions = {}
+        for rcp in passwords:
+            for pw, rcp_items in remote_control_password(rcp, {}):
+                remote_control_restrictions[pw] = rcp_items
+    return remote_control_restrictions
+
+
 def _launch(
     boss: Boss,
     opts: LaunchCLIOptions,
@@ -444,6 +491,7 @@ def _launch(
     active: Optional[Window] = None,
     is_clone_launch: str = '',
     rc_from_window: Optional[Window] = None,
+    base_env: Optional[Dict[str, str]] = None,
 ) -> Optional[Window]:
     active = active or boss.active_window_for_cwd
     if active:
@@ -458,17 +506,10 @@ def _launch(
     if opts.os_window_title == 'current':
         tm = boss.active_tab_manager
         opts.os_window_title = get_os_window_title(tm.os_window_id) if tm else None
-    env = get_env(opts, active_child)
-    remote_control_restrictions: Optional[Dict[str, Sequence[str]]] = None
-    if opts.allow_remote_control and opts.remote_control_password:
-        from kitty.options.utils import remote_control_password
-        remote_control_restrictions = {}
-        for rcp in opts.remote_control_password:
-            for pw, rcp_items in remote_control_password(rcp, {}):
-                remote_control_restrictions[pw] = rcp_items
+    env = get_env(opts, active_child, base_env)
     kw: LaunchKwds = {
         'allow_remote_control': opts.allow_remote_control,
-        'remote_control_passwords': remote_control_restrictions,
+        'remote_control_passwords': parse_remote_control_passwords(opts.allow_remote_control, opts.remote_control_password),
         'cwd_from': None,
         'cwd': None,
         'location': None,
@@ -477,7 +518,8 @@ def _launch(
         'marker': opts.marker or None,
         'cmd': None,
         'overlay_for': None,
-        'stdin': None
+        'stdin': None,
+        'hold': False,
     }
     spacing = {}
     if opts.spacing:
@@ -568,7 +610,10 @@ def _launch(
         cmd = kw['cmd']
         if not cmd:
             raise ValueError('The cmd to run must be specified when running a background process')
-        boss.run_background_process(cmd, cwd=kw['cwd'], cwd_from=kw['cwd_from'], env=env or None, stdin=kw['stdin'])
+        boss.run_background_process(
+            cmd, cwd=kw['cwd'], cwd_from=kw['cwd_from'], env=env or None, stdin=kw['stdin'],
+            allow_remote_control=kw['allow_remote_control'], remote_control_passwords=kw['remote_control_passwords']
+        )
     elif opts.type in ('clipboard', 'primary'):
         stdin = kw.get('stdin')
         if stdin is not None:
@@ -577,11 +622,7 @@ def _launch(
             else:
                 set_primary_selection(stdin)
     else:
-        if opts.hold:
-            cmd = kw['cmd'] or [shell_path]
-            if not os.path.isabs(cmd[0]):
-                cmd[0] = which(cmd[0]) or cmd[0]
-            kw['cmd'] = [kitten_exe(), '__hold_till_enter__'] + cmd
+        kw['hold'] = opts.hold
         if force_target_tab:
             tab = target_tab
         else:
@@ -605,6 +646,9 @@ def _launch(
                 new_window.set_logo(opts.logo, opts.logo_position or '', opts.logo_alpha)
             if opts.type == 'overlay-main':
                 new_window.overlay_type = OverlayType.main
+            if opts.var:
+                for key, val in parse_var(opts.var):
+                    new_window.set_user_var(key, val)
             return new_window
     return None
 
@@ -618,12 +662,13 @@ def launch(
     active: Optional[Window] = None,
     is_clone_launch: str = '',
     rc_from_window: Optional[Window] = None,
+    base_env: Optional[Dict[str, str]] = None,
 ) -> Optional[Window]:
     active = active or boss.active_window_for_cwd
     if opts.keep_focus and active:
         orig, active.ignore_focus_changes = active.ignore_focus_changes, True
     try:
-        return _launch(boss, opts, args, target_tab, force_target_tab, active, is_clone_launch, rc_from_window)
+        return _launch(boss, opts, args, target_tab, force_target_tab, active, is_clone_launch, rc_from_window, base_env)
     finally:
         if opts.keep_focus and active:
             active.ignore_focus_changes = orig
@@ -631,7 +676,7 @@ def launch(
 @run_once
 def clone_safe_opts() -> FrozenSet[str]:
     return frozenset((
-        'window_title', 'tab_title', 'type', 'keep_focus', 'cwd', 'env', 'hold',
+        'window_title', 'tab_title', 'type', 'keep_focus', 'cwd', 'env', 'var', 'hold',
         'location', 'os_window_class', 'os_window_name', 'os_window_title', 'os_window_state',
         'logo', 'logo_position', 'logo_alpha', 'color', 'spacing',
     ))
@@ -885,13 +930,18 @@ def clone_and_launch(msg: str, window: Window) -> None:
                 patch_cmdline('env', entry, cmdline)
             c.opts.env = []
     else:
-
         try:
             cmdline = window.child.cmdline_of_pid(c.pid)
         except Exception:
             cmdline = []
         if not cmdline:
             cmdline = list(window.child.argv)
+        if cmdline and cmdline[0].startswith('-'):  # on macOS, run via run-shell kitten
+            if window.child.is_default_shell:
+                cmdline = window.child.unmodified_argv
+            else:
+                cmdline[0] = cmdline[0][1:]
+                cmdline[0] = which(cmdline[0]) or cmdline[0]
         if cmdline and cmdline[0] == window.child.final_argv0:
             cmdline[0] = window.child.final_exe
         if cmdline and cmdline == [window.child.final_exe] + window.child.argv[1:]:

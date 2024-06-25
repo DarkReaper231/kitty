@@ -4,6 +4,7 @@ from socket import socket as Socket
 from subprocess import CompletedProcess as CompletedProcess
 from subprocess import Popen as PopenType
 from typing import Literal
+from typing import NotRequired as NotRequired
 from typing import Protocol as Protocol
 from typing import TypedDict as TypedDict
 
@@ -30,7 +31,6 @@ from .key_encoding import KeyEvent as KeyEventType
 from .layout.base import Layout as LayoutType
 from .options.utils import AliasMap as AliasMap
 from .options.utils import KeyMap as KeyMap
-from .options.utils import SequenceMap as SequenceMap
 from .rc.base import RemoteCommand as RemoteCommandType
 from .session import Session as SessionType
 from .session import Tab as SessionTab
@@ -46,7 +46,7 @@ PowerlineStyle = Literal['angled', 'slanted', 'round']
 GRT_a = Literal['t', 'T', 'q', 'p', 'd', 'f', 'a', 'c']
 GRT_f = Literal[24, 32, 100]
 GRT_t = Literal['d', 'f', 't', 's']
-GRT_o = Literal['z']
+GRT_o = Literal['z', 'z']  # two z's to workaround a bug in ruff
 GRT_m = Literal[0, 1]
 GRT_C = Literal[0, 1]
 GRT_d = Literal['a', 'A', 'c', 'C', 'i', 'I', 'p', 'P', 'q', 'Q', 'x', 'X', 'y', 'Y', 'z', 'Z', 'f', 'F']
@@ -62,8 +62,8 @@ __all__ = (
     'EdgeLiteral', 'MatchType', 'GRT_a', 'GRT_f', 'GRT_t', 'GRT_o', 'GRT_m', 'GRT_d',
     'GraphicsCommandType', 'HandlerType', 'AbstractEventLoop', 'AddressFamily', 'Socket', 'CompletedProcess',
     'PopenType', 'Protocol', 'TypedDict', 'MarkType', 'ImageManagerType', 'Debug', 'LoopType', 'MouseEvent',
-    'TermManagerType', 'BossType', 'ChildType', 'BadLineType', 'MouseButton',
-    'KeyActionType', 'KeyMap', 'KittyCommonOpts', 'AliasMap', 'SequenceMap', 'CoreTextFont', 'WindowSystemMouseEvent',
+    'TermManagerType', 'BossType', 'ChildType', 'BadLineType', 'MouseButton', 'NotRequired',
+    'KeyActionType', 'KeyMap', 'KittyCommonOpts', 'AliasMap', 'CoreTextFont', 'WindowSystemMouseEvent',
     'FontConfigPattern', 'ScreenType', 'StartupCtx', 'KeyEventType', 'LayoutType', 'PowerlineStyle',
     'RemoteCommandType', 'SessionType', 'SessionTab', 'SpecialWindowInstance', 'TabType', 'ScreenSize', 'WindowType'
 )

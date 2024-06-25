@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"image"
 	"image/gif"
+	"kitty/tools/tty"
 	"kitty/tools/tui/graphics"
 	"kitty/tools/utils"
 	"kitty/tools/utils/images"
 	"kitty/tools/utils/shm"
 
-	"github.com/disintegration/imaging"
+	"github.com/edwvee/exiffix"
+	"github.com/kovidgoyal/imaging"
 )
 
 var _ = fmt.Print
@@ -107,8 +109,8 @@ func scale_image(imgd *image_data) bool {
 	return false
 }
 
-func load_one_frame_image(ctx *images.Context, imgd *image_data, src *opened_input) (img image.Image, err error) {
-	img, err = imaging.Decode(src.file, imaging.AutoOrientation(true))
+func load_one_frame_image(imgd *image_data, src *opened_input) (img image.Image, err error) {
+	img, _, err = exiffix.Decode(src.file)
 	src.Rewind()
 	if err != nil {
 		return
@@ -121,19 +123,8 @@ func load_one_frame_image(ctx *images.Context, imgd *image_data, src *opened_inp
 	return
 }
 
-func calc_min_gap(gaps []int) int {
-	// Some broken GIF images have all zero gaps, browsers with their usual
-	// idiot ideas render these with a default 100ms gap https://bugzilla.mozilla.org/show_bug.cgi?id=125137
-	// Browsers actually force a 100ms gap at any zero gap frame, but that
-	// just means it is impossible to deliberately use zero gap frames for
-	// sophisticated blending, so we dont do that.
-	max_gap := utils.Max(0, gaps...)
-	min_gap := 0
-	if max_gap <= 0 {
-		min_gap = 10
-	}
-	return min_gap
-}
+var debugprintln = tty.DebugPrintln
+var _ = debugprintln
 
 func (frame *image_frame) set_disposal(anchor_frame int, disposal byte) int {
 	anchor_frame, frame.compose_onto = images.SetGIFFrameDisposal(frame.number, anchor_frame, disposal)
@@ -173,7 +164,7 @@ func render_image_with_go(imgd *image_data, src *opened_input) (err error) {
 			return err
 		}
 	default:
-		img, err := load_one_frame_image(&ctx, imgd, src)
+		img, err := load_one_frame_image(imgd, src)
 		if err != nil {
 			return err
 		}

@@ -292,9 +292,9 @@ class Freeze(object):
                 'harfbuzz.0',
                 'png16.16',
                 'lcms2.2',
-                'crypto.1.1',
-                'ssl.1.1',
-                'rsync.2',
+                'crypto.3',
+                'ssl.3',
+                'xxhash.0',
         ):
             print('\nAdding', x)
             x = f'lib{x}.dylib'

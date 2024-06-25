@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2018, Kovid Goyal <kovid at kovidgoyal.net>
 
 from kitty.config import defaults
@@ -31,8 +31,8 @@ class Window:
     def effective_padding(self, edge):
         return 1
 
-    def effective_margin(self, edge, is_single_window=False):
-        return 0 if is_single_window else 1
+    def effective_margin(self, edge):
+        return 1
 
     def set_visible_in_layout(self, val):
         self.is_visible_in_layout = bool(val)

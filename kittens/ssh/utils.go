@@ -5,23 +5,25 @@ package ssh
 import (
 	"fmt"
 	"io"
-	"kitty"
-	"kitty/tools/config"
-	"kitty/tools/utils"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+
+	"kitty"
+	"kitty/tools/config"
+	"kitty/tools/utils"
 )
 
 var _ = fmt.Print
 
-var SSHExe = (&utils.Once[string]{Run: func() string {
+var SSHExe = sync.OnceValue(func() string {
 	return utils.FindExe("ssh")
-}}).Get
+})
 
-var SSHOptions = (&utils.Once[map[string]string]{Run: func() (ssh_options map[string]string) {
+var SSHOptions = sync.OnceValue(func() (ssh_options map[string]string) {
 	defer func() {
 		if ssh_options == nil {
 			ssh_options = map[string]string{
@@ -40,7 +42,7 @@ var SSHOptions = (&utils.Once[map[string]string]{Run: func() (ssh_options map[st
 	if err != nil {
 		return
 	}
-	if err := cmd.Start(); err != nil {
+	if err = cmd.Start(); err != nil {
 		return
 	}
 	raw, err := io.ReadAll(stderr)
@@ -48,6 +50,10 @@ var SSHOptions = (&utils.Once[map[string]string]{Run: func() (ssh_options map[st
 		return
 	}
 	text := utils.UnsafeBytesToString(raw)
+	if strings.Contains(text, "OpenSSL version mismatch.") {
+		// https://bugzilla.mindrot.org/show_bug.cgi?id=3548
+		return
+	}
 	ssh_options = make(map[string]string, 32)
 	for {
 		pos := strings.IndexByte(text, '[')
@@ -80,7 +86,7 @@ var SSHOptions = (&utils.Once[map[string]string]{Run: func() (ssh_options map[st
 		}
 	}
 	return
-}}).Get
+})
 
 func GetSSHCLI() (boolean_ssh_args *utils.Set[string], other_ssh_args *utils.Set[string]) {
 	other_ssh_args, boolean_ssh_args = utils.NewSet[string](32), utils.NewSet[string](32)
@@ -113,7 +119,7 @@ func (self *ErrInvalidSSHArgs) Error() string {
 }
 
 func PassthroughArgs() map[string]bool {
-	return map[string]bool{"-N": true, "-n": true, "-f": true, "-G": true, "-T": true}
+	return map[string]bool{"-N": true, "-n": true, "-f": true, "-G": true, "-T": true, "-V": true}
 }
 
 func ParseSSHArgs(args []string, extra_args ...string) (ssh_args []string, server_args []string, passthrough bool, found_extra_args []string, err error) {
@@ -201,7 +207,7 @@ func (self SSHVersion) SupportsAskpassRequire() bool {
 	return self.Major > 8 || (self.Major == 8 && self.Minor >= 4)
 }
 
-var GetSSHVersion = (&utils.Once[SSHVersion]{Run: func() SSHVersion {
+var GetSSHVersion = sync.OnceValue(func() SSHVersion {
 	b, err := exec.Command(SSHExe(), "-V").CombinedOutput()
 	if err != nil {
 		return SSHVersion{}
@@ -213,7 +219,7 @@ var GetSSHVersion = (&utils.Once[SSHVersion]{Run: func() SSHVersion {
 		return SSHVersion{Major: maj, Minor: min}
 	}
 	return SSHVersion{}
-}}).Get
+})
 
 type KittyOpts struct {
 	Term, Shell_integration string
@@ -235,6 +241,6 @@ func read_relevant_kitty_opts(path string) KittyOpts {
 	return ans
 }
 
-var RelevantKittyOpts = (&utils.Once[KittyOpts]{Run: func() KittyOpts {
+var RelevantKittyOpts = sync.OnceValue(func() KittyOpts {
 	return read_relevant_kitty_opts(filepath.Join(utils.ConfigDir(), "kitty.conf"))
-}}).Get
+})

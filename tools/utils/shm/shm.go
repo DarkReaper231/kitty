@@ -92,16 +92,22 @@ func CreateTemp(pattern string, size uint64) (MMap, error) {
 	return create_temp(pattern, size)
 }
 
-func truncate_or_unlink(ans *os.File, size uint64) (err error) {
-	for {
-		err = unix.Ftruncate(int(ans.Fd()), int64(size))
-		if !errors.Is(err, unix.EINTR) {
-			break
+func truncate_or_unlink(ans *os.File, size uint64, unlink func(string) error) (err error) {
+	fd := int(ans.Fd())
+	sz := int64(size)
+	if err = Fallocate_simple(fd, sz); err != nil {
+		if !errors.Is(err, errors.ErrUnsupported) {
+			return fmt.Errorf("fallocate() failed on fd from shm_open(%s) with size: %d with error: %w", ans.Name(), size, err)
+		}
+		for {
+			if err = unix.Ftruncate(fd, sz); !errors.Is(err, unix.EINTR) {
+				break
+			}
 		}
 	}
 	if err != nil {
-		ans.Close()
-		os.Remove(ans.Name())
+		_ = ans.Close()
+		_ = unlink(ans.Name())
 		return fmt.Errorf("Failed to ftruncate() SHM file %s to size: %d with error: %w", ans.Name(), size, err)
 	}
 	return
@@ -152,7 +158,7 @@ func ReadWithSizeAndUnlink(name string, file_callback ...func(fs.FileInfo) error
 	}
 	defer func() {
 		mmap.Close()
-		mmap.Unlink()
+		_ = mmap.Unlink()
 	}()
 	slice, err := ReadWithSize(mmap, 0)
 	if err != nil {
@@ -164,7 +170,10 @@ func ReadWithSizeAndUnlink(name string, file_callback ...func(fs.FileInfo) error
 }
 
 func Read(self MMap, b []byte) (n int, err error) {
-	pos, _ := self.Seek(0, io.SeekCurrent)
+	pos, err := self.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
 	if pos < 0 {
 		pos = 0
 	}
@@ -174,7 +183,7 @@ func Read(self MMap, b []byte) (n int, err error) {
 		return 0, io.EOF
 	}
 	n = copy(b, s[pos:])
-	self.Seek(int64(n), io.SeekCurrent)
+	_, err = self.Seek(int64(n), io.SeekCurrent)
 	return
 }
 
@@ -191,7 +200,9 @@ func Write(self MMap, b []byte) (n int, err error) {
 		return 0, io.ErrShortWrite
 	}
 	n = copy(s[pos:], b)
-	self.Seek(int64(n), io.SeekCurrent)
+	if _, err = self.Seek(int64(n), io.SeekCurrent); err != nil {
+		return n, err
+	}
 	if n < len(b) {
 		return n, io.ErrShortWrite
 	}
@@ -220,7 +231,9 @@ func test_integration_with_python(args []string) (rc int, err error) {
 		if err != nil {
 			return 1, err
 		}
-		WriteWithSize(mmap, data, 0)
+		if err = WriteWithSize(mmap, data, 0); err != nil {
+			return 1, err
+		}
 		mmap.Close()
 		fmt.Println(mmap.Name())
 	}

@@ -7,15 +7,19 @@ import (
 	"encoding/base32"
 	"fmt"
 	"io/fs"
-	not_rand "math/rand"
+	not_rand "math/rand/v2"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"unicode/utf8"
 
+	"github.com/shirou/gopsutil/v3/process"
 	"golang.org/x/sys/unix"
 )
 
@@ -62,16 +66,24 @@ func Abspath(path string) string {
 	return path
 }
 
-var KittyExe = (&Once[string]{Run: func() string {
-	exe, err := os.Executable()
-	if err == nil {
+var KittyExe = sync.OnceValue(func() string {
+	if kitty_pid := os.Getenv("KITTY_PID"); kitty_pid != "" {
+		if kp, err := strconv.Atoi(kitty_pid); err == nil {
+			if p, err := process.NewProcess(int32(kp)); err == nil {
+				if exe, err := p.Exe(); err == nil && filepath.IsAbs(exe) && filepath.Base(exe) == "kitty" {
+					return exe
+				}
+			}
+		}
+	}
+	if exe, err := os.Executable(); err == nil {
 		ans := filepath.Join(filepath.Dir(exe), "kitty")
 		if s, err := os.Stat(ans); err == nil && !s.IsDir() {
 			return ans
 		}
 	}
 	return os.Getenv("KITTY_PATH_TO_KITTY_EXE")
-}}).Get
+})
 
 func ConfigDirForName(name string) (config_dir string) {
 	if kcd := os.Getenv("KITTY_CONFIG_DIRECTORY"); kcd != "" {
@@ -102,8 +114,10 @@ func ConfigDirForName(name string) (config_dir string) {
 		if loc != "" {
 			q := filepath.Join(loc, "kitty")
 			if _, err := os.Stat(filepath.Join(q, name)); err == nil {
-				config_dir = q
-				return
+				if unix.Access(q, unix.W_OK) == nil {
+					config_dir = q
+					return
+				}
 			}
 		}
 	}
@@ -115,11 +129,11 @@ func ConfigDirForName(name string) (config_dir string) {
 	return
 }
 
-var ConfigDir = (&Once[string]{Run: func() (config_dir string) {
+var ConfigDir = sync.OnceValue(func() (config_dir string) {
 	return ConfigDirForName("kitty.conf")
-}}).Get
+})
 
-var CacheDir = (&Once[string]{Run: func() (cache_dir string) {
+var CacheDir = sync.OnceValue(func() (cache_dir string) {
 	candidate := ""
 	if edir := os.Getenv("KITTY_CACHE_DIRECTORY"); edir != "" {
 		candidate = Abspath(Expanduser(edir))
@@ -132,9 +146,9 @@ var CacheDir = (&Once[string]{Run: func() (cache_dir string) {
 		}
 		candidate = filepath.Join(Expanduser(candidate), "kitty")
 	}
-	os.MkdirAll(candidate, 0o755)
+	_ = os.MkdirAll(candidate, 0o755)
 	return candidate
-}}).Get
+})
 
 func macos_user_cache_dir() string {
 	// Sadly Go does not provide confstr() so we use this hack.
@@ -174,7 +188,7 @@ func macos_user_cache_dir() string {
 	return ""
 }
 
-var RuntimeDir = (&Once[string]{Run: func() (runtime_dir string) {
+var RuntimeDir = sync.OnceValue(func() (runtime_dir string) {
 	var candidate string
 	if q := os.Getenv("KITTY_RUNTIME_DIRECTORY"); q != "" {
 		candidate = q
@@ -197,7 +211,7 @@ var RuntimeDir = (&Once[string]{Run: func() (runtime_dir string) {
 		os.Chmod(candidate, 0o700)
 	}
 	return candidate
-}}).Get
+})
 
 type Walk_callback func(path, abspath string, d fs.DirEntry, err error) error
 
@@ -288,4 +302,30 @@ func ResolveConfPath(path string) string {
 		cs = filepath.Join(ConfigDir(), cs)
 	}
 	return cs
+}
+
+// Longest common path. Must be passed paths that have been cleaned by filepath.Clean
+func Commonpath(paths ...string) (longest_prefix string) {
+	switch len(paths) {
+	case 0:
+		return
+	case 1:
+		return paths[0]
+	default:
+		sort.Strings(paths)
+		a, b := paths[0], paths[len(paths)-1]
+		sz := 0
+		for a != "" && b != "" {
+			ra, na := utf8.DecodeRuneInString(a)
+			rb, nb := utf8.DecodeRuneInString(b)
+			if ra != rb {
+				break
+			}
+			sz += na
+			a = a[na:]
+			b = b[nb:]
+		}
+		longest_prefix = paths[0][:sz]
+	}
+	return
 }

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
 import locale
@@ -30,7 +30,6 @@ from .constants import (
     website_url,
 )
 from .fast_data_types import (
-    GLFW_IBEAM_CURSOR,
     GLFW_MOD_ALT,
     GLFW_MOD_SHIFT,
     SingleKey,
@@ -45,23 +44,24 @@ from .fast_data_types import (
     set_options,
 )
 from .fonts.box_drawing import set_scale
-from .fonts.render import set_font_family
+from .fonts.render import dump_font_debug, set_font_family
 from .options.types import Options
 from .options.utils import DELETE_ENV_VAR
-from .os_window_size import initial_window_size_func
+from .os_window_size import edge_spacing, initial_window_size_func
 from .session import create_sessions, get_os_window_sizing_data
-from .types import SingleInstanceData
+from .shaders import CompileError, load_shader_programs
+from .types import LayerShellConfig
 from .utils import (
     cleanup_ssh_control_masters,
     detach,
     expandvars,
+    get_custom_window_icon,
     log_error,
     parse_os_window_state,
-    single_instance,
+    safe_mtime,
+    shlex_split,
     startup_notification_handler,
-    unix_socket_paths,
 )
-from .window import load_shader_programs
 
 
 def set_custom_ibeam_cursor() -> None:
@@ -74,69 +74,27 @@ def set_custom_ibeam_cursor() -> None:
     rgba_data2, width2, height2 = load_png_data(data)
     images = (rgba_data, width, height), (rgba_data2, width2, height2)
     try:
-        set_custom_cursor(GLFW_IBEAM_CURSOR, images, 4, 8)
+        set_custom_cursor("beam", images, 4, 8)
     except Exception as e:
         log_error(f'Failed to set custom beam cursor with error: {e}')
 
 
-def talk_to_instance(args: CLIOptions) -> None:
-    import json
-    import socket
-    session_data = ''
-    if args.session == '-':
-        session_data = sys.stdin.read()
-    elif args.session == 'none':
-        session_data = 'none'
-    elif args.session:
-        with open(args.session) as f:
-            session_data = f.read()
-
-    data: SingleInstanceData = {
-        'cmd': 'new_instance', 'args': tuple(sys.argv), 'cmdline_args_for_open': getattr(sys, 'cmdline_args_for_open', ()),
-        'cwd': os.getcwd(), 'session_data': session_data, 'environ': dict(os.environ), 'notify_on_os_window_death': None
-    }
-    notify_socket = None
-    if args.wait_for_single_instance_window_close:
-        address = f'\0{appname}-os-window-close-notify-{os.getpid()}-{os.geteuid()}'
-        notify_socket = socket.socket(family=socket.AF_UNIX)
-        try:
-            notify_socket.bind(address)
-        except FileNotFoundError:
-            for address in unix_socket_paths(address[1:], ext='.sock'):
-                notify_socket.bind(address)
-                break
-        data['notify_on_os_window_death'] = address
-        notify_socket.listen()
-
-    sdata = json.dumps(data, ensure_ascii=False).encode('utf-8')
-    assert single_instance.socket is not None
-    single_instance.socket.sendall(sdata)
-    with suppress(OSError):
-        single_instance.socket.shutdown(socket.SHUT_RDWR)
-    single_instance.socket.close()
-
-    if args.wait_for_single_instance_window_close:
-        assert notify_socket is not None
-        conn = notify_socket.accept()[0]
-        conn.recv(1)
-        with suppress(OSError):
-            conn.shutdown(socket.SHUT_RDWR)
-        conn.close()
-
-
 def load_all_shaders(semi_transparent: bool = False) -> None:
-    load_shader_programs(semi_transparent)
-    load_borders_program()
+    try:
+        load_shader_programs(semi_transparent)
+        load_borders_program()
+    except CompileError as err:
+        raise SystemExit(err)
 
 
-def init_glfw_module(glfw_module: str, debug_keyboard: bool = False, debug_rendering: bool = False) -> None:
-    if not glfw_init(glfw_path(glfw_module), debug_keyboard, debug_rendering):
+def init_glfw_module(glfw_module: str, debug_keyboard: bool = False, debug_rendering: bool = False, wayland_enable_ime: bool = True) -> None:
+    if not glfw_init(glfw_path(glfw_module), edge_spacing, debug_keyboard, debug_rendering, wayland_enable_ime):
         raise SystemExit('GLFW initialization failed')
 
 
 def init_glfw(opts: Options, debug_keyboard: bool = False, debug_rendering: bool = False) -> str:
     glfw_module = 'cocoa' if is_macos else ('wayland' if is_wayland(opts) else 'x11')
-    init_glfw_module(glfw_module, debug_keyboard, debug_rendering)
+    init_glfw_module(glfw_module, debug_keyboard, debug_rendering, wayland_enable_ime=opts.wayland_enable_ime)
     return glfw_module
 
 
@@ -145,7 +103,7 @@ def get_macos_shortcut_for(
 ) -> Optional[SingleKey]:
     # for maximum robustness we should use opts.alias_map to resolve
     # aliases however this requires parsing everything on startup which could
-    # be potentially slow. Lets just hope the user doesnt alias these
+    # be potentially slow. Lets just hope the user doesn't alias these
     # functions.
     ans = None
     candidates = []
@@ -167,50 +125,58 @@ def get_macos_shortcut_for(
     return ans
 
 
-def safe_mtime(path: str) -> Optional[float]:
-    with suppress(OSError):
-        return os.path.getmtime(path)
-    return None
-
-
 def set_macos_app_custom_icon() -> None:
-    for name in ('kitty.app.icns', 'kitty.app.png'):
-        icon_path = os.path.join(config_dir, name)
-        custom_icon_mtime = safe_mtime(icon_path)
-        if custom_icon_mtime is not None:
-            from .fast_data_types import cocoa_set_app_icon, cocoa_set_dock_icon
-            krd = getattr(sys, 'kitty_run_data')
-            bundle_path = os.path.dirname(os.path.dirname(krd.get('bundle_exe_dir')))
-            icon_sentinel = os.path.join(bundle_path, 'Icon\r')
-            sentinel_mtime = safe_mtime(icon_sentinel)
-            if sentinel_mtime is None or sentinel_mtime < custom_icon_mtime:
-                try:
-                    cocoa_set_app_icon(icon_path, bundle_path)
-                except (FileNotFoundError, OSError) as e:
-                    log_error(str(e))
-                    log_error('Failed to set custom app icon, ignoring')
-            # macOS Dock does not reload icons until it is restarted, so we set
-            # the application icon here. This will revert when kitty quits, but
-            # cant be helped since there appears to be no way to get the dock
-            # to reload short of killing it.
-            cocoa_set_dock_icon(icon_path)
-            break
+    custom_icon_mtime, custom_icon_path = get_custom_window_icon()
+    if custom_icon_mtime is not None and custom_icon_path is not None:
+        from .fast_data_types import cocoa_set_app_icon, cocoa_set_dock_icon
+        krd = getattr(sys, 'kitty_run_data')
+        bundle_path = os.path.dirname(os.path.dirname(krd.get('bundle_exe_dir')))
+        icon_sentinel = os.path.join(bundle_path, 'Icon\r')
+        sentinel_mtime = safe_mtime(icon_sentinel)
+        if sentinel_mtime is None or sentinel_mtime < custom_icon_mtime:
+            try:
+                cocoa_set_app_icon(custom_icon_path, bundle_path)
+            except (FileNotFoundError, OSError) as e:
+                log_error(str(e))
+                log_error('Failed to set custom app icon, ignoring')
+        # macOS Dock does not reload icons until it is restarted, so we set
+        # the application icon here. This will revert when kitty quits, but
+        # can't be helped since there appears to be no way to get the dock
+        # to reload short of killing it.
+        cocoa_set_dock_icon(custom_icon_path)
+
+
+def get_icon128_path(base_path: str) -> str:
+    # max icon size on X11 64bits is 128x128
+    path, ext = os.path.splitext(base_path)
+    return f'{path}-128{ext}'
 
 
 def set_x11_window_icon() -> None:
-    # max icon size on X11 64bits is 128x128
-    path, ext = os.path.splitext(logo_png_file)
-    set_default_window_icon(f'{path}-128{ext}')
+    custom_icon_path = get_custom_window_icon()[1]
+    try:
+        if custom_icon_path is not None:
+            custom_icon128_path = get_icon128_path(custom_icon_path)
+            if safe_mtime(custom_icon128_path) is None:
+                set_default_window_icon(custom_icon_path)
+            else:
+                set_default_window_icon(custom_icon128_path)
+        else:
+            set_default_window_icon(get_icon128_path(logo_png_file))
+    except ValueError as err:
+        log_error(err)
 
 
-def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = ()) -> None:
+def set_cocoa_global_shortcuts(opts: Options) -> Dict[str, SingleKey]:
     global_shortcuts: Dict[str, SingleKey] = {}
     if is_macos:
         from collections import defaultdict
         func_map = defaultdict(list)
-        for k, v in opts.keymap.items():
-            parts = tuple(v.split())
-            func_map[parts].append(k)
+        for single_key, v in opts.keyboard_modes[''].keymap.items():
+            kd = v[-1]  # the last definition is the active one
+            if kd.is_suitable_for_global_shortcut:
+                parts = tuple(kd.definition.split())
+                func_map[parts].append(single_key)
 
         for ac in ('new_os_window', 'close_os_window', 'close_tab', 'edit_config_file', 'previous_tab',
                    'next_tab', 'new_tab', 'new_window', 'close_window', 'toggle_macos_secure_keyboard_entry', 'toggle_fullscreen',
@@ -230,13 +196,20 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = ())
         val = get_macos_shortcut_for(func_map, f'open_url {website_url()}', lookup_name='open_kitty_website')
         if val is not None:
             global_shortcuts['open_kitty_website'] = val
+    return global_shortcuts
 
+
+def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (), talk_fd: int = -1) -> None:
+    if is_macos:
+        global_shortcuts = set_cocoa_global_shortcuts(opts)
         if opts.macos_custom_beam_cursor:
             set_custom_ibeam_cursor()
         set_macos_app_custom_icon()
+    else:
+        global_shortcuts = {}
+        if not is_wayland():  # no window icons on wayland
+            set_x11_window_icon()
 
-    if not is_wayland() and not is_macos:  # no window icons on wayland
-        set_x11_window_icon()
     with cached_values_for(run_app.cached_values_name) as cached_values:
         startup_sessions = tuple(create_sessions(opts, args, default_session=opts.startup_session))
         wincls = (startup_sessions[0].os_window_class if startup_sessions else '') or args.cls or appname
@@ -249,11 +222,14 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = ())
                     run_app.initial_window_size_func(get_os_window_sizing_data(opts, startup_sessions[0] if startup_sessions else None), cached_values),
                     pre_show_callback,
                     args.title or appname, args.name or args.cls or appname,
-                    wincls, wstate, load_all_shaders, disallow_override_title=bool(args.title))
-        boss = Boss(opts, args, cached_values, global_shortcuts)
+                    wincls, wstate, load_all_shaders, disallow_override_title=bool(args.title), layer_shell_config=run_app.layer_shell_config)
+        boss = Boss(opts, args, cached_values, global_shortcuts, talk_fd)
         boss.start(window_id, startup_sessions)
-        if bad_lines:
-            boss.show_bad_config_lines(bad_lines)
+        if args.debug_font_fallback:
+            dump_font_debug()
+        if bad_lines or boss.misc_config_errors:
+            boss.show_bad_config_lines(bad_lines, boss.misc_config_errors)
+            boss.misc_config_errors = []
         try:
             boss.child_monitor.main_loop()
         finally:
@@ -265,14 +241,15 @@ class AppRunner:
     def __init__(self) -> None:
         self.cached_values_name = 'main'
         self.first_window_callback = lambda window_handle: None
+        self.layer_shell_config: Optional[LayerShellConfig] = None
         self.initial_window_size_func = initial_window_size_func
 
-    def __call__(self, opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = ()) -> None:
+    def __call__(self, opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (), talk_fd: int = -1) -> None:
         set_scale(opts.box_drawing_scale)
         set_options(opts, is_wayland(), args.debug_rendering, args.debug_font_fallback)
         try:
-            set_font_family(opts, debug_font_matching=args.debug_font_fallback)
-            _run_app(opts, args, bad_lines)
+            set_font_family(opts)
+            _run_app(opts, args, bad_lines, talk_fd)
         finally:
             set_options(None)
             free_font_data()  # must free font data before glfw/freetype/fontconfig/opengl etc are finalized
@@ -291,15 +268,20 @@ def ensure_macos_locale() -> None:
     # https://github.com/kovidgoyal/kitty/issues/90
     from .fast_data_types import cocoa_get_lang, locale_is_valid
     if 'LANG' not in os.environ:
-        lang = cocoa_get_lang()
-        if lang is not None:
-            if not locale_is_valid(lang):
-                if lang.startswith('en_'):
-                    lang = 'en_US'
-                else:
-                    log_error(f'Could not set LANG Cocoa returns language as: {lang}')
-            os.environ['LANG'] = f'{lang}.UTF-8'
-            set_LANG_in_default_env(os.environ['LANG'])
+        lang_code, country_code, identifier = cocoa_get_lang()
+        lang = 'en_US'
+        if identifier and locale_is_valid(identifier):
+            lang = identifier
+        elif lang_code and country_code and locale_is_valid(f'{lang_code}_{country_code}'):
+            lang = f'{lang_code}_{country_code}'
+        elif lang_code:
+            if lang_code != 'en':
+                with suppress(OSError):
+                    found = sorted(x for x in os.listdir('/usr/share/locale') if x.startswith(f'{lang_code}_'))
+                    if found:
+                        lang = found[0].partition('.')[0]
+        os.environ['LANG'] = f'{lang}.UTF-8'
+        set_LANG_in_default_env(os.environ['LANG'])
 
 
 @contextmanager
@@ -333,17 +315,18 @@ def macos_cmdline(argv_args: List[str]) -> List[str]:
             raw = f.read()
     except FileNotFoundError:
         return argv_args
-    import shlex
     raw = raw.strip()
-    ans = shlex.split(raw)
+    ans = list(shlex_split(raw))
     if ans and ans[0] == 'kitty':
         del ans[0]
-    return ans
+    return ans + argv_args
 
 
 def expand_listen_on(listen_on: str, from_config_file: bool) -> str:
+    if from_config_file and listen_on == 'none':
+        return ''
     listen_on = expandvars(listen_on)
-    if '{kitty_pid}' not in listen_on and from_config_file:
+    if '{kitty_pid}' not in listen_on and from_config_file and listen_on.startswith('unix:'):
         listen_on += '-{kitty_pid}'
     listen_on = listen_on.replace('{kitty_pid}', str(os.getpid()))
     if listen_on.startswith('unix:'):
@@ -354,6 +337,9 @@ def expand_listen_on(listen_on: str, from_config_file: bool) -> str:
             elif not os.path.isabs(path):
                 import tempfile
                 listen_on = f'unix:{os.path.join(tempfile.gettempdir(), path)}'
+    elif listen_on.startswith('tcp:') or listen_on.startswith('tcp6:'):
+        if from_config_file:  # use a random port
+            listen_on = ':'.join(listen_on.split(':', 2)[:2]) + ':0'
     return listen_on
 
 
@@ -416,7 +402,7 @@ def setup_manpath(env: Dict[str, str]) -> None:
 
 def setup_environment(opts: Options, cli_opts: CLIOptions) -> None:
     from_config_file = False
-    if not cli_opts.listen_on and opts.listen_on.startswith('unix:'):
+    if not cli_opts.listen_on:
         cli_opts.listen_on = opts.listen_on
         from_config_file = True
     if cli_opts.listen_on:
@@ -490,11 +476,20 @@ def _main() -> None:
         from kitty.client import main as client_main
         client_main(cli_opts.replay_commands)
         return
+    talk_fd = -1
     if cli_opts.single_instance:
-        is_first = single_instance(cli_opts.instance_group)
-        if not is_first:
-            talk_to_instance(cli_opts)
-            return
+        si_data = os.environ.pop('KITTY_SI_DATA', '')
+        if si_data:
+            import atexit
+            fdnum, sep, socket_path = si_data.partition(':')
+            talk_fd = int(fdnum)
+            def cleanup_si() -> None:
+                with suppress(OSError):
+                    os.close(talk_fd)
+                with suppress(OSError):
+                    if sep and socket_path:
+                        os.unlink(socket_path)
+            atexit.register(cleanup_si)
     bad_lines: List[BadLine] = []
     opts = create_opts(cli_opts, accumulate_bad_lines=bad_lines)
     setup_environment(opts, cli_opts)
@@ -508,19 +503,19 @@ def _main() -> None:
     with suppress(AttributeError):  # python compiled without threading
         sys.setswitchinterval(1000.0)  # we have only a single python thread
 
+    if cli_opts.watcher:
+        from .window import global_watchers
+        global_watchers.set_extra(cli_opts.watcher)
+        log_error('The --watcher command line option has been deprecated in favor of using the watcher option in kitty.conf')
     # mask the signals now as on some platforms the display backend starts
     # threads. These threads must not handle the masked signals, to ensure
     # kitty can handle them. See https://github.com/kovidgoyal/kitty/issues/4636
     mask_kitty_signals_process_wide()
     init_glfw(opts, cli_opts.debug_keyboard, cli_opts.debug_rendering)
-    if cli_opts.watcher:
-        from .window import global_watchers
-        global_watchers.set_extra(cli_opts.watcher)
-        log_error('The --watcher command line option has been deprecated in favor of using the watcher option in kitty.conf')
     try:
         with setup_profiling():
             # Avoid needing to launch threads to reap zombies
-            run_app(opts, cli_opts, bad_lines)
+            run_app(opts, cli_opts, bad_lines, talk_fd)
     finally:
         glfw_terminate()
         cleanup_ssh_control_masters()

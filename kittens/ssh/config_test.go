@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"kitty/tools/utils"
 	"os"
+	"os/user"
 	"path/filepath"
 	"testing"
 
@@ -14,16 +15,23 @@ import (
 
 var _ = fmt.Print
 
+type Pair struct {
+	Input, Uname, Host string
+}
+
 func TestSSHConfigParsing(t *testing.T) {
 	tdir := t.TempDir()
 	hostname := "unmatched"
 	username := ""
 	conf := ""
+	overrides := []string{}
 	for_python := false
 	cf := filepath.Join(tdir, "ssh.conf")
 	rt := func(expected_env ...string) {
-		os.WriteFile(cf, []byte(conf), 0o600)
-		c, bad_lines, err := load_config(hostname, username, nil, cf)
+		if err := os.WriteFile(cf, []byte(conf), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, bad_lines, err := load_config(hostname, username, overrides, cf)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -47,6 +55,28 @@ func TestSSHConfigParsing(t *testing.T) {
 	rt()
 	conf = "env a=b"
 	rt(`export 'a'="b"`)
+	conf = "env a=b"
+	overrides = []string{"env=c=d"}
+	rt(`export 'a'="b"`, `export 'c'="d"`)
+	overrides = nil
+
+	conf = "env a=\\"
+	rt(`export 'a'="\\"`)
+	conf = `env
+		\ a=
+		\\`
+	conf = "env\n \t \\ a=\n\\\\"
+	rt(`export 'a'="\\"`)
+	conf = `
+		e
+		\n
+		\v
+		\ a
+		\=
+		\\
+		\`
+	rt(`export 'a'="\\"`)
+
 	conf = "env a=b\nhostname 2\nenv a=c\nenv b=b"
 	rt(`export 'a'="b"`)
 	hostname = "2"
@@ -108,6 +138,22 @@ func TestSSHConfigParsing(t *testing.T) {
 	}
 	if len(ci) != 1 {
 		t.Fatal(ci)
+	}
+
+	u, _ := user.Current()
+	un := u.Username
+	for _, x := range []Pair{
+		{"localhost:12", un, "localhost:12"},
+		{"@localhost", un, "@localhost"},
+		{"ssh://@localhost:33", un, "localhost"},
+		{"me@localhost", "me", "localhost"},
+		{"ssh://me@localhost:12/something?else=1", "me", "localhost"},
+	} {
+		ue, uh := get_destination(x.Input)
+		q := Pair{x.Input, ue, uh}
+		if diff := cmp.Diff(x, q); diff != "" {
+			t.Fatalf("Failed: %s", diff)
+		}
 	}
 
 }

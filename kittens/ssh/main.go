@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"kitty"
+	"maps"
 	"net/url"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -30,12 +32,12 @@ import (
 	"kitty/tools/tty"
 	"kitty/tools/tui"
 	"kitty/tools/tui/loop"
+	"kitty/tools/tui/shell_integration"
 	"kitty/tools/utils"
 	"kitty/tools/utils/secrets"
+	"kitty/tools/utils/shlex"
 	"kitty/tools/utils/shm"
 
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
 	"golang.org/x/sys/unix"
 )
 
@@ -47,21 +49,23 @@ func get_destination(hostname string) (username, hostname_for_match string) {
 		username = u.Username
 	}
 	hostname_for_match = hostname
+	parsed := false
 	if strings.HasPrefix(hostname, "ssh://") {
 		p, err := url.Parse(hostname)
 		if err == nil {
 			hostname_for_match = p.Hostname()
+			parsed = true
 			if p.User.Username() != "" {
 				username = p.User.Username()
 			}
 		}
 	} else if strings.Contains(hostname, "@") && hostname[0] != '@' {
 		username, hostname_for_match, _ = strings.Cut(hostname, "@")
+		parsed = true
 	}
-	if strings.Contains(hostname, "@") && hostname[0] != '@' {
-		_, hostname_for_match, _ = strings.Cut(hostname_for_match, "@")
+	if !parsed && strings.Contains(hostname, "@") && hostname[0] != '@' {
+		_, hostname_for_match, _ = strings.Cut(hostname, "@")
 	}
-	hostname_for_match, _, _ = strings.Cut(hostname_for_match, ":")
 	return
 }
 
@@ -111,9 +115,6 @@ func parse_kitten_args(found_extra_args []string, username, hostname_for_match s
 			}
 		}
 	}
-	if len(overrides) > 0 {
-		overrides = append([]string{"hostname " + username + "@" + hostname_for_match}, overrides...)
-	}
 	return
 }
 
@@ -150,7 +151,7 @@ func set_askpass() (need_to_request_data bool) {
 	sentinel_exists := err == nil
 	if sentinel_exists || GetSSHVersion().SupportsAskpassRequire() {
 		if !sentinel_exists {
-			os.WriteFile(sentinel, []byte{0}, 0o644)
+			_ = os.WriteFile(sentinel, []byte{0}, 0o644)
 		}
 		need_to_request_data = false
 	}
@@ -175,6 +176,7 @@ type connection_data struct {
 	echo_on            bool
 	request_data       bool
 	literal_env        map[string]string
+	listen_on          string
 	test_script        string
 	dont_create_shm    bool
 
@@ -244,6 +246,9 @@ func serialize_env(cd *connection_data, get_local_env func(string) (string, bool
 		add_env("KITTY_REMOTE", cd.host_opts.Remote_kitty.String())
 	}
 	add_env("KITTY_PUBLIC_KEY", os.Getenv("KITTY_PUBLIC_KEY"))
+	if cd.listen_on != "" {
+		add_env("KITTY_LISTEN_ON", cd.listen_on)
+	}
 	return final_env_instructions(cd.script_type == "py", get_local_env, env...), ksi
 }
 
@@ -298,14 +303,14 @@ func make_tarfile(cd *connection_data, get_local_env func(string) (string, bool)
 		}
 		return nil
 	}
-	add_entries := func(prefix string, items ...Entry) error {
+	add_entries := func(prefix string, items ...shell_integration.Entry) error {
 		for _, item := range items {
 			err := add(
 				&tar.Header{
-					Typeflag: item.metadata.Typeflag, Name: path.Join(prefix, path.Base(item.metadata.Name)), Format: tar.FormatPAX,
-					Size: int64(len(item.data)), Mode: item.metadata.Mode, ModTime: item.metadata.ModTime,
-					AccessTime: item.metadata.AccessTime, ChangeTime: item.metadata.ChangeTime,
-				}, item.data)
+					Typeflag: item.Metadata.Typeflag, Name: path.Join(prefix, path.Base(item.Metadata.Name)), Format: tar.FormatPAX,
+					Size: int64(len(item.Data)), Mode: item.Metadata.Mode, ModTime: item.Metadata.ModTime,
+					AccessTime: item.Metadata.AccessTime, ChangeTime: item.Metadata.ChangeTime,
+				}, item.Data)
 			if err != nil {
 				return err
 			}
@@ -313,18 +318,22 @@ func make_tarfile(cd *connection_data, get_local_env func(string) (string, bool)
 		return nil
 
 	}
-	add_data(fe{"data.sh", utils.UnsafeStringToBytes(env_script)})
+	if err = add_data(fe{"data.sh", utils.UnsafeStringToBytes(env_script)}); err != nil {
+		return nil, err
+	}
 	if cd.script_type == "sh" {
-		add_data(fe{"bootstrap-utils.sh", Data()[path.Join("shell-integration/ssh/bootstrap-utils.sh")].data})
+		if err = add_data(fe{"bootstrap-utils.sh", shell_integration.Data()[path.Join("shell-integration/ssh/bootstrap-utils.sh")].Data}); err != nil {
+			return nil, err
+		}
 	}
 	if ksi != "" {
-		for _, fname := range Data().files_matching(
+		for _, fname := range shell_integration.Data().FilesMatching(
 			"shell-integration/",
 			"shell-integration/ssh/.+",        // bootstrap files are sent as command line args
 			"shell-integration/zsh/kitty.zsh", // backward compat file not needed by ssh kitten
 		) {
 			arcname := path.Join("home/", rd, "/", path.Dir(fname))
-			err = add_entries(arcname, Data()[fname])
+			err = add_entries(arcname, shell_integration.Data()[fname])
 			if err != nil {
 				return nil, err
 			}
@@ -337,15 +346,15 @@ func make_tarfile(cd *connection_data, get_local_env func(string) (string, bool)
 			return nil, err
 		}
 		for _, x := range []string{"kitty", "kitten"} {
-			err = add_entries(path.Join(arcname, "bin"), Data()[path.Join("shell-integration", "ssh", x)])
+			err = add_entries(path.Join(arcname, "bin"), shell_integration.Data()[path.Join("shell-integration", "ssh", x)])
 			if err != nil {
 				return nil, err
 			}
 		}
 	}
-	err = add_entries(path.Join("home", ".terminfo"), Data()["terminfo/kitty.terminfo"])
+	err = add_entries(path.Join("home", ".terminfo"), shell_integration.Data()["terminfo/kitty.terminfo"])
 	if err == nil {
-		err = add_entries(path.Join("home", ".terminfo", "x"), Data()["terminfo/x/xterm-kitty"])
+		err = add_entries(path.Join("home", ".terminfo", "x"), shell_integration.Data()["terminfo/x/"+kitty.DefaultTermName])
 	}
 	if err == nil {
 		err = tw.Close()
@@ -402,7 +411,7 @@ func prepare_script(script string, replacements map[string]string) string {
 	if _, found := replacements["EXPORT_HOME_CMD"]; !found {
 		replacements["EXPORT_HOME_CMD"] = ""
 	}
-	keys := maps.Keys(replacements)
+	keys := utils.Keys(replacements)
 	for i, key := range keys {
 		keys[i] = "\\b" + key + "\\b"
 	}
@@ -469,7 +478,7 @@ func bootstrap_script(cd *connection_data) (err error) {
 	}
 	maps.Copy(replacements, sensitive_data)
 	cd.replacements = replacements
-	cd.bootstrap_script = utils.UnsafeBytesToString(Data()["shell-integration/ssh/bootstrap."+cd.script_type].data)
+	cd.bootstrap_script = utils.UnsafeBytesToString(shell_integration.Data()["shell-integration/ssh/bootstrap."+cd.script_type].Data)
 	cd.bootstrap_script = prepare_script(cd.bootstrap_script, sd)
 	return err
 }
@@ -489,7 +498,7 @@ func wrap_bootstrap_script(cd *connection_data) {
 		encoded_script = base64.StdEncoding.EncodeToString(utils.UnsafeStringToBytes(cd.bootstrap_script))
 		unwrap_script = `"import base64, sys; eval(compile(base64.standard_b64decode(sys.argv[-1]), 'bootstrap.py', 'exec'))"`
 	} else {
-		// We cant rely on base64 being available on the remote system, so instead
+		// We can't rely on base64 being available on the remote system, so instead
 		// we quote the bootstrap script by replacing ' and \ with \v and \f
 		// also replacing \n and ! with \r and \b for tcsh
 		// finally surrounding with '
@@ -515,16 +524,20 @@ func get_remote_command(cd *connection_data) error {
 	return nil
 }
 
+var debugprintln = tty.DebugPrintln
+var _ = debugprintln
+
 func drain_potential_tty_garbage(term *tty.Term) {
-	err := term.ApplyOperations(tty.TCSANOW, tty.SetNoEcho)
+	err := term.ApplyOperations(tty.TCSANOW, tty.SetRaw)
 	if err != nil {
 		return
 	}
-	canary, err := secrets.TokenBase64()
+	canary, err := secrets.TokenHex()
 	if err != nil {
 		return
 	}
-	dcs, err := tui.DCSToKitty("echo", canary+"\n\r")
+	dcs, err := tui.DCSToKitty("echo", canary)
+	q := utils.UnsafeStringToBytes(canary)
 	if err != nil {
 		return
 	}
@@ -532,19 +545,18 @@ func drain_potential_tty_garbage(term *tty.Term) {
 	if err != nil {
 		return
 	}
-	q := utils.UnsafeStringToBytes(canary)
 	data := make([]byte, 0)
 	give_up_at := time.Now().Add(2 * time.Second)
 	buf := make([]byte, 0, 8192)
 	for !bytes.Contains(data, q) {
 		buf = buf[:cap(buf)]
-		timeout := give_up_at.Sub(time.Now())
+		timeout := time.Until(give_up_at)
 		if timeout < 0 {
 			break
 		}
 		n, err := term.ReadWithTimeout(buf, timeout)
 		if err != nil {
-			return
+			break
 		}
 		data = append(data, buf[:n]...)
 	}
@@ -583,12 +595,12 @@ func change_colors(color_scheme string) (ans string, err error) {
 }
 
 func run_ssh(ssh_args, server_args, found_extra_args []string) (rc int, err error) {
-	go Data()
+	go shell_integration.Data()
 	go RelevantKittyOpts()
 	defer func() {
 		if data_shm != nil {
 			data_shm.Close()
-			data_shm.Unlink()
+			_ = data_shm.Unlink()
 		}
 	}()
 	cmd := append([]string{SSHExe()}, ssh_args...)
@@ -613,28 +625,95 @@ func run_ssh(ssh_args, server_args, found_extra_args []string) (rc int, err erro
 			fmt.Fprintf(os.Stderr, "Ignoring bad config line: %s:%d with error: %s", filepath.Base(x.Src_file), x.Line_number, x.Err)
 		}
 	}
+	if host_opts.Delegate != "" {
+		delegate_cmd, err := shlex.Split(host_opts.Delegate)
+		if err != nil {
+			return 1, fmt.Errorf("Could not parse delegate command: %#v with error: %w", host_opts.Delegate, err)
+		}
+		return 1, unix.Exec(utils.FindExe(delegate_cmd[0]), utils.Concat(delegate_cmd, ssh_args, server_args), os.Environ())
+	}
+	master_is_alive, master_checked := false, false
+	var control_master_args []string
 	if host_opts.Share_connections {
 		kpid, err := strconv.Atoi(os.Getenv("KITTY_PID"))
 		if err != nil {
 			return 1, fmt.Errorf("Invalid KITTY_PID env var not an integer: %#v", os.Getenv("KITTY_PID"))
 		}
-		cpargs, err := connection_sharing_args(kpid)
+		control_master_args, err = connection_sharing_args(kpid)
 		if err != nil {
 			return 1, err
 		}
-		cmd = slices.Insert(cmd, insertion_point, cpargs...)
+		cmd = slices.Insert(cmd, insertion_point, control_master_args...)
 	}
 	use_kitty_askpass := host_opts.Askpass == Askpass_native || (host_opts.Askpass == Askpass_unless_set && os.Getenv("SSH_ASKPASS") == "")
 	need_to_request_data := true
 	if use_kitty_askpass {
 		need_to_request_data = set_askpass()
 	}
-	if need_to_request_data && host_opts.Share_connections {
-		check_cmd := slices.Insert(cmd, 1, "-O", "check")
-		err = exec.Command(check_cmd[0], check_cmd[1:]...).Run()
-		if err == nil {
-			need_to_request_data = false
+	master_is_functional := func() bool {
+		if master_checked {
+			return master_is_alive
 		}
+		master_checked = true
+		check_cmd := slices.Insert(cmd, 1, "-O", "check")
+		master_is_alive = exec.Command(check_cmd[0], check_cmd[1:]...).Run() == nil
+		return master_is_alive
+	}
+
+	if need_to_request_data && host_opts.Share_connections && master_is_functional() {
+		need_to_request_data = false
+	}
+	run_control_master := func() error {
+		cmcmd := slices.Clone(cmd[:insertion_point])
+		cmcmd = append(cmcmd, control_master_args...)
+		cmcmd = append(cmcmd, "-N", "-f")
+		cmcmd = append(cmcmd, "--", hostname)
+		c := exec.Command(cmcmd[0], cmcmd[1:]...)
+		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+		err := c.Run()
+		if err != nil {
+			err = fmt.Errorf("Failed to start SSH ControlMaster with cmdline: %s and error: %w", strings.Join(cmcmd, " "), err)
+		}
+		master_checked = false
+		master_is_alive = false
+		return err
+	}
+	if host_opts.Forward_remote_control && os.Getenv("KITTY_LISTEN_ON") != "" {
+		if !host_opts.Share_connections {
+			return 1, fmt.Errorf("Cannot use forward_remote_control=yes without share_connections=yes as it relies on SSH Controlmasters")
+		}
+		if !master_is_functional() {
+			if err = run_control_master(); err != nil {
+				return 1, err
+			}
+			if !master_is_functional() {
+				return 1, fmt.Errorf("SSH ControlMaster not functional after being started explicitly")
+			}
+		}
+		protocol, listen_on, found := strings.Cut(os.Getenv("KITTY_LISTEN_ON"), ":")
+		if !found {
+			return 1, fmt.Errorf("Invalid KITTY_LISTEN_ON: %#v", os.Getenv("KITTY_LISTEN_ON"))
+		}
+		if protocol == "unix" && strings.HasPrefix(listen_on, "@") {
+			return 1, fmt.Errorf("Cannot forward kitty remote control socket when an abstract UNIX socket (%s) is used, due to limitations in OpenSSH. Use either a path based one or a TCP socket", listen_on)
+		}
+		cmcmd := slices.Clone(cmd[:insertion_point])
+		cmcmd = append(cmcmd, control_master_args...)
+		cmcmd = append(cmcmd, "-R", "0:"+listen_on, "-O", "forward")
+		cmcmd = append(cmcmd, "--", hostname)
+		c := exec.Command(cmcmd[0], cmcmd[1:]...)
+		b := bytes.Buffer{}
+		c.Stdout = &b
+		c.Stderr = os.Stderr
+		if err := c.Run(); err != nil {
+			return 1, fmt.Errorf("%s\nSetup of port forward in SSH ControlMaster failed with error: %w", b.String(), err)
+		}
+		port, err := strconv.Atoi(strings.TrimSpace(b.String()))
+		if err != nil {
+			os.Stderr.Write(b.Bytes())
+			return 1, fmt.Errorf("Setup of port forward in SSH ControlMaster failed with error: invalid resolved port returned: %s", b.String())
+		}
+		cd.listen_on = "tcp:localhost:" + strconv.Itoa(port)
 	}
 	term, err := tty.OpenControllingTerm(tty.SetNoEcho)
 	if err != nil {
@@ -651,14 +730,22 @@ func run_ssh(ssh_args, server_args, found_extra_args []string) (rc int, err erro
 	if err != nil {
 		return 1, err
 	}
-	restore_escape_codes := loop.RESTORE_PRIVATE_MODE_VALUES
+	restore_escape_codes := loop.RESTORE_PRIVATE_MODE_VALUES + loop.HANDLE_TERMIOS_SIGNALS.EscapeCodeToReset()
 	if escape_codes_to_set_colors != "" {
 		restore_escape_codes += "\x1b[#Q"
 	}
-	defer func() {
-		term.WriteAllString(restore_escape_codes)
-		term.RestoreAndClose()
-	}()
+	sigs := make(chan os.Signal, 8)
+	signal.Notify(sigs, unix.SIGINT, unix.SIGTERM)
+	cleaned_up := false
+	cleanup := func() {
+		if !cleaned_up {
+			_ = term.WriteAllString(restore_escape_codes)
+			term.RestoreAndClose()
+			signal.Reset()
+			cleaned_up = true
+		}
+	}
+	defer cleanup()
 	err = get_remote_command(&cd)
 	if err != nil {
 		return 1, err
@@ -670,8 +757,6 @@ func run_ssh(ssh_args, server_args, found_extra_args []string) (rc int, err erro
 	if err != nil {
 		return 1, err
 	}
-	sigs := make(chan os.Signal, 8)
-	signal.Notify(sigs, unix.SIGINT, unix.SIGTERM)
 
 	if !cd.request_data {
 		rq := fmt.Sprintf("id=%s:pwfile=%s:pw=%s", cd.replacements["REQUEST_ID"], cd.replacements["PASSWORD_FILENAME"], cd.replacements["DATA_PASSWORD"])
@@ -684,24 +769,24 @@ func run_ssh(ssh_args, server_args, found_extra_args []string) (rc int, err erro
 			}
 		}
 		if err != nil {
-			c.Process.Kill()
-			c.Wait()
+			_ = c.Process.Kill()
+			_ = c.Wait()
 			return 1, err
 		}
 	}
 	go func() {
-		_ = <-sigs
+		<-sigs
 		// ignore any interrupt and terminate signals as they will usually be sent to the ssh child process as well
 		// and we are waiting on that.
 	}()
 	err = c.Wait()
 	drain_potential_tty_garbage(term)
-	signal.Reset(unix.SIGINT, unix.SIGTERM)
 	if err != nil {
 		var exit_err *exec.ExitError
 		if errors.As(err, &exit_err) {
 			if state := exit_err.ProcessState.String(); state == "signal: interrupt" {
-				unix.Kill(os.Getpid(), unix.SIGINT)
+				cleanup()
+				_ = unix.Kill(os.Getpid(), unix.SIGINT)
 				// Give the signal time to be delivered
 				time.Sleep(20 * time.Millisecond)
 			}
@@ -735,10 +820,7 @@ func main(cmd *cli.Command, o *Options, args []string) (rc int, err error) {
 		return 1, err
 	}
 	if passthrough {
-		if len(found_extra_args) > 0 {
-			return 1, fmt.Errorf("The SSH kitten cannot work with the options: %s", strings.Join(maps.Keys(PassthroughArgs()), " "))
-		}
-		return 1, unix.Exec(SSHExe(), append([]string{"ssh"}, args...), os.Environ())
+		return 1, unix.Exec(SSHExe(), utils.Concat([]string{"ssh"}, ssh_args, server_args), os.Environ())
 	}
 	if os.Getenv("KITTY_WINDOW_ID") == "" || os.Getenv("KITTY_PID") == "" {
 		return 1, fmt.Errorf("The SSH kitten is meant to run inside a kitty window")
@@ -756,7 +838,7 @@ func EntryPoint(parent *cli.Command) {
 func specialize_command(ssh *cli.Command) {
 	ssh.Usage = "arguments for the ssh command"
 	ssh.ShortDescription = "Truly convenient SSH"
-	ssh.HelpText = "The ssh kitten is a thin wrapper around the ssh command. It automatically enables shell integration on the remote host, re-uses existing connections to reduce latency, makes the kitty terminfo database available, etc. It's invocation is identical to the ssh command. For details on its usage, see :doc:`/kittens/ssh`."
+	ssh.HelpText = "The ssh kitten is a thin wrapper around the ssh command. It automatically enables shell integration on the remote host, re-uses existing connections to reduce latency, makes the kitty terminfo database available, etc. Its invocation is identical to the ssh command. For details on its usage, see :doc:`/kittens/ssh`."
 	ssh.IgnoreAllArgs = true
 	ssh.OnlyArgsAllowed = true
 	ssh.ArgCompleter = cli.CompletionForWrapper("ssh")

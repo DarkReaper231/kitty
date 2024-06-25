@@ -11,9 +11,15 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 
 	"kitty/tools/utils"
+
+	"github.com/shirou/gopsutil/v3/process"
+	"golang.org/x/sys/unix"
 )
 
 var _ = fmt.Print
@@ -49,6 +55,10 @@ func (self *ConfigParser) BadLines() []ConfigLine {
 	return self.bad_lines
 }
 
+var key_pat = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9_-]*)\s+(.+)$`)
+})
+
 func (self *ConfigParser) parse(scanner Scanner, name, base_path_for_includes string, depth int) error {
 	if self.seen_includes[name] { // avoid include loops
 		return nil
@@ -63,7 +73,6 @@ func (self *ConfigParser) parse(scanner Scanner, name, base_path_for_includes st
 		return self.parse(escanner, nname, base_path_for_includes, depth+1)
 	}
 
-	lnum := 0
 	make_absolute := func(path string) (string, error) {
 		if path == "" {
 			return "", fmt.Errorf("Empty include paths not allowed")
@@ -73,12 +82,44 @@ func (self *ConfigParser) parse(scanner Scanner, name, base_path_for_includes st
 		}
 		return path, nil
 	}
-	for scanner.Scan() {
-		line := strings.TrimLeft(scanner.Text(), " ")
-		lnum++
-		if line == "" {
-			continue
+
+	lnum := 0
+	next_line_num := 0
+	next_line := ""
+	var line string
+
+	for {
+		if next_line != "" {
+			line = next_line
+		} else {
+			if scanner.Scan() {
+				line = strings.TrimLeft(scanner.Text(), " \t")
+				next_line_num++
+			} else {
+				break
+			}
+			if line == "" {
+				continue
+			}
 		}
+		lnum = next_line_num
+		if scanner.Scan() {
+			next_line = strings.TrimLeft(scanner.Text(), " \t")
+			next_line_num++
+
+			for strings.HasPrefix(next_line, `\`) {
+				line += next_line[1:]
+				if scanner.Scan() {
+					next_line = strings.TrimLeft(scanner.Text(), " \t")
+					next_line_num++
+				} else {
+					next_line = ""
+				}
+			}
+		} else {
+			next_line = ""
+		}
+
 		if line[0] == '#' {
 			if self.CommentsHandler != nil {
 				err := self.CommentsHandler(line)
@@ -88,8 +129,19 @@ func (self *ConfigParser) parse(scanner Scanner, name, base_path_for_includes st
 			}
 			continue
 		}
-		key, val, _ := strings.Cut(line, " ")
-		val = strings.TrimSpace(val)
+		m := key_pat().FindStringSubmatch(line)
+		if len(m) < 3 {
+			self.bad_lines = append(self.bad_lines, ConfigLine{Src_file: name, Line: line, Line_number: lnum, Err: fmt.Errorf("Invalid config line: %#v", line)})
+			continue
+		}
+		key, val := m[1], m[2]
+		for i, ch := range line {
+			if ch == ' ' || ch == '\t' {
+				key = line[:i]
+				val = strings.TrimSpace(line[i+1:])
+				break
+			}
+		}
 		switch key {
 		default:
 			err := self.LineHandler(key, val)
@@ -225,4 +277,95 @@ func (self *ConfigParser) ParseOverrides(overrides ...string) error {
 	}, overrides)}
 	self.seen_includes = make(map[string]bool)
 	return self.parse(&s, "<overrides>", utils.ConfigDir(), 0)
+}
+
+func is_kitty_gui_cmdline(cmd ...string) bool {
+	if len(cmd) == 0 {
+		return false
+	}
+	if filepath.Base(cmd[0]) != "kitty" {
+		return false
+	}
+	if len(cmd) == 1 {
+		return true
+	}
+	s := cmd[1][:1]
+	switch s {
+	case `@`:
+		return false
+	case `+`:
+		if cmd[1] == `+` {
+			return len(cmd) > 2 && cmd[2] == `open`
+		}
+		return cmd[1] == `+open`
+	}
+	return true
+}
+
+type Patcher struct {
+	Write_backup bool
+	Mode         fs.FileMode
+}
+
+func (self Patcher) Patch(path, sentinel, content string, settings_to_comment_out ...string) (updated bool, err error) {
+	if self.Mode == 0 {
+		self.Mode = 0o644
+	}
+	backup_path := path
+	if q, err := filepath.EvalSymlinks(path); err == nil {
+		path = q
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false, err
+	}
+	if raw == nil {
+		raw = []byte{}
+	}
+	pat := utils.MustCompile(fmt.Sprintf(`(?m)^\s*(%s)\b`, strings.Join(settings_to_comment_out, "|")))
+	text := pat.ReplaceAllString(utils.UnsafeBytesToString(raw), `# $1`)
+
+	pat = utils.MustCompile(fmt.Sprintf(`(?ms)^# BEGIN_%s.+?# END_%s`, sentinel, sentinel))
+	replaced := false
+	addition := fmt.Sprintf("# BEGIN_%s\n%s\n# END_%s", sentinel, content, sentinel)
+	ntext := pat.ReplaceAllStringFunc(text, func(string) string {
+		replaced = true
+		return addition
+	})
+	if !replaced {
+		if text != "" {
+			text += "\n\n"
+		}
+		ntext = text + addition
+	}
+	nraw := utils.UnsafeStringToBytes(ntext)
+	if !bytes.Equal(raw, nraw) {
+		if len(raw) > 0 && self.Write_backup {
+			_ = os.WriteFile(backup_path+".bak", raw, self.Mode)
+		}
+
+		return true, utils.AtomicUpdateFile(path, nraw, self.Mode)
+	}
+	return false, nil
+}
+
+func ReloadConfigInKitty(in_parent_only bool) error {
+	if in_parent_only {
+		if pid, err := strconv.Atoi(os.Getenv("KITTY_PID")); err == nil {
+			if p, err := process.NewProcess(int32(pid)); err == nil {
+				if c, err := p.CmdlineSlice(); err == nil && is_kitty_gui_cmdline(c...) {
+					return p.SendSignal(unix.SIGUSR1)
+				}
+			}
+		}
+		return nil
+	}
+	if all, err := process.Processes(); err == nil {
+		for _, p := range all {
+			if c, err := p.CmdlineSlice(); err == nil && is_kitty_gui_cmdline(c...) {
+				_ = p.SendSignal(unix.SIGUSR1)
+			}
+		}
+	}
+	return nil
 }

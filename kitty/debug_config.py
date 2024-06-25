@@ -10,17 +10,18 @@ import time
 from contextlib import suppress
 from functools import partial
 from pprint import pformat
-from typing import IO, Callable, Dict, Iterator, Optional, Set, TypeVar
+from typing import IO, Callable, Dict, Iterator, Optional, Sequence, Set, TypeVar
 
 from kittens.tui.operations import colored, styled
 
+from .child import cmdline_of_pid
 from .cli import version
 from .constants import extensions_dir, is_macos, is_wayland, kitty_base_dir, kitty_exe, shell_path
-from .fast_data_types import Color, num_users
+from .fast_data_types import Color, SingleKey, current_fonts, num_users, opengl_version_string, wayland_compositor_data
 from .options.types import Options as KittyOpts
 from .options.types import defaults
-from .options.utils import SequenceMap
-from .rgb import color_as_sharp
+from .options.utils import KeyboardMode, KeyDefinition
+from .rgb import color_as_sharp, color_from_int
 from .types import MouseEvent, Shortcut, mod_to_names
 
 AnyEvent = TypeVar('AnyEvent', MouseEvent, Shortcut)
@@ -51,24 +52,21 @@ def print_mapping_changes(defns: Dict[str, str], changes: Set[str], text: str, p
             print_event(k, defns[k], print)
 
 
-def compare_maps(final: Dict[AnyEvent, str], final_kitty_mod: int, initial: Dict[AnyEvent, str], initial_kitty_mod: int, print: Print) -> None:
+def compare_maps(
+    final: Dict[AnyEvent, str], final_kitty_mod: int, initial: Dict[AnyEvent, str], initial_kitty_mod: int, print: Print, mode_name: str = ''
+) -> None:
     ei = {k.human_repr(initial_kitty_mod): v for k, v in initial.items()}
     ef = {k.human_repr(final_kitty_mod): v for k, v in final.items()}
     added = set(ef) - set(ei)
     removed = set(ei) - set(ef)
     changed = {k for k in set(ef) & set(ei) if ef[k] != ei[k]}
-    which = 'shortcuts' if isinstance(next(iter(initial)), Shortcut) else 'mouse actions'
+    which = 'shortcuts' if isinstance(next(iter(initial or final)), Shortcut) else 'mouse actions'
+    if mode_name and (added or removed or changed):
+        print(f'{title("Changes in keyboard mode: " + mode_name)}')
     print_mapping_changes(ef, added, f'Added {which}:', print)
     print_mapping_changes(ei, removed, f'Removed {which}:', print)
     print_mapping_changes(ef, changed, f'Changed {which}:', print)
 
-
-def flatten_sequence_map(m: SequenceMap) -> ShortcutMap:
-    ans = {}
-    for key_spec, rest_map in m.items():
-        for r, action in rest_map.items():
-            ans[Shortcut((key_spec,) + (r))] = action
-    return ans
 
 
 def compare_opts(opts: KittyOpts, print: Print) -> None:
@@ -103,17 +101,46 @@ def compare_opts(opts: KittyOpts, print: Print) -> None:
             else:
                 if f == 'kitty_mod':
                     print(fmt.format(f), '+'.join(mod_to_names(getattr(opts, f))))
+                elif f in ('wayland_titlebar_color', 'macos_titlebar_color'):
+                    if val == 0:
+                        cval = 'system'
+                    elif val == 1:
+                        cval = 'background'
+                    else:
+                        col = color_from_int(val >> 8)
+                        cval = color_as_sharp(col) + ' ' + styled('  ', bg=col)
+                    colors.append(fmt.format(f) + ' ' + cval)
                 else:
                     print(fmt.format(f), str(getattr(opts, f)))
 
     compare_maps(opts.mousemap, opts.kitty_mod, default_opts.mousemap, default_opts.kitty_mod, print)
-    final_, initial_ = opts.keymap, default_opts.keymap
-    final: ShortcutMap = {Shortcut((k,)): v for k, v in final_.items()}
-    initial: ShortcutMap = {Shortcut((k,)): v for k, v in initial_.items()}
-    final_s, initial_s = map(flatten_sequence_map, (opts.sequence_map, default_opts.sequence_map))
-    final.update(final_s)
-    initial.update(initial_s)
-    compare_maps(final, opts.kitty_mod, initial, default_opts.kitty_mod, print)
+    def as_sc(k: SingleKey, v: KeyDefinition) -> Shortcut:
+        if v.is_sequence:
+            return Shortcut((v.trigger,) + v.rest)
+        return Shortcut((k,))
+
+    def as_str(defns: Sequence[KeyDefinition]) -> str:
+        seen = set()
+        uniq = []
+        for d in reversed(defns):
+            key = d.unique_identity_within_keymap
+            if key not in seen:
+                seen.add(key)
+                uniq.append(d)
+        return ', '.join(d.human_repr() for d in uniq)
+
+    for kmn, initial_ in default_opts.keyboard_modes.items():
+        initial = {as_sc(k, v[0]): as_str(v) for k, v in initial_.keymap.items()}
+        final_ = opts.keyboard_modes.get(kmn, KeyboardMode(kmn))
+        final = {as_sc(k, v[0]): as_str(v) for k, v in final_.keymap.items()}
+        compare_maps(final, opts.kitty_mod, initial, default_opts.kitty_mod, print, mode_name=kmn)
+    new_keyboard_modes = set(opts.keyboard_modes) - set(default_opts.keyboard_modes)
+    for kmn in new_keyboard_modes:
+        initial_ = KeyboardMode(kmn)
+        initial = {as_sc(k, v[0]): as_str(v) for k, v in initial_.keymap.items()}
+        final_ = opts.keyboard_modes[kmn]
+        final = {as_sc(k, v[0]): as_str(v) for k, v in final_.keymap.items()}
+        compare_maps(final, opts.kitty_mod, initial, default_opts.kitty_mod, print, mode_name=kmn)
     if colors:
         print(f'{title("Colors")}:', end='\n\t')
         print('\n\t'.join(sorted(colors)))
@@ -176,6 +203,31 @@ def format_tty_name(raw: str) -> str:
     return re.sub(r'^/dev/([^/]+)/([^/]+)$', r'\1\2', raw)
 
 
+def compositor_name() -> str:
+    ans = 'X11'
+    if is_wayland():
+        ans = 'Wayland'
+        with suppress(Exception):
+            pid, missing_capabilities = wayland_compositor_data()
+            if pid > -1:
+                cmdline = cmdline_of_pid(pid)
+                exe = cmdline[0]
+                with suppress(Exception):
+                    import subprocess
+                    if exe.lower() == 'hyprland':
+                        raw = subprocess.check_output(['hyprctl', 'version']).decode().strip()
+                        m = re.search(r'^Tag:\s*(\S+)', raw, flags=re.M)
+                        if m is not None:
+                            exe = f'{exe} {m.group(1)}'
+                        else:
+                            exe = raw.splitlines()[0]
+                    exe = subprocess.check_output([exe, '--version']).decode().strip().splitlines()[0]
+                ans += f' ({exe})'
+            if missing_capabilities:
+                ans += f' missing: {missing_capabilities}'
+    return ans
+
+
 def debug_config(opts: KittyOpts) -> str:
     from io import StringIO
     out = StringIO()
@@ -202,8 +254,13 @@ def debug_config(opts: KittyOpts) -> str:
         with open('/etc/lsb-release', encoding='utf-8', errors='replace') as f:
             p(f.read().strip())
     if not is_macos:
-        p('Running under:', green('Wayland' if is_wayland() else 'X11'))
+        p('Running under:', green(compositor_name()))
+    p(green('OpenGL:'), opengl_version_string())
     p(green('Frozen:'), 'True' if getattr(sys, 'frozen', False) else 'False')
+    p(green('Fonts:'))
+    for k, font in current_fonts().items():
+        if hasattr(font, 'identify_for_debug'):
+            p(yellow(f'  {k}:'), font.identify_for_debug())
     p(green('Paths:'))
     p(yellow('  kitty:'), os.path.realpath(kitty_exe()))
     p(yellow('  base dir:'), kitty_base_dir)

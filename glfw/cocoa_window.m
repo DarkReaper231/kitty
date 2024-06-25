@@ -26,8 +26,9 @@
 // It is fine to use C99 in this file because it will not be built with VS
 //========================================================================
 
-#include "internal.h"
 #include "../kitty/monotonic.h"
+#include "glfw3.h"
+#include "internal.h"
 
 #include <Availability.h>
 #import <CoreServices/CoreServices.h>
@@ -35,6 +36,7 @@
 #include <float.h>
 #include <string.h>
 
+#define debug debug_rendering
 
 static const char*
 polymorphic_string_as_utf8(id string) {
@@ -291,17 +293,14 @@ vk_to_unicode_key_with_current_layout(uint16_t keycode)
 static NSUInteger getStyleMask(_GLFWwindow* window)
 {
     NSUInteger styleMask = NSWindowStyleMaskMiniaturizable;
+    if (window->ns.titlebar_hidden) styleMask |= NSWindowStyleMaskFullSizeContentView;
 
-    if (window->monitor || !window->decorated)
+    if (window->monitor || !window->decorated) {
         styleMask |= NSWindowStyleMaskBorderless;
-    else
-    {
-        styleMask |= NSWindowStyleMaskTitled |
-                     NSWindowStyleMaskClosable;
-
-        if (window->resizable)
-            styleMask |= NSWindowStyleMaskResizable;
+    } else {
+        styleMask |= NSWindowStyleMaskTitled | NSWindowStyleMaskClosable;
     }
+    if (window->resizable) styleMask |= NSWindowStyleMaskResizable;
 
     return styleMask;
 }
@@ -355,7 +354,7 @@ requestRenderFrame(_GLFWwindow *w, GLFWcocoarenderframefun callback) {
             if (!dl->first_unserviced_render_frame_request_at) dl->first_unserviced_render_frame_request_at = now;
             if (!CVDisplayLinkIsRunning(dl->displayLink)) CVDisplayLinkStart(dl->displayLink);
             else if (now - dl->first_unserviced_render_frame_request_at > s_to_monotonic_t(1ll)) {
-                // display link is stuck need to recreate it because Apple cant even
+                // display link is stuck need to recreate it because Apple can't even
                 // get a simple timer right
                 CVDisplayLinkRelease(dl->displayLink); dl->displayLink = nil;
                 dl->first_unserviced_render_frame_request_at = now;
@@ -641,6 +640,7 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
         window->ns.height = (int)contentRect.size.height;
         _glfwInputWindowSize(window, (int)contentRect.size.width, (int)contentRect.size.height);
     }
+    if (window->ns.resizeCallback) window->ns.resizeCallback((GLFWwindow*)window);
 }
 
 - (void)windowDidMove:(NSNotification *)notification
@@ -1012,13 +1012,11 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
 
 - (void)viewDidChangeEffectiveAppearance
 {
-    static int appearance = 0;
-    if (_glfw.callbacks.system_color_theme_change) {
-        int new_appearance = glfwGetCurrentSystemColorTheme();
-        if (new_appearance != appearance) {
-            appearance = new_appearance;
-            _glfw.callbacks.system_color_theme_change(appearance);
-        }
+    static GLFWColorScheme appearance = GLFW_COLOR_SCHEME_NO_PREFERENCE;
+    GLFWColorScheme new_appearance = glfwGetCurrentSystemColorTheme();
+    if (new_appearance != appearance) {
+        appearance = new_appearance;
+        _glfwInputColorScheme(appearance);
     }
 }
 
@@ -1257,6 +1255,15 @@ is_ascii_control_char(char x) {
     }
 }
 
+static bool
+is_modifier_pressed(NSUInteger flags, NSUInteger target_mask, NSUInteger other_mask, NSUInteger either_mask) {
+    bool target_pressed = (flags & target_mask) != 0;
+    bool other_pressed = (flags & other_mask) != 0;
+    bool either_pressed = (flags & either_mask) != 0;
+    if (either_pressed != (target_pressed || other_pressed)) return either_pressed;
+    return target_pressed;
+}
+
 - (void)flagsChanged:(NSEvent *)event
 {
     int action = GLFW_RELEASE;
@@ -1269,29 +1276,24 @@ is_ascii_control_char(char x) {
     const bool process_text = !_glfw.ignoreOSKeyboardProcessing && (!window->ns.textInputFilterCallback || window->ns.textInputFilterCallback(key, mods, keycode, modifierFlags) != 1);
     const char *mod_name = "unknown";
 
+    // Code for handling modifier key events copied form SDL_cocoakeyboard.m, with thanks. See IsModifierKeyPressedFunction()
+#define action_for(modname, target_mask, other_mask, either_mask) action = is_modifier_pressed([event modifierFlags], target_mask, other_mask, either_mask) ? GLFW_PRESS : GLFW_RELEASE; mod_name = #modname; break;
     switch(key) {
         case GLFW_FKEY_CAPS_LOCK:
             mod_name = "capslock";
             action = modifierFlags & NSEventModifierFlagCapsLock ? GLFW_PRESS : GLFW_RELEASE; break;
-        case GLFW_FKEY_LEFT_SUPER:
-        case GLFW_FKEY_RIGHT_SUPER:
-            mod_name = "super";
-            action = modifierFlags & NSEventModifierFlagCommand ? GLFW_PRESS : GLFW_RELEASE; break;
-        case GLFW_FKEY_LEFT_CONTROL:
-        case GLFW_FKEY_RIGHT_CONTROL:
-            mod_name = "ctrl";
-            action = modifierFlags & NSEventModifierFlagControl ? GLFW_PRESS : GLFW_RELEASE; break;
-        case GLFW_FKEY_LEFT_ALT:
-        case GLFW_FKEY_RIGHT_ALT:
-            mod_name = "alt";
-            action = modifierFlags & NSEventModifierFlagOption ? GLFW_PRESS : GLFW_RELEASE; break;
-        case GLFW_FKEY_LEFT_SHIFT:
-        case GLFW_FKEY_RIGHT_SHIFT:
-            mod_name = "shift";
-            action = modifierFlags & NSEventModifierFlagShift ? GLFW_PRESS : GLFW_RELEASE; break;
+        case GLFW_FKEY_LEFT_SUPER: action_for(super, NX_DEVICELCMDKEYMASK, NX_DEVICERCMDKEYMASK, NX_COMMANDMASK);
+        case GLFW_FKEY_RIGHT_SUPER: action_for(super, NX_DEVICERCMDKEYMASK, NX_DEVICELCMDKEYMASK, NX_COMMANDMASK);
+        case GLFW_FKEY_LEFT_CONTROL: action_for(ctrl, NX_DEVICELCTLKEYMASK, NX_DEVICERCTLKEYMASK, NX_CONTROLMASK);
+        case GLFW_FKEY_RIGHT_CONTROL: action_for(ctrl, NX_DEVICERCTLKEYMASK, NX_DEVICELCTLKEYMASK, NX_CONTROLMASK);
+        case GLFW_FKEY_LEFT_ALT: action_for(alt, NX_DEVICELALTKEYMASK, NX_DEVICERALTKEYMASK, NX_ALTERNATEMASK);
+        case GLFW_FKEY_RIGHT_ALT: action_for(alt, NX_DEVICERALTKEYMASK, NX_DEVICELALTKEYMASK, NX_ALTERNATEMASK);
+        case GLFW_FKEY_LEFT_SHIFT: action_for(shift, NX_DEVICELSHIFTKEYMASK, NX_DEVICERSHIFTKEYMASK, NX_SHIFTMASK);
+        case GLFW_FKEY_RIGHT_SHIFT: action_for(shift, NX_DEVICERSHIFTKEYMASK, NX_DEVICELSHIFTKEYMASK, NX_SHIFTMASK);
         default:
             return;
     }
+#undef action_for
     GLFWkeyevent glfw_keyevent = {.key = key, .native_key = keycode, .native_key_id = keycode, .action = action, .mods = mods};
     debug_key("\x1b[33mflagsChanged:\x1b[m modifier: %s native_key: 0x%x (%s) glfw_key: 0x%x %s\n",
             mod_name, keycode, safe_name_for_keycode(keycode), key, format_mods(mods));
@@ -1508,7 +1510,7 @@ void _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
     (void)range; (void)actualRange;
     if (_glfw.callbacks.get_ime_cursor_position) {
         GLFWIMEUpdateEvent ev = { .type = GLFW_IME_UPDATE_CURSOR_POSITION };
-        if (_glfw.callbacks.get_ime_cursor_position((GLFWwindow*)window, &ev)) {
+        if (window && _glfw.callbacks.get_ime_cursor_position((GLFWwindow*)window, &ev)) {
             const CGFloat left = (CGFloat)ev.cursor.left / window->ns.xscale;
             const CGFloat top = (CGFloat)ev.cursor.top / window->ns.yscale;
             const CGFloat cellWidth = (CGFloat)ev.cursor.width / window->ns.xscale;
@@ -1539,16 +1541,20 @@ void _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
         }
     }
     // insertText can be called multiple times for a single key event
-    char *s = _glfw.ns.text + strnlen(_glfw.ns.text, sizeof(_glfw.ns.text));
-    snprintf(s, sizeof(_glfw.ns.text) - (s - _glfw.ns.text), "%s", utf8);
-    _glfw.ns.text[sizeof(_glfw.ns.text) - 1] = 0;
-    if ((!in_key_handler || in_key_handler == 2) && _glfw.ns.text[0]) {
-        if (!is_ascii_control_char(_glfw.ns.text[0])) {
-            debug_key("Sending text to kitty from insertText called from %s: %s\n", in_key_handler ? "flagsChanged" : "event loop", _glfw.ns.text);
-            GLFWkeyevent glfw_keyevent = {.text=_glfw.ns.text, .ime_state=GLFW_IME_COMMIT_TEXT};
-            _glfwInputKeyboard(window, &glfw_keyevent);
+    size_t existing_length = strnlen(_glfw.ns.text, sizeof(_glfw.ns.text));
+    size_t required_length = strlen(utf8) + 1;
+    size_t available_length = sizeof(_glfw.ns.text) - existing_length;
+    if (available_length >= required_length) {
+        memcpy(_glfw.ns.text + existing_length, utf8, required_length); // copies the null terminator from utf8 as well
+        _glfw.ns.text[sizeof(_glfw.ns.text) - 1] = 0;
+        if ((!in_key_handler || in_key_handler == 2) && _glfw.ns.text[0]) {
+            if (!is_ascii_control_char(_glfw.ns.text[0])) {
+                debug_key("Sending text to kitty from insertText called from %s: %s\n", in_key_handler ? "flagsChanged" : "event loop", _glfw.ns.text);
+                GLFWkeyevent glfw_keyevent = {.text=_glfw.ns.text, .ime_state=GLFW_IME_COMMIT_TEXT};
+                _glfwInputKeyboard(window, &glfw_keyevent);
+            }
+            _glfw.ns.text[0] = 0;
         }
-        _glfw.ns.text[0] = 0;
     }
 }
 
@@ -1714,6 +1720,24 @@ void _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
     return YES;
 }
 
+static void
+update_titlebar_button_visibility_after_fullscreen_transition(_GLFWwindow* w, bool traditional, bool made_fullscreen) {
+    // Update window button visibility
+    if (w->ns.titlebar_hidden) {
+        NSWindow *window = w->ns.object;
+        // The hidden buttons might be automatically reset to be visible after going full screen
+        // to show up in the auto-hide title bar, so they need to be set back to hidden.
+        BOOL button_hidden = YES;
+        // When title bar is configured to be hidden, it should be shown with buttons (auto-hide) after going to full screen.
+        if (!traditional) {
+            button_hidden = (BOOL) !made_fullscreen;
+        }
+        [[window standardWindowButton: NSWindowCloseButton] setHidden:button_hidden];
+        [[window standardWindowButton: NSWindowMiniaturizeButton] setHidden:button_hidden];
+        [[window standardWindowButton: NSWindowZoomButton] setHidden:button_hidden];
+    }
+}
+
 - (void)toggleFullScreen:(nullable id)sender
 {
     if (glfw_window) {
@@ -1721,6 +1745,8 @@ void _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
         if (glfw_window->ns.toggleFullscreenCallback && glfw_window->ns.toggleFullscreenCallback((GLFWwindow*)glfw_window) == 1) return;
         glfw_window->ns.in_fullscreen_transition = true;
     }
+    NSWindowStyleMask sm = [self styleMask];
+    bool is_fullscreen_already = (sm & NSWindowStyleMaskFullScreen) != 0;
     // When resizeIncrements is set, Cocoa cannot restore the original window size after returning from fullscreen.
     const NSSize original = [self resizeIncrements];
     [self setResizeIncrements:NSMakeSize(1.0, 1.0)];
@@ -1729,6 +1755,7 @@ void _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
     // When the window decoration is hidden, toggling fullscreen causes the style mask to be changed,
     // and causes the first responder to be cleared.
     if (glfw_window && !glfw_window->decorated && glfw_window->ns.view) [self makeFirstResponder:glfw_window->ns.view];
+    update_titlebar_button_visibility_after_fullscreen_transition(glfw_window, false, !is_fullscreen_already);
 }
 
 - (void)zoom:(id)sender
@@ -1794,9 +1821,15 @@ static bool createNativeWindow(_GLFWwindow* window,
     else
     {
         [(NSWindow*) window->ns.object center];
-        _glfw.ns.cascadePoint =
-            NSPointToCGPoint([window->ns.object cascadeTopLeftFromPoint:
-                              NSPointFromCGPoint(_glfw.ns.cascadePoint)]);
+        CGRect screen_frame = [[(NSWindow*) window->ns.object screen] frame];
+        if (CGRectContainsPoint(screen_frame, _glfw.ns.cascadePoint)
+            || CGPointEqualToPoint(CGPointZero, _glfw.ns.cascadePoint)) {
+            _glfw.ns.cascadePoint =
+                NSPointToCGPoint([window->ns.object cascadeTopLeftFromPoint:
+                                  NSPointFromCGPoint(_glfw.ns.cascadePoint)]);
+        } else {
+            _glfw.ns.cascadePoint = CGPointZero;
+        }
 
         if (wndconfig->resizable)
         {
@@ -1835,6 +1868,7 @@ static bool createNativeWindow(_GLFWwindow* window,
 
     _glfwPlatformGetWindowSize(window, &window->ns.width, &window->ns.height);
     _glfwPlatformGetFramebufferSize(window, &window->ns.fbWidth, &window->ns.fbHeight);
+    if (wndconfig->blur_radius > 0) _glfwPlatformSetWindowBlur(window, wndconfig->blur_radius);
 
     return true;
 }
@@ -1931,9 +1965,11 @@ void _glfwPlatformDestroyWindow(_GLFWwindow* window)
     window->ns.object = nil;
 }
 
-void _glfwPlatformSetWindowTitle(_GLFWwindow* window UNUSED, const char* title)
+void _glfwPlatformSetWindowTitle(_GLFWwindow* window, const char* title)
 {
+    if (!title) return;
     NSString* string = @(title);
+    if (!string) return;  // the runtime failed to convert title to an NSString
     [window->ns.object setTitle:string];
     // HACK: Set the miniwindow title explicitly as setTitle: doesn't update it
     //       if the window lacks NSWindowStyleMaskTitled
@@ -2258,6 +2294,7 @@ int _glfwPlatformFramebufferTransparent(_GLFWwindow* window)
 void _glfwPlatformSetWindowResizable(_GLFWwindow* window, bool enabled UNUSED)
 {
     [window->ns.object setStyleMask:getStyleMask(window)];
+    [window->ns.object makeFirstResponder:window->ns.view];
 }
 
 void _glfwPlatformSetWindowDecorated(_GLFWwindow* window, bool enabled UNUSED)
@@ -2502,27 +2539,83 @@ int _glfwPlatformCreateCursor(_GLFWcursor* cursor,
     return true;
 }
 
-int _glfwPlatformCreateStandardCursor(_GLFWcursor* cursor, GLFWCursorShape shape)
-{
+static NSCursor*
+load_hidden_system_cursor(NSString *name, SEL fallback) {
+    // this implementation comes from SDL_cocoamouse.m
+    NSString *cursorPath = [@"/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/Resources/cursors" stringByAppendingPathComponent:name];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[cursorPath stringByAppendingPathComponent:@"info.plist"]];
+    /* we can't do animation atm.  :/ */
+    const int frames = (int)[[info valueForKey:@"frames"] integerValue];
+    NSCursor *cursor;
+    NSImage *image = [[NSImage alloc] initWithContentsOfFile:[cursorPath stringByAppendingPathComponent:@"cursor.pdf"]];
+    if ((image == nil) || (image.isValid == NO)) {
+        return [NSCursor performSelector:fallback];
+    }
+
+    if (frames > 1) {
+        const NSCompositingOperation operation = NSCompositingOperationCopy;
+        const NSSize cropped_size = NSMakeSize(image.size.width, (int)(image.size.height / frames));
+        NSImage *cropped = [[NSImage alloc] initWithSize:cropped_size];
+        if (cropped == nil) {
+            return [NSCursor performSelector:fallback];
+        }
+
+        [cropped lockFocus];
+        {
+            const NSRect cropped_rect = NSMakeRect(0, 0, cropped_size.width, cropped_size.height);
+            [image drawInRect:cropped_rect fromRect:cropped_rect operation:operation fraction:1];
+        }
+        [cropped unlockFocus];
+        image = cropped;
+    }
+
+    cursor = [[NSCursor alloc] initWithImage:image hotSpot:NSMakePoint([[info valueForKey:@"hotx"] doubleValue], [[info valueForKey:@"hoty"] doubleValue])];
+    return cursor;
+}
+
+int _glfwPlatformCreateStandardCursor(_GLFWcursor* cursor, GLFWCursorShape shape) {
 #define C(name, val) case name: cursor->ns.object = [NSCursor val]; break;
-#define U(name, val) case name: cursor->ns.object = [[NSCursor class] performSelector:@selector(val)]; break;
+#define U(name, val) case name: cursor->ns.object = [NSCursor performSelector:@selector(val)]; break;
+#define S(name, val, fallback) case name: cursor->ns.object = load_hidden_system_cursor(@#val, @selector(val)); break;
     switch(shape) {
-        C(GLFW_ARROW_CURSOR, arrowCursor);
-        C(GLFW_IBEAM_CURSOR, IBeamCursor);
+        /* start glfw to cocoa (auto generated by gen-key-constants.py do not edit) */
+        C(GLFW_DEFAULT_CURSOR, arrowCursor);
+        C(GLFW_TEXT_CURSOR, IBeamCursor);
+        C(GLFW_POINTER_CURSOR, pointingHandCursor);
+        S(GLFW_HELP_CURSOR, help, arrowCursor);
+        S(GLFW_WAIT_CURSOR, busybutclickable, arrowCursor);
+        S(GLFW_PROGRESS_CURSOR, busybutclickable, arrowCursor);
         C(GLFW_CROSSHAIR_CURSOR, crosshairCursor);
-        C(GLFW_HAND_CURSOR, pointingHandCursor);
-        C(GLFW_HRESIZE_CURSOR, resizeLeftRightCursor);
-        C(GLFW_VRESIZE_CURSOR, resizeUpDownCursor);
-        U(GLFW_NW_RESIZE_CURSOR, _windowResizeNorthWestSouthEastCursor);
-        U(GLFW_NE_RESIZE_CURSOR, _windowResizeNorthEastSouthWestCursor);
-        U(GLFW_SW_RESIZE_CURSOR, _windowResizeNorthEastSouthWestCursor);
-        U(GLFW_SE_RESIZE_CURSOR, _windowResizeNorthWestSouthEastCursor);
+        S(GLFW_CELL_CURSOR, cell, crosshairCursor);
+        C(GLFW_VERTICAL_TEXT_CURSOR, IBeamCursorForVerticalLayout);
+        S(GLFW_MOVE_CURSOR, move, openHandCursor);
+        C(GLFW_E_RESIZE_CURSOR, resizeRightCursor);
+        S(GLFW_NE_RESIZE_CURSOR, resizenortheast, _windowResizeNorthEastSouthWestCursor);
+        S(GLFW_NW_RESIZE_CURSOR, resizenorthwest, _windowResizeNorthWestSouthEastCursor);
+        C(GLFW_N_RESIZE_CURSOR, resizeUpCursor);
+        S(GLFW_SE_RESIZE_CURSOR, resizesoutheast, _windowResizeNorthWestSouthEastCursor);
+        S(GLFW_SW_RESIZE_CURSOR, resizesouthwest, _windowResizeNorthEastSouthWestCursor);
+        C(GLFW_S_RESIZE_CURSOR, resizeDownCursor);
+        C(GLFW_W_RESIZE_CURSOR, resizeLeftCursor);
+        C(GLFW_EW_RESIZE_CURSOR, resizeLeftRightCursor);
+        C(GLFW_NS_RESIZE_CURSOR, resizeUpDownCursor);
+        U(GLFW_NESW_RESIZE_CURSOR, _windowResizeNorthEastSouthWestCursor);
+        U(GLFW_NWSE_RESIZE_CURSOR, _windowResizeNorthWestSouthEastCursor);
+        S(GLFW_ZOOM_IN_CURSOR, zoomin, arrowCursor);
+        S(GLFW_ZOOM_OUT_CURSOR, zoomout, arrowCursor);
+        C(GLFW_ALIAS_CURSOR, dragLinkCursor);
+        C(GLFW_COPY_CURSOR, dragCopyCursor);
+        C(GLFW_NOT_ALLOWED_CURSOR, operationNotAllowedCursor);
+        C(GLFW_NO_DROP_CURSOR, operationNotAllowedCursor);
+        C(GLFW_GRAB_CURSOR, openHandCursor);
+        C(GLFW_GRABBING_CURSOR, closedHandCursor);
+/* end glfw to cocoa */
         case GLFW_INVALID_CURSOR:
             return false;
     }
 #undef C
 #undef U
-
+#undef S
     if (!cursor->ns.object)
     {
         _glfwInputError(GLFW_PLATFORM_ERROR,
@@ -2554,6 +2647,20 @@ bool _glfwPlatformIsFullscreen(_GLFWwindow* w, unsigned int flags) {
     return sm & NSWindowStyleMaskFullScreen;
 }
 
+static void
+make_window_fullscreen_after_show(unsigned long long timer_id, void* data) {
+    (void)timer_id;
+    unsigned long long window_id = (uintptr_t)data;
+    for (_GLFWwindow *w = _glfw.windowListHead;  w;  w = w->next) {
+        if (w->id == window_id) {
+            NSWindow *window = w->ns.object;
+            [window toggleFullScreen: nil];
+            update_titlebar_button_visibility_after_fullscreen_transition(w, false, true);
+            break;
+        }
+    }
+}
+
 bool _glfwPlatformToggleFullscreen(_GLFWwindow* w, unsigned int flags) {
     NSWindow *window = w->ns.object;
     bool made_fullscreen = true;
@@ -2561,7 +2668,7 @@ bool _glfwPlatformToggleFullscreen(_GLFWwindow* w, unsigned int flags) {
     NSWindowStyleMask sm = [window styleMask];
     if (traditional) {
         if (@available(macOS 10.15.7, *)) {
-            // As of Big Turd NSWindowStyleMaskFullScreen is no longer useable
+            // As of Big Turd NSWindowStyleMaskFullScreen is no longer usable
             // Also no longer compatible after a minor release of macOS 10.15.7
             if (!w->ns.in_traditional_fullscreen) {
                 w->ns.pre_full_screen_style_mask = sm;
@@ -2589,28 +2696,23 @@ bool _glfwPlatformToggleFullscreen(_GLFWwindow* w, unsigned int flags) {
         }
         // Changing the style mask causes the first responder to be cleared
         [window makeFirstResponder:w->ns.view];
-        // If the dock and menubar are hidden going from maximized to fullscreen doesnt change the window size
+        // If the dock and menubar are hidden going from maximized to fullscreen doesn't change the window size
         // and macOS forgets to trigger windowDidResize, so call it ourselves
         NSNotification *notification = [NSNotification notificationWithName:NSWindowDidResizeNotification object:window];
         [w->ns.delegate performSelector:@selector(windowDidResize:) withObject:notification afterDelay:0];
     } else {
         bool in_fullscreen = sm & NSWindowStyleMaskFullScreen;
+        if (!in_fullscreen && !_glfwPlatformWindowVisible(w)) {
+            // Bug in Apple's fullscreen implementation causes fullscreen to
+            // not work before window is shown (at creation) if another window
+            // is already fullscreen. Le sigh. https://github.com/kovidgoyal/kitty/issues/7448
+            _glfwPlatformAddTimer(0, false, make_window_fullscreen_after_show, (void*)(uintptr_t)(w->id), NULL);
+            return made_fullscreen;
+        }
         if (in_fullscreen) made_fullscreen = false;
         [window toggleFullScreen: nil];
     }
-    // Update window button visibility
-    if (w->ns.titlebar_hidden) {
-        // The hidden buttons might be automatically reset to be visible after going full screen
-        // to show up in the auto-hide title bar, so they need to be set back to hidden.
-        BOOL button_hidden = YES;
-        // When title bar is configured to be hidden, it should be shown with buttons (auto-hide) after going to full screen.
-        if (!traditional) {
-            button_hidden = (BOOL) !made_fullscreen;
-        }
-        [[window standardWindowButton: NSWindowCloseButton] setHidden:button_hidden];
-        [[window standardWindowButton: NSWindowMiniaturizeButton] setHidden:button_hidden];
-        [[window standardWindowButton: NSWindowZoomButton] setHidden:button_hidden];
-    }
+    update_titlebar_button_visibility_after_fullscreen_transition(w, traditional, made_fullscreen);
     return made_fullscreen;
 }
 
@@ -2907,6 +3009,18 @@ VkResult _glfwPlatformCreateWindowSurface(VkInstance instance,
 #endif
 }
 
+int
+_glfwPlatformSetWindowBlur(_GLFWwindow *window, int radius) {
+    int orig = window->ns.blur_radius;
+    if (radius > -1 && radius != window->ns.blur_radius) {
+        extern OSStatus CGSSetWindowBackgroundBlurRadius(void* connection, NSInteger windowNumber, int radius);
+        extern void* CGSDefaultConnectionForThread(void);
+        CGSSetWindowBackgroundBlurRadius(CGSDefaultConnectionForThread(), [window->ns.object windowNumber], radius);
+        window->ns.blur_radius = radius;
+    }
+    return orig;
+}
+
 
 //////////////////////////////////////////////////////////////////////////
 //////                        GLFW native API                       //////
@@ -2917,29 +3031,6 @@ GLFWAPI id glfwGetCocoaWindow(GLFWwindow* handle)
     _GLFWwindow* window = (_GLFWwindow*) handle;
     _GLFW_REQUIRE_INIT_OR_RETURN(nil);
     return window->ns.object;
-}
-
-GLFWAPI void glfwHideCocoaTitlebar(GLFWwindow* handle, bool yes) {
-    @autoreleasepool {
-    _GLFWwindow* w = (_GLFWwindow*) handle;
-    NSWindow *window = w->ns.object;
-    w->ns.titlebar_hidden = yes;
-    NSButton *button;
-    button = [window standardWindowButton: NSWindowCloseButton];
-    if (button) button.hidden = yes;
-    button = [window standardWindowButton: NSWindowMiniaturizeButton];
-    if (button) button.hidden = yes;
-    button = [window standardWindowButton: NSWindowZoomButton];
-    [window setTitlebarAppearsTransparent:yes];
-    if (button) button.hidden = yes;
-    if (yes) {
-        [window setTitleVisibility:NSWindowTitleHidden];
-        [window setStyleMask: [window styleMask] | NSWindowStyleMaskFullSizeContentView];
-    } else {
-        [window setTitleVisibility:NSWindowTitleVisible];
-        [window setStyleMask: [window styleMask] & ~NSWindowStyleMaskFullSizeContentView];
-    }
-    } // autoreleasepool
 }
 
 GLFWAPI GLFWcocoatextinputfilterfun glfwSetCocoaTextInputFilter(GLFWwindow *handle, GLFWcocoatextinputfilterfun callback) {
@@ -2969,7 +3060,117 @@ GLFWAPI void glfwCocoaRequestRenderFrame(GLFWwindow *w, GLFWcocoarenderframefun 
     requestRenderFrame((_GLFWwindow*)w, callback);
 }
 
-GLFWAPI int glfwGetCurrentSystemColorTheme(void) {
+GLFWAPI GLFWcocoarenderframefun glfwCocoaSetWindowResizeCallback(GLFWwindow *w, GLFWcocoarenderframefun cb) {
+    _GLFWwindow* window = (_GLFWwindow*)w;
+    GLFWcocoarenderframefun current = window->ns.resizeCallback;
+    window->ns.resizeCallback = cb;
+    return current;
+}
+
+GLFWAPI void glfwCocoaSetWindowChrome(GLFWwindow *w, unsigned int color, bool use_system_color, unsigned int system_color, int background_blur, unsigned int hide_window_decorations, bool show_text_in_titlebar, int color_space, float background_opacity, bool resizable) { @autoreleasepool {
+    _GLFWwindow* window = (_GLFWwindow*)w;
+    const bool is_transparent = ![window->ns.object isOpaque];
+    if (!is_transparent) { background_opacity = 1.0; background_blur = 0; }
+    NSColor *background = nil;
+    NSAppearance *appearance = nil;
+    bool titlebar_transparent = false;
+    const NSWindowStyleMask current_style_mask = [window->ns.object styleMask];
+    const bool in_fullscreen = ((current_style_mask & NSWindowStyleMaskFullScreen) != 0) || window->ns.in_traditional_fullscreen;
+    NSAppearance *light_appearance = is_transparent ? [NSAppearance appearanceNamed:NSAppearanceNameVibrantLight] : [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+    NSAppearance *dark_appearance = is_transparent ? [NSAppearance appearanceNamed:NSAppearanceNameVibrantDark] : [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    if (use_system_color || background_opacity < 1.0) {
+        if (is_transparent) {
+            // prevent blurring of shadows at window corners with desktop background by setting a low alpha background
+            background = background_blur > 0 ? [NSColor colorWithWhite: 0 alpha: 0.001f] : [NSColor clearColor];
+        } else background = [NSColor windowBackgroundColor];
+        switch (system_color) {
+            case 1:
+                appearance = light_appearance; break;
+            case 2:
+                appearance = dark_appearance; break;
+        }
+    } else {
+        // set a background color and make the title bar transparent so the background color is visible
+        double red = ((color >> 16) & 0xFF) / 255.0;
+        double green = ((color >> 8) & 0xFF) / 255.0;
+        double blue = (color & 0xFF) / 255.0;
+        double luma = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+        background = [NSColor colorWithSRGBRed:red green:green blue:blue alpha:1.f];
+        appearance = luma < 0.5 ? dark_appearance : light_appearance;
+        titlebar_transparent = true;
+    }
+    [window->ns.object setBackgroundColor:background];
+    [window->ns.object setAppearance:appearance];
+    _glfwPlatformSetWindowBlur(window, background_blur);
+    bool has_shadow = false;
+    const char *decorations_desc = "full";
+    window->ns.titlebar_hidden = false;
+    switch (hide_window_decorations) {
+        case 1:
+            decorations_desc = "none";
+            window->decorated = false;
+            break;
+        case 2:
+            decorations_desc = "no-titlebar";
+            window->decorated = true;
+            has_shadow = true;
+            titlebar_transparent = true;
+            window->ns.titlebar_hidden = true;
+            show_text_in_titlebar = false;
+            break;
+        case 4:
+            decorations_desc = "no-titlebar-and-no-corners";
+            window->decorated = false;
+            has_shadow = true;
+            break;
+        default:
+            window->decorated = true;
+            has_shadow = true;
+            break;
+    }
+    // shadow causes burn-in/ghosting because cocoa doesnt invalidate it on OS window resize/minimize/restore.
+    // https://github.com/kovidgoyal/kitty/issues/6439
+    if (is_transparent) has_shadow = false;
+    bool hide_titlebar_buttons = !in_fullscreen && window->ns.titlebar_hidden;
+    [window->ns.object setTitlebarAppearsTransparent:titlebar_transparent];
+    [window->ns.object setHasShadow:has_shadow];
+    [window->ns.object setTitleVisibility:(show_text_in_titlebar) ? NSWindowTitleVisible : NSWindowTitleHidden];
+    NSColorSpace *cs = nil;
+    switch (color_space) {
+        case SRGB_COLORSPACE: cs = [NSColorSpace sRGBColorSpace]; break;
+        case DISPLAY_P3_COLORSPACE: cs = [NSColorSpace displayP3ColorSpace]; break;
+        case DEFAULT_COLORSPACE: cs = nil; break;  // using deviceRGBColorSpace causes a hang when transitioning to fullscreen
+    }
+    window->resizable = resizable;
+    debug(
+        "Window Chrome state:\n\tbackground: %s\n\tappearance: %s color_space: %s\n\t"
+        "blur: %d has_shadow: %d resizable: %d decorations: %s (%d)\n\t"
+        "titlebar: transparent: %d title_visibility: %d hidden: %d buttons_hidden: %d"
+        "\n",
+        background ? [background.description UTF8String] : "<nil>",
+        appearance ? [appearance.name UTF8String] : "<nil>",
+        cs ? (cs.localizedName ? [cs.localizedName UTF8String] : [cs.description UTF8String]) : "<nil>",
+        background_blur, has_shadow, resizable, decorations_desc, window->decorated, titlebar_transparent,
+        show_text_in_titlebar, window->ns.titlebar_hidden, hide_titlebar_buttons
+    );
+    [window->ns.object setColorSpace:cs];
+    [[window->ns.object standardWindowButton: NSWindowCloseButton] setHidden:hide_titlebar_buttons];
+    [[window->ns.object standardWindowButton: NSWindowMiniaturizeButton] setHidden:hide_titlebar_buttons];
+    [[window->ns.object standardWindowButton: NSWindowZoomButton] setHidden:hide_titlebar_buttons];
+    // Apple throws a hissy fit if one attempts to clear the value of NSWindowStyleMaskFullScreen outside of a full screen transition
+    // event. See https://github.com/kovidgoyal/kitty/issues/7106
+    NSWindowStyleMask fsmask = current_style_mask & NSWindowStyleMaskFullScreen;
+    window->ns.pre_full_screen_style_mask = getStyleMask(window);
+    if (in_fullscreen && window->ns.in_traditional_fullscreen) {
+        [window->ns.object setStyleMask:NSWindowStyleMaskBorderless];
+    } else {
+        [window->ns.object setStyleMask:window->ns.pre_full_screen_style_mask | fsmask];
+    }
+    // HACK: Changing the style mask can cause the first responder to be cleared
+    [window->ns.object makeFirstResponder:window->ns.view];
+}}
+
+GLFWAPI GLFWColorScheme glfwGetCurrentSystemColorTheme(void) {
     int theme_type = 0;
     NSAppearance *changedAppearance = NSApp.effectiveAppearance;
     NSAppearanceName newAppearance = [changedAppearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];

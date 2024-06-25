@@ -9,6 +9,7 @@
 #include "state.h"
 #include "cleanup.h"
 #include "monotonic.h"
+#include <Availability.h>
 #include <Carbon/Carbon.h>
 #include <Cocoa/Cocoa.h>
 #ifndef KITTY_USE_DEPRECATED_MACOS_NOTIFICATION_API
@@ -212,6 +213,16 @@ find_app_name(void) {
 @end
 // }}}
 
+@interface UserMenuItem : NSMenuItem
+@property (nonatomic) size_t action_index;
+@end
+
+@implementation UserMenuItem {
+}
+@end
+
+
+
 @interface GlobalMenuTarget : NSObject
 + (GlobalMenuTarget *) shared_instance;
 @end
@@ -219,6 +230,13 @@ find_app_name(void) {
 #define PENDING(selector, which) - (void)selector:(id)sender { (void)sender; set_cocoa_pending_action(which, NULL); }
 
 @implementation GlobalMenuTarget
+
+- (void)user_menu_action:(id)sender {
+    UserMenuItem *m = sender;
+    if (m.action_index < OPT(global_menu).count && OPT(global_menu.entries)) {
+        set_cocoa_pending_action(USER_MENU_ACTION, OPT(global_menu).entries[m.action_index].definition);
+    }
+}
 
 PENDING(edit_config_file, PREFERENCES_WINDOW)
 PENDING(new_os_window, NEW_OS_WINDOW)
@@ -374,8 +392,8 @@ set_notification_activated_callback(PyObject *self UNUSED, PyObject *callback) {
 
 static PyObject*
 cocoa_send_notification(PyObject *self UNUSED, PyObject *args) {
-    char *identifier = NULL, *title = NULL, *informativeText = NULL, *subtitle = NULL;
-    if (!PyArg_ParseTuple(args, "zsz|z", &identifier, &title, &informativeText, &subtitle)) return NULL;
+    char *identifier = NULL, *title = NULL, *informativeText = NULL, *subtitle = NULL; int urgency = 1;
+    if (!PyArg_ParseTuple(args, "zsz|zi", &identifier, &title, &informativeText, &subtitle, &urgency)) return NULL;
     NSUserNotificationCenter *center = [NSUserNotificationCenter defaultUserNotificationCenter];
     if (!center) {PyErr_SetString(PyExc_RuntimeError, "Failed to get the user notification center"); return NULL; }
     if (!center.delegate) center.delegate = [[NotificationDelegate alloc] init];
@@ -421,10 +439,25 @@ cocoa_send_notification(PyObject *self UNUSED, PyObject *args) {
     }
 @end
 
+static UNUserNotificationCenter*
+get_notification_center_safely(void) {
+    NSBundle *b = [NSBundle mainBundle];
+    // when bundleIdentifier is nil currentNotificationCenter crashes instead
+    // of returning nil. Apple...purveyor of shiny TOYS
+    if (!b || !b.bundleIdentifier) return nil;
+    UNUserNotificationCenter *center = nil;
+    @try {
+        center = [UNUserNotificationCenter currentNotificationCenter];
+    } @catch (NSException *e) {
+        log_error("Failed to get current UNUserNotificationCenter object with error: %s (%s)",
+                            [[e name] UTF8String], [[e reason] UTF8String]);
+    }
+    return center;
+}
 
 static void
-schedule_notification(const char *identifier, const char *title, const char *body, const char *subtitle) {
-    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+schedule_notification(const char *identifier, const char *title, const char *body, const char *subtitle, int urgency) {
+    UNUserNotificationCenter *center = get_notification_center_safely();
     if (!center) return;
     // Configure the notification's payload.
     UNMutableNotificationContent* content = [[UNMutableNotificationContent alloc] init];
@@ -432,6 +465,22 @@ schedule_notification(const char *identifier, const char *title, const char *bod
     if (body) content.body = @(body);
     if (subtitle) content.subtitle = @(subtitle);
     content.sound = [UNNotificationSound defaultSound];
+#if __MAC_OS_X_VERSION_MIN_REQUIRED >= 120000
+    switch (urgency) {
+        case 0:
+            content.interruptionLevel = UNNotificationInterruptionLevelPassive;
+        case 2:
+            content.interruptionLevel = UNNotificationInterruptionLevelCritical;
+        default:
+            content.interruptionLevel = UNNotificationInterruptionLevelActive;
+    }
+#else
+    if ([content respondsToSelector:@selector(interruptionLevel)]) {
+        NSUInteger level = 1;
+        if (urgency == 0) level = 0; else if (urgency == 2) level = 3;
+        [content setValue:@(level) forKey:@"interruptionLevel"];
+    }
+#endif
     // Deliver the notification
     static unsigned long counter = 1;
     UNNotificationRequest* request = [
@@ -448,6 +497,7 @@ schedule_notification(const char *identifier, const char *title, const char *bod
 
 typedef struct {
     char *identifier, *title, *body, *subtitle;
+    int urgency;
 } QueuedNotification;
 
 typedef struct {
@@ -457,13 +507,14 @@ typedef struct {
 static NotificationQueue notification_queue = {0};
 
 static void
-queue_notification(const char *identifier, const char *title, const char* body, const char* subtitle) {
+queue_notification(const char *identifier, const char *title, const char* body, const char* subtitle, int urgency) {
     ensure_space_for((&notification_queue), notifications, QueuedNotification, notification_queue.count + 16, capacity, 16, true);
     QueuedNotification *n = notification_queue.notifications + notification_queue.count++;
     n->identifier = identifier ? strdup(identifier) : NULL;
     n->title = title ? strdup(title) : NULL;
     n->body = body ? strdup(body) : NULL;
     n->subtitle = subtitle ? strdup(subtitle) : NULL;
+    n->urgency = urgency;
 }
 
 static void
@@ -471,25 +522,25 @@ drain_pending_notifications(BOOL granted) {
     if (granted) {
         for (size_t i = 0; i < notification_queue.count; i++) {
             QueuedNotification *n = notification_queue.notifications + i;
-            schedule_notification(n->identifier, n->title, n->body, n->subtitle);
+            schedule_notification(n->identifier, n->title, n->body, n->subtitle, n->urgency);
         }
     }
     while(notification_queue.count) {
         QueuedNotification *n = notification_queue.notifications + --notification_queue.count;
         free(n->identifier); free(n->title); free(n->body); free(n->subtitle);
-        n->identifier = NULL; n->title = NULL; n->body = NULL; n->subtitle = NULL;
+        memset(n, 0, sizeof(QueuedNotification));
     }
 }
 
 static PyObject*
 cocoa_send_notification(PyObject *self UNUSED, PyObject *args) {
-    char *identifier = NULL, *title = NULL, *body = NULL, *subtitle = NULL;
-    if (!PyArg_ParseTuple(args, "zsz|z", &identifier, &title, &body, &subtitle)) return NULL;
+    char *identifier = NULL, *title = NULL, *body = NULL, *subtitle = NULL; int urgency = 1;
+    if (!PyArg_ParseTuple(args, "zsz|zi", &identifier, &title, &body, &subtitle, &urgency)) return NULL;
 
-    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+    UNUserNotificationCenter *center = get_notification_center_safely();
     if (!center) Py_RETURN_NONE;
     if (!center.delegate) center.delegate = [[NotificationDelegate alloc] init];
-    queue_notification(identifier, title, body, subtitle);
+    queue_notification(identifier, title, body, subtitle, urgency);
 
     // The badge permission needs to be requested as well, even though it is not used,
     // otherwise macOS refuses to show the preference checkbox for enable/disable notification sound.
@@ -558,6 +609,36 @@ cocoa_send_notification(PyObject *self UNUSED, PyObject *args) {
 @end
 
 // global menu {{{
+
+static void
+add_user_global_menu_entry(struct MenuItem *e, NSMenu *bar, size_t action_index) {
+    NSMenu *parent = bar;
+    UserMenuItem *final_item = nil;
+    GlobalMenuTarget *global_menu_target = [GlobalMenuTarget shared_instance];
+    for (size_t i = 0; i < e->location_count; i++) {
+        NSMenuItem *item = [parent itemWithTitle:@(e->location[i])];
+        if (!item) {
+            final_item = [[UserMenuItem alloc] initWithTitle:@(e->location[i]) action:@selector(user_menu_action:) keyEquivalent:@""];
+            final_item.target = global_menu_target;
+            [parent addItem:final_item];
+            item = final_item;
+            [final_item release];
+        }
+        if (i + 1 < e->location_count) {
+            if (![item hasSubmenu]) {
+                NSMenu* sub_menu = [[NSMenu alloc] initWithTitle:item.title];
+                [item setSubmenu:sub_menu];
+                [sub_menu release];
+            }
+            parent = [item submenu];
+            if (!parent) return;
+        }
+    }
+    if (final_item != nil) {
+        final_item.action_index = action_index;
+    }
+}
+
 void
 cocoa_create_global_menu(void) {
     NSString* app_name = find_app_name();
@@ -664,7 +745,16 @@ cocoa_create_global_menu(void) {
     [NSApp setHelpMenu:helpMenu];
     [helpMenu release];
 
+    if (OPT(global_menu.entries)) {
+        for (size_t i = 0; i < OPT(global_menu.count); i++) {
+            struct MenuItem *e = OPT(global_menu.entries) + i;
+            if (e->definition && e->location && e->location_count > 1) {
+                add_user_global_menu_entry(e, bar, i);
+            }
+        }
+    }
     [bar release];
+
 
     class_addMethod(
         object_getClass([NSApp delegate]),
@@ -674,17 +764,20 @@ cocoa_create_global_menu(void) {
 
 
     [NSApp setServicesProvider:[[[ServiceProvider alloc] init] autorelease]];
+
 #undef MENU_ITEM
 }
 
 void
 cocoa_update_menu_bar_title(PyObject *pytitle) {
+    if (!pytitle) return;
     NSString *title = nil;
     if (OPT(macos_menubar_title_max_length) > 0 && PyUnicode_GetLength(pytitle) > OPT(macos_menubar_title_max_length)) {
         static char fmt[64];
         snprintf(fmt, sizeof(fmt), "%%%ld.%ldU%%s", OPT(macos_menubar_title_max_length), OPT(macos_menubar_title_max_length));
-        DECREF_AFTER_FUNCTION PyObject *st = PyUnicode_FromFormat(fmt, pytitle, "…");
+        RAII_PyObject(st, PyUnicode_FromFormat(fmt, pytitle, "…"));
         if (st) title = @(PyUnicode_AsUTF8(st));
+        else PyErr_Print();
     } else {
         title = @(PyUnicode_AsUTF8(pytitle));
     }
@@ -697,26 +790,25 @@ cocoa_update_menu_bar_title(PyObject *pytitle) {
     NSMenu *m = [[NSMenu alloc] initWithTitle:[NSString stringWithFormat:@" :: %@", title]];
     [title_menu setSubmenu:m];
     [m release];
-} // }}}
-
-bool
-cocoa_make_window_resizable(void *w, bool resizable) {
-    NSWindow *window = (NSWindow*)w;
-
-    @try {
-        if (resizable) {
-            [window setStyleMask:
-                [window styleMask] | NSWindowStyleMaskResizable];
-        } else {
-            [window setStyleMask:
-                [window styleMask] & ~NSWindowStyleMaskResizable];
-        }
-    } @catch (NSException *e) {
-        log_error("Failed to set style mask: %s: %s", [[e name] UTF8String], [[e reason] UTF8String]);
-        return false;
-    }
-    return true;
 }
+
+void
+cocoa_clear_global_shortcuts(void) {
+    memset(&global_shortcuts, 0, sizeof(global_shortcuts));
+}
+
+void
+cocoa_recreate_global_menu(void) {
+    if (title_menu != NULL) {
+        NSMenu *bar = [NSApp mainMenu];
+        [bar removeItem:title_menu];
+    }
+    title_menu = NULL;
+    cocoa_create_global_menu();
+}
+
+
+// }}}
 
 #define NSLeftAlternateKeyMask  (0x000020 | NSEventModifierFlagOption)
 #define NSRightAlternateKeyMask (0x000040 | NSEventModifierFlagOption)
@@ -782,19 +874,10 @@ cocoa_get_workspace_ids(void *w, size_t *workspace_ids, size_t array_sz) {
 static PyObject*
 cocoa_get_lang(PyObject UNUSED *self) {
     @autoreleasepool {
-
-    NSString* locale = nil;
-    NSString* lang_code = [[NSLocale currentLocale] objectForKey:NSLocaleLanguageCode];
+    NSString* lang_code = [[NSLocale currentLocale] languageCode];
     NSString* country_code = [[NSLocale currentLocale] objectForKey:NSLocaleCountryCode];
-    if (lang_code && country_code) {
-        locale = [NSString stringWithFormat:@"%@_%@", lang_code, country_code];
-    } else {
-        locale = [[NSLocale currentLocale] localeIdentifier];
-    }
-    if (!locale) { Py_RETURN_NONE; }
-    const char* locale_utf8 = [locale UTF8String];
-    return Py_BuildValue("s", locale_utf8);
-
+    NSString* identifier = [[NSLocale currentLocale] localeIdentifier];
+    return Py_BuildValue("sss", lang_code ? [lang_code UTF8String]:"", country_code ? [country_code UTF8String] : "", identifier ? [identifier UTF8String]: "");
     } // autoreleasepool
 }
 
@@ -820,46 +903,6 @@ cocoa_cursor_blink_interval(void) {
 void
 cocoa_set_activation_policy(bool hide_from_tasks) {
     [NSApp setActivationPolicy:(hide_from_tasks ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular)];
-}
-
-void
-cocoa_set_titlebar_appearance(void *w, unsigned int theme)
-{
-    if (!theme) return;
-    @autoreleasepool {
-        NSWindow *window = (NSWindow*)w;
-        [window setAppearance:[NSAppearance appearanceNamed:((theme == 2) ? NSAppearanceNameVibrantDark : NSAppearanceNameVibrantLight)]];
-    } // autoreleasepool
-}
-
-void
-cocoa_set_titlebar_color(void *w, color_type titlebar_color)
-{
-    @autoreleasepool {
-
-    NSWindow *window = (NSWindow*)w;
-
-    double red = ((titlebar_color >> 16) & 0xFF) / 255.0;
-    double green = ((titlebar_color >> 8) & 0xFF) / 255.0;
-    double blue = (titlebar_color & 0xFF) / 255.0;
-
-    NSColor *background =
-        [NSColor colorWithSRGBRed:red
-                            green:green
-                             blue:blue
-                            alpha:1.0];
-    [window setTitlebarAppearsTransparent:YES];
-    [window setBackgroundColor:background];
-
-    double luma = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
-
-    if (luma < 0.5) {
-        [window setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameVibrantDark]];
-    } else {
-        [window setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameVibrantLight]];
-    }
-
-    } // autoreleasepool
 }
 
 static PyObject*
@@ -979,17 +1022,6 @@ cleanup(void) {
 }
 
 void
-cocoa_hide_window_title(void *w)
-{
-    @autoreleasepool {
-
-    NSWindow *window = (NSWindow*)w;
-    [window setTitleVisibility:NSWindowTitleHidden];
-
-    } // autoreleasepool
-}
-
-void
 cocoa_system_beep(const char *path) {
     if (!path) { NSBeep(); return; }
     static const char *beep_path = NULL;
@@ -1025,7 +1057,7 @@ static PyMethodDef module_methods[] = {
 
 bool
 init_cocoa(PyObject *module) {
-    memset(&global_shortcuts, 0, sizeof(global_shortcuts));
+    cocoa_clear_global_shortcuts();
     if (PyModule_AddFunctions(module, module_methods) != 0) return false;
     register_at_exit_cleanup_func(COCOA_CLEANUP_FUNC, cleanup);
     return true;

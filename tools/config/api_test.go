@@ -16,21 +16,34 @@ var _ = fmt.Print
 func TestConfigParsing(t *testing.T) {
 	tdir := t.TempDir()
 	conf_file := filepath.Join(tdir, "a.conf")
-	os.Mkdir(filepath.Join(tdir, "sub"), 0o700)
-	os.WriteFile(conf_file, []byte(
+	if err := os.Mkdir(filepath.Join(tdir, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	w := func(path string, data []byte) {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w(conf_file, []byte(
 		`error main
-# ignore me
-a one
+# igno
+     \re me
+a	one
 #: other
-include sub/b.conf
-b
-include non-existent
-globinclude sub/c?.conf
-`), 0o600)
-	os.WriteFile(filepath.Join(tdir, "sub/b.conf"), []byte("incb cool\ninclude a.conf"), 0o600)
-	os.WriteFile(filepath.Join(tdir, "sub/c1.conf"), []byte("inc1 cool"), 0o600)
-	os.WriteFile(filepath.Join(tdir, "sub/c2.conf"), []byte("inc2 cool\nenvinclude ENVINCLUDE"), 0o600)
-	os.WriteFile(filepath.Join(tdir, "sub/c.conf"), []byte("inc notcool\nerror sub"), 0o600)
+include
+\ sub/b.conf
+b x
+include non-exis
+\tent
+globin
+\clude sub/c?.c
+   \onf
+badline
+`))
+	w(filepath.Join(tdir, "sub/b.conf"), []byte("incb cool\ninclude a.conf"))
+	w(filepath.Join(tdir, "sub/c1.conf"), []byte("inc1 cool"))
+	w(filepath.Join(tdir, "sub/c2.conf"), []byte("inc2 cool\nenvinclude ENVINCLUDE"))
+	w(filepath.Join(tdir, "sub/c.conf"), []byte("inc notcool\nerror sub"))
 
 	var parsed_lines []string
 	pl := func(key, val string) error {
@@ -46,8 +59,10 @@ globinclude sub/c?.conf
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = p.ParseOverrides("over one", "over two")
-	diff := cmp.Diff([]string{"a one", "incb cool", "b ", "inc1 cool", "inc2 cool", "env cool", "inc notcool", "over one", "over two"}, parsed_lines)
+	if err = p.ParseOverrides("over one", "over two"); err != nil {
+		t.Fatal(err)
+	}
+	diff := cmp.Diff([]string{"a one", "incb cool", "b x", "inc1 cool", "inc2 cool", "env cool", "inc notcool", "over one", "over two"}, parsed_lines)
 	if diff != "" {
 		t.Fatalf("Unexpected parsed config values:\n%s", diff)
 	}
@@ -55,7 +70,7 @@ globinclude sub/c?.conf
 	for _, bl := range p.BadLines() {
 		bad_lines = append(bad_lines, fmt.Sprintf("%s: %d", filepath.Base(bl.Src_file), bl.Line_number))
 	}
-	diff = cmp.Diff([]string{"a.conf: 1", "c.conf: 2"}, bad_lines)
+	diff = cmp.Diff([]string{"a.conf: 1", "c.conf: 2", "a.conf: 14"}, bad_lines)
 	if diff != "" {
 		t.Fatalf("Unexpected bad lines:\n%s", diff)
 	}

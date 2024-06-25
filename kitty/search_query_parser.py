@@ -6,8 +6,12 @@ from functools import lru_cache
 from gettext import gettext as _
 from typing import Callable, Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple, TypeVar, Union
 
+from .types import run_once
+
 
 class ParseException(Exception):
+
+    hide_traceback = True
 
     @property
     def msg(self) -> str:
@@ -113,14 +117,30 @@ class Token(NamedTuple):
     val: str
 
 
-lex_scanner = getattr(re, 'Scanner')([
-        (r'[()]', lambda x, t: Token(TokenType.OPCODE, t)),
-        (r'@.+?:[^")\s]+', lambda x, t: Token(TokenType.WORD, str(t))),
-        (r'[^"()\s]+', lambda x, t: Token(TokenType.WORD, str(t))),
-        (r'".*?((?<!\\)")', lambda x, t: Token(TokenType.QUOTED_WORD, t[1:-1])),
-        (r'\s+',              None)
-], flags=re.DOTALL)
-REPLACEMENTS = tuple(('\\' + x, chr(i + 1)) for i, x in enumerate('\\"()'))
+@run_once
+def lex_scanner() -> Callable[[str], Tuple[List[Token], str]]:
+    return getattr(re, 'Scanner')([  # type: ignore
+            (r'[()]', lambda x, t: Token(TokenType.OPCODE, t)),
+            (r'@.+?:[^")\s]+', lambda x, t: Token(TokenType.WORD, str(t))),
+            (r'[^"()\s]+', lambda x, t: Token(TokenType.WORD, str(t))),
+            (r'".*?((?<!\\)")', lambda x, t: Token(TokenType.QUOTED_WORD, t[1:-1])),
+            (r'\s+',              None)
+    ], flags=re.DOTALL).scan
+
+
+@run_once
+def replacements() -> Tuple[Tuple[str, str], ...]:
+    return tuple(('\\' + x, chr(i + 1)) for i, x in enumerate('\\"()'))
+
+
+class NoLocation(ParseException):
+
+    def __init__(self, tt: str):
+        a, sep, b = tt.partition(':')
+        if sep == ':':
+            super().__init__(f'{a} is not a recognized location in {tt}')
+        else:
+            super().__init__(f'No location specified before {tt}')
 
 
 class Parser:
@@ -160,12 +180,14 @@ class Parser:
     def tokenize(self, expr: str) -> List[Token]:
         # Strip out escaped backslashes, quotes and parens so that the
         # lex scanner doesn't get confused. We put them back later.
-        for k, v in REPLACEMENTS:
+        for k, v in replacements():
             expr = expr.replace(k, v)
-        tokens = lex_scanner.scan(expr)[0]
+        tokens, leftover = lex_scanner()(expr)
+        if leftover:
+            raise ParseException(_('Extra characters at end of search'))
 
         def unescape(x: str) -> str:
-            for k, v in REPLACEMENTS:
+            for k, v in replacements():
                 x = x.replace(v, k[1:])
             return x
 
@@ -225,7 +247,7 @@ class Parser:
             assert tt is not None
             if self.allow_no_location:
                 return TokenNode('all', tt)
-            raise ParseException(f'No location specified before {tt}')
+            raise NoLocation(tt)
 
         tt = self.token(advance=True)
         assert tt is not None
@@ -253,7 +275,7 @@ class Parser:
 
         if self.allow_no_location:
             return TokenNode('all', ':'.join(words))
-        raise ParseException(f'No location specified before {tt}')
+        raise NoLocation(tt)
 
 
 @lru_cache(maxsize=64)

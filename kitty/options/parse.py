@@ -12,13 +12,14 @@ from kitty.options.utils import (
     config_or_absolute_path, copy_on_select, cursor_text_color, deprecated_adjust_line_height,
     deprecated_hide_window_decorations_aliases, deprecated_macos_show_window_title_in_menubar_alias,
     deprecated_send_text, disable_ligatures, edge_width, env, font_features, hide_window_decorations,
-    macos_option_as_alt, macos_titlebar_color, modify_font, narrow_symbols, optional_edge_width,
-    parse_map, parse_mouse_map, paste_actions, remote_control_password, resize_draw_strategy,
-    scrollback_lines, scrollback_pager_history_size, shell_integration, store_multiple, symbol_map,
-    tab_activity_symbol, tab_bar_edge, tab_bar_margin_height, tab_bar_min_tabs, tab_fade,
-    tab_font_style, tab_separator, tab_title_template, titlebar_color, to_cursor_shape, to_font_size,
+    macos_option_as_alt, macos_titlebar_color, menu_map, modify_font, narrow_symbols,
+    notify_on_cmd_finish, optional_edge_width, parse_font_spec, parse_map, parse_mouse_map,
+    paste_actions, remote_control_password, resize_debounce_time, scrollback_lines,
+    scrollback_pager_history_size, shell_integration, store_multiple, symbol_map, tab_activity_symbol,
+    tab_bar_edge, tab_bar_margin_height, tab_bar_min_tabs, tab_fade, tab_font_style, tab_separator,
+    tab_title_template, titlebar_color, to_cursor_shape, to_cursor_unfocused_shape, to_font_size,
     to_layout_names, to_modifiers, url_prefixes, url_style, visual_window_select_characters,
-    window_border_width, window_size
+    window_border_width, window_logo_scale, window_size
 )
 
 
@@ -65,6 +66,9 @@ class Parser:
     def background(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['background'] = to_color(val)
 
+    def background_blur(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        ans['background_blur'] = int(val)
+
     def background_image(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['background_image'] = config_or_absolute_path(val)
 
@@ -74,7 +78,7 @@ class Parser:
             raise ValueError(f"The value {val} is not a valid choice for background_image_layout")
         ans["background_image_layout"] = val
 
-    choices_for_background_image_layout = frozenset(('mirror-tiled', 'scaled', 'tiled', 'clamped', 'centered'))
+    choices_for_background_image_layout = frozenset(('mirror-tiled', 'scaled', 'tiled', 'clamped', 'centered', 'cscaled'))
 
     def background_image_linear(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['background_image_linear'] = to_bool(val)
@@ -98,10 +102,10 @@ class Parser:
         ans['bell_path'] = config_or_absolute_path(val)
 
     def bold_font(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
-        ans['bold_font'] = str(val)
+        ans['bold_font'] = parse_font_spec(val)
 
     def bold_italic_font(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
-        ans['bold_italic_font'] = str(val)
+        ans['bold_italic_font'] = parse_font_spec(val)
 
     def box_drawing_scale(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['box_drawing_scale'] = box_drawing_scale(val)
@@ -916,6 +920,9 @@ class Parser:
     def cursor_shape(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['cursor_shape'] = to_cursor_shape(val)
 
+    def cursor_shape_unfocused(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        ans['cursor_shape_unfocused'] = to_cursor_unfocused_shape(val)
+
     def cursor_stop_blinking_after(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['cursor_stop_blinking_after'] = positive_float(val)
 
@@ -931,7 +938,7 @@ class Parser:
             raise ValueError(f"The value {val} is not a valid choice for default_pointer_shape")
         ans["default_pointer_shape"] = val
 
-    choices_for_default_pointer_shape = frozenset(('arrow', 'beam', 'hand'))
+    choices_for_default_pointer_shape = frozenset(('arrow', 'beam', 'text', 'pointer', 'hand', 'help', 'wait', 'progress', 'crosshair', 'cell', 'vertical-text', 'move', 'e-resize', 'ne-resize', 'nw-resize', 'n-resize', 'se-resize', 'sw-resize', 's-resize', 'w-resize', 'ew-resize', 'ns-resize', 'nesw-resize', 'nwse-resize', 'zoom-in', 'zoom-out', 'alias', 'copy', 'not-allowed', 'no-drop', 'grab', 'grabbing'))
 
     def detect_urls(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['detect_urls'] = to_bool(val)
@@ -972,7 +979,7 @@ class Parser:
         ans['focus_follows_mouse'] = to_bool(val)
 
     def font_family(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
-        ans['font_family'] = str(val)
+        ans['font_family'] = parse_font_spec(val)
 
     def font_features(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         for k, v in font_features(val):
@@ -986,6 +993,9 @@ class Parser:
 
     def foreground(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['foreground'] = to_color(val)
+
+    def forward_stdio(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        ans['forward_stdio'] = to_bool(val)
 
     def hide_window_decorations(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['hide_window_decorations'] = hide_window_decorations(val)
@@ -1015,7 +1025,7 @@ class Parser:
         ans['input_delay'] = positive_int(val)
 
     def italic_font(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
-        ans['italic_font'] = str(val)
+        ans['italic_font'] = parse_font_spec(val)
 
     def kitten_alias(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         for k, v in action_alias(val):
@@ -1099,6 +1109,10 @@ class Parser:
     def mark3_foreground(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['mark3_foreground'] = to_color(val)
 
+    def menu_map(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        for k, v in menu_map(val, ans["menu_map"]):
+            ans["menu_map"][k] = v
+
     def modify_font(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         for k, v in modify_font(val):
             ans["modify_font"][k] = v
@@ -1109,6 +1123,9 @@ class Parser:
     def narrow_symbols(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         for k, v in narrow_symbols(val):
             ans["narrow_symbols"][k] = v
+
+    def notify_on_cmd_finish(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        ans['notify_on_cmd_finish'] = notify_on_cmd_finish(val)
 
     def open_url_with(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['open_url_with'] = to_cmdline(val)
@@ -1122,7 +1139,7 @@ class Parser:
             raise ValueError(f"The value {val} is not a valid choice for placement_strategy")
         ans["placement_strategy"] = val
 
-    choices_for_placement_strategy = frozenset(('center', 'top-left'))
+    choices_for_placement_strategy = frozenset(('top-left', 'top', 'top-right', 'left', 'center', 'right', 'bottom-left', 'bottom', 'bottom-right'))
 
     def pointer_shape_when_dragging(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         val = val.lower()
@@ -1130,7 +1147,7 @@ class Parser:
             raise ValueError(f"The value {val} is not a valid choice for pointer_shape_when_dragging")
         ans["pointer_shape_when_dragging"] = val
 
-    choices_for_pointer_shape_when_dragging = frozenset(('arrow', 'beam', 'hand'))
+    choices_for_pointer_shape_when_dragging = choices_for_default_pointer_shape
 
     def pointer_shape_when_grabbed(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         val = val.lower()
@@ -1138,7 +1155,7 @@ class Parser:
             raise ValueError(f"The value {val} is not a valid choice for pointer_shape_when_grabbed")
         ans["pointer_shape_when_grabbed"] = val
 
-    choices_for_pointer_shape_when_grabbed = frozenset(('arrow', 'beam', 'hand'))
+    choices_for_pointer_shape_when_grabbed = choices_for_default_pointer_shape
 
     def remember_window_size(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['remember_window_size'] = to_bool(val)
@@ -1151,16 +1168,16 @@ class Parser:
         ans['repaint_delay'] = positive_int(val)
 
     def resize_debounce_time(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
-        ans['resize_debounce_time'] = positive_float(val)
-
-    def resize_draw_strategy(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
-        ans['resize_draw_strategy'] = resize_draw_strategy(val)
+        ans['resize_debounce_time'] = resize_debounce_time(val)
 
     def resize_in_steps(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['resize_in_steps'] = to_bool(val)
 
     def scrollback_fill_enlarged_window(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['scrollback_fill_enlarged_window'] = to_bool(val)
+
+    def scrollback_indicator_opacity(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        ans['scrollback_indicator_opacity'] = unit_float(val)
 
     def scrollback_lines(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['scrollback_lines'] = scrollback_lines(val)
@@ -1194,6 +1211,9 @@ class Parser:
 
     def single_window_margin_width(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['single_window_margin_width'] = optional_edge_width(val)
+
+    def single_window_padding_width(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        ans['single_window_padding_width'] = optional_edge_width(val)
 
     def startup_session(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['startup_session'] = config_or_absolute_path(val)
@@ -1281,6 +1301,14 @@ class Parser:
     def term(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['term'] = str(val)
 
+    def terminfo_type(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        val = val.lower()
+        if val not in self.choices_for_terminfo_type:
+            raise ValueError(f"The value {val} is not a valid choice for terminfo_type")
+        ans["terminfo_type"] = val
+
+    choices_for_terminfo_type = frozenset(('path', 'direct', 'none'))
+
     def text_composition_strategy(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['text_composition_strategy'] = str(val)
 
@@ -1297,6 +1325,14 @@ class Parser:
         ans["undercurl_style"] = val
 
     choices_for_undercurl_style = frozenset(('thin-sparse', 'thin-dense', 'thick-sparse', 'thick-dense'))
+
+    def underline_hyperlinks(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        val = val.lower()
+        if val not in self.choices_for_underline_hyperlinks:
+            raise ValueError(f"The value {val} is not a valid choice for underline_hyperlinks")
+        ans["underline_hyperlinks"] = val
+
+    choices_for_underline_hyperlinks = frozenset(('hover', 'always', 'never'))
 
     def update_check_interval(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['update_check_interval'] = float(val)
@@ -1326,6 +1362,9 @@ class Parser:
         for k, v in store_multiple(val, ans["watcher"]):
             ans["watcher"][k] = v
 
+    def wayland_enable_ime(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        ans['wayland_enable_ime'] = to_bool(val)
+
     def wayland_titlebar_color(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['wayland_titlebar_color'] = titlebar_color(val)
 
@@ -1353,7 +1392,10 @@ class Parser:
             raise ValueError(f"The value {val} is not a valid choice for window_logo_position")
         ans["window_logo_position"] = val
 
-    choices_for_window_logo_position = frozenset(('top-left', 'top', 'top-right', 'left', 'center', 'right', 'bottom-left', 'bottom', 'bottom-right'))
+    choices_for_window_logo_position = choices_for_placement_strategy
+
+    def window_logo_scale(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
+        ans['window_logo_scale'] = window_logo_scale(val)
 
     def window_margin_width(self, val: str, ans: typing.Dict[str, typing.Any]) -> None:
         ans['window_margin_width'] = edge_width(val)
@@ -1404,6 +1446,7 @@ def create_result_dict() -> typing.Dict[str, typing.Any]:
         'exe_search_path': {},
         'font_features': {},
         'kitten_alias': {},
+        'menu_map': {},
         'modify_font': {},
         'narrow_symbols': {},
         'remote_control_password': {},

@@ -8,4 +8,5 @@
 
 #include "data-types.h"
 #define uthash_fatal(msg) fatal(msg)
-#include "uthash.h"
+#define hash_handle_type UT_hash_handle
+#include "../3rdparty/uthash.h"

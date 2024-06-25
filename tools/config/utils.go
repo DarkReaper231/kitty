@@ -7,11 +7,10 @@ import (
 	"kitty/tools/tui/loop"
 	"kitty/tools/utils"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
-
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
+	"sync"
 )
 
 var _ = fmt.Print
@@ -30,7 +29,7 @@ func ParseStrDict(val, record_sep, field_sep string) (map[string]string, error) 
 func PositiveFloat(val string) (ans float64, err error) {
 	ans, err = strconv.ParseFloat(val, 64)
 	if err == nil {
-		ans = utils.Max(0, ans)
+		ans = max(0, ans)
 	}
 	return
 }
@@ -38,7 +37,7 @@ func PositiveFloat(val string) (ans float64, err error) {
 func UnitFloat(val string) (ans float64, err error) {
 	ans, err = strconv.ParseFloat(val, 64)
 	if err == nil {
-		ans = utils.Max(0, utils.Min(ans, 1))
+		ans = max(0, min(ans, 1))
 	}
 	return
 }
@@ -189,7 +188,7 @@ func StringLiteral(val string) (string, error) {
 	return ans.String(), nil
 }
 
-var ModMap = (&utils.Once[map[string]string]{Run: func() map[string]string {
+var ModMap = sync.OnceValue(func() map[string]string {
 	return map[string]string{
 		"shift":     "shift",
 		"⇧":         "shift",
@@ -209,11 +208,11 @@ var ModMap = (&utils.Once[map[string]string]{Run: func() map[string]string {
 		"num_lock":  "num_lock",
 		"caps_lock": "caps_lock",
 	}
-}}).Get
+})
 
-var ShortcutSpecPat = (&utils.Once[*regexp.Regexp]{Run: func() *regexp.Regexp {
+var ShortcutSpecPat = sync.OnceValue(func() *regexp.Regexp {
 	return regexp.MustCompile(`([^+])>`)
-}}).Get
+})
 
 func NormalizeShortcut(spec string) string {
 	parts := strings.Split(strings.ToLower(spec), "+")
@@ -308,5 +307,5 @@ func ResolveShortcuts(actions []*KeyAction) []*KeyAction {
 			action_map[key] = ac
 		}
 	}
-	return maps.Values(action_map)
+	return utils.Values(action_map)
 }

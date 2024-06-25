@@ -6,19 +6,33 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 
 	"kitty/tools/cli"
 	"kitty/tools/utils"
-
-	"github.com/jamesruan/go-rfc1924/base85"
+	"kitty/tools/utils/base85"
 )
 
 var _ = fmt.Print
 
+var RunningAsUI = sync.OnceValue(func() bool {
+	defer func() { os.Unsetenv("KITTEN_RUNNING_AS_UI") }()
+	return os.Getenv("KITTEN_RUNNING_AS_UI") != ""
+})
+
+func PrepareRootCmd(root *cli.Command) {
+	if RunningAsUI() {
+		root.CallbackOnError = func(cmd *cli.Command, err error, during_parsing bool, exit_code int) int {
+			cli.ShowError(err)
+			os.Stdout.WriteString("\x1bP@kitty-overlay-ready|\x1b\\")
+			HoldTillEnter(true)
+			return exit_code
+		}
+	}
+}
+
 func KittenOutputSerializer() func(any) (string, error) {
-	write_with_escape_code := os.Getenv("KITTEN_RUNNING_AS_UI") != ""
-	os.Unsetenv("KITTEN_RUNNING_AS_UI")
-	if write_with_escape_code {
+	if RunningAsUI() {
 		return func(what any) (string, error) {
 			data, err := json.Marshal(what)
 			if err != nil {
@@ -37,10 +51,4 @@ func KittenOutputSerializer() func(any) (string, error) {
 		}
 		return utils.UnsafeBytesToString(data), nil
 	}
-}
-
-func ReportError(err error) {
-	cli.ShowError(err)
-	os.Stdout.WriteString("\x1bP@kitty-overlay-ready|\x1b\\")
-	HoldTillEnter(false)
 }

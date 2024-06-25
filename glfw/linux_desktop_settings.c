@@ -20,11 +20,10 @@
 
 static char theme_name[128] = {0};
 static int theme_size = -1;
-static uint32_t appearance = 0;
-static bool is_gnome = false;
+static GLFWColorScheme appearance = GLFW_COLOR_SCHEME_NO_PREFERENCE;
 static bool cursor_theme_changed = false;
 
-int
+GLFWColorScheme
 glfw_current_system_color_theme(void) {
     return appearance;
 }
@@ -40,8 +39,10 @@ static void
 process_fdo_setting(const char *key, DBusMessageIter *value) {
     if (strcmp(key, FDO_APPEARANCE_KEY) == 0) {
         if (dbus_message_iter_get_arg_type(value) == DBUS_TYPE_UINT32) {
-            dbus_message_iter_get_basic(value, &appearance);
-            if (appearance > 2) appearance = 0;
+            uint32_t val;
+            dbus_message_iter_get_basic(value, &val);
+            if (val > 2) val = 0;
+            appearance = val;
         }
     }
 }
@@ -102,7 +103,7 @@ HANDLER(process_desktop_settings)
                 dbus_message_iter_recurse(&item, &settings);
                 if (strcmp(namespace, FDO_DESKTOP_NAMESPACE) == 0) {
                     process_settings_dict(&settings, process_fdo_setting);
-                } else if (is_gnome && strcmp(namespace, GNOME_DESKTOP_NAMESPACE) == 0) {
+                } else if (strcmp(namespace, GNOME_DESKTOP_NAMESPACE) == 0) {
                     process_settings_dict(&settings, process_gnome_setting);
                 }
             }
@@ -117,14 +118,13 @@ HANDLER(process_desktop_settings)
 
 static bool
 read_desktop_settings(DBusConnection *session_bus) {
-    DBusMessage *msg = dbus_message_new_method_call(DESKTOP_SERVICE, DESKTOP_PATH, DESKTOP_INTERFACE, "ReadAll");
+    RAII_MSG(msg, dbus_message_new_method_call(DESKTOP_SERVICE, DESKTOP_PATH, DESKTOP_INTERFACE, "ReadAll"));
     if (!msg) return false;
     DBusMessageIter iter, array_iter;
     dbus_message_iter_init_append(msg, &iter);
-    if (!dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "s", &array_iter)) { dbus_message_unref(msg); return false; }
-    if (!dbus_message_iter_close_container(&iter, &array_iter)) { dbus_message_unref(msg); return false; }
+    if (!dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "s", &array_iter)) { return false; }
+    if (!dbus_message_iter_close_container(&iter, &array_iter)) { return false; }
     bool ok = call_method_with_msg(session_bus, msg, DBUS_TIMEOUT_USE_DEFAULT, process_desktop_settings, NULL);
-    dbus_message_unref(msg);
     return ok;
 }
 
@@ -160,9 +160,7 @@ on_color_scheme_change(DBusMessage *message) {
                 if (val > 2) val = 0;
                 if (val != appearance) {
                     appearance = val;
-                    if (_glfw.callbacks.system_color_theme_change) {
-                        _glfw.callbacks.system_color_theme_change(appearance);
-                    }
+                    _glfwInputColorScheme(appearance);
                 }
             }
             break;
@@ -192,8 +190,6 @@ setting_changed(DBusConnection *conn UNUSED, DBusMessage *msg, void *user_data U
 void
 glfw_initialize_desktop_settings(void) {
     get_cursor_theme_from_env();
-    const char *desktop = getenv("XDG_CURRENT_DESKTOP");
-    is_gnome = desktop && strstr(desktop, "GNOME");
     DBusConnection *session_bus = glfw_dbus_session_bus();
     if (session_bus) {
         if (!read_desktop_settings(session_bus)) _glfwInputError(GLFW_PLATFORM_ERROR, "Failed to read desktop settings, make sure you have the desktop portal running.");

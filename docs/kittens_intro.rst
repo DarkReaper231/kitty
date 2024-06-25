@@ -11,6 +11,7 @@ Extend with kittens
    kittens/diff
    kittens/unicode_input
    kittens/themes
+   kittens/choose-fonts
    kittens/hints
    kittens/remote_file
    kittens/hyperlinked_grep
@@ -25,16 +26,24 @@ add features to |kitty| itself and to create useful standalone programs.
 Some prominent kittens:
 
 :doc:`icat <kittens/icat>`
-    Display images in the terminal
+    Display images in the terminal.
 
 
 :doc:`diff <kittens/diff>`
     A fast, side-by-side diff for the terminal with syntax highlighting and
-    images
+    images.
 
 
 :doc:`Unicode input <kittens/unicode_input>`
     Easily input arbitrary Unicode characters in |kitty| by name or hex code.
+
+
+:doc:`Themes <kittens/themes>`
+    Preview and quick switch between over three hundred color themes.
+
+
+:doc:`Fonts <kittens/choose-fonts>`
+    Preview, fine-tune and quick switch the fonts used by kitty.
 
 
 :doc:`Hints <kittens/hints>`

@@ -5,16 +5,17 @@ package utils
 import (
 	"fmt"
 	"os"
+	"sync"
 )
 
 var _ = fmt.Print
 
 var hostname string = "*"
 
-var Hostname = (&Once[string]{Run: func() string {
+var Hostname = sync.OnceValue(func() string {
 	h, err := os.Hostname()
 	if err == nil {
 		return h
 	}
 	return ""
-}}).Get
+})

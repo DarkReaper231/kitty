@@ -7,9 +7,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"kitty"
 	"kitty/tools/config"
+	"kitty/tools/tty"
 	"kitty/tools/tui"
 	"kitty/tools/tui/loop"
 	"kitty/tools/utils"
@@ -38,20 +40,20 @@ func read_relevant_kitty_opts(path string) KittyOpts {
 		return nil
 	}
 	cp := config.ConfigParser{LineHandler: handle_line}
-	cp.ParseFiles(path)
+	_ = cp.ParseFiles(path)
 	return ans
 }
 
-var RelevantKittyOpts = (&utils.Once[KittyOpts]{Run: func() KittyOpts {
+var RelevantKittyOpts = sync.OnceValue(func() KittyOpts {
 	return read_relevant_kitty_opts(filepath.Join(utils.ConfigDir(), "kitty.conf"))
-}}).Get
+})
 
 func (self *Handler) handle_wheel_event(up bool) {
 	amt := RelevantKittyOpts().Wheel_scroll_multiplier
 	if up {
 		amt *= -1
 	}
-	self.dispatch_action(`scroll_by`, strconv.Itoa(amt))
+	_ = self.dispatch_action(`scroll_by`, strconv.Itoa(amt))
 }
 
 type line_pos struct {
@@ -110,6 +112,9 @@ func (self *Handler) drag_scroll_tick(timer_id loop.IdType) error {
 	})
 }
 
+var debugprintln = tty.DebugPrintln
+var _ = debugprintln
+
 func (self *Handler) update_mouse_selection(ev *loop.MouseEvent) {
 	if !self.mouse_selection.IsActive() {
 		return
@@ -151,7 +156,7 @@ func (self *Handler) text_for_current_mouse_selection() string {
 		return self.logical_lines.ScreenLineAt(pos).right.marked_up_text
 	}
 
-	for pos, prev_ll_idx := start, start.logical_line; pos.Less(end) || pos == end; self.logical_lines.IncrementScrollPosBy(&pos, 1) {
+	for pos, prev_ll_idx := start, start.logical_line; pos.Less(end) || pos == end; {
 		ll := self.logical_lines.At(pos.logical_line)
 		var line string
 		switch ll.line_type {
@@ -179,6 +184,9 @@ func (self *Handler) text_for_current_mouse_selection() string {
 		prev_ll_idx = pos.logical_line
 		if line != "" {
 			text = append(text, line...)
+		}
+		if self.logical_lines.IncrementScrollPosBy(&pos, 1) == 0 {
+			break
 		}
 	}
 	return utils.UnsafeBytesToString(text)

@@ -4,9 +4,31 @@ package loop
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 	"time"
+
+	"kitty/tools/tty"
+	"kitty/tools/utils"
 )
+
+var debugprintln = tty.DebugPrintln
+var _ = debugprintln
+
+type timer struct {
+	interval time.Duration
+	deadline time.Time
+	repeats  bool
+	id       IdType
+	callback TimerCallback
+}
+
+func (self *timer) update_deadline(now time.Time) {
+	self.deadline = now.Add(self.interval)
+}
+
+func (self timer) String() string {
+	return fmt.Sprintf("Timer(id=%d, callback=%s, deadline=%s, repeats=%v)", self.id, utils.FunctionName(self.callback), time.Until(self.deadline), self.repeats)
+}
 
 func (self *Loop) add_timer(interval time.Duration, repeats bool, callback TimerCallback) (IdType, error) {
 	if self.timers == nil {
@@ -34,29 +56,30 @@ func (self *Loop) remove_timer(id IdType) bool {
 }
 
 func (self *Loop) dispatch_timers(now time.Time) error {
-	updated := false
 	self.timers_temp = self.timers_temp[:0]
-	self.timers_temp = append(self.timers_temp, self.timers...)
-	for i, t := range self.timers_temp {
+	self.timers, self.timers_temp = self.timers_temp, self.timers
+	dispatched := false
+	for _, t := range self.timers_temp {
 		if now.After(t.deadline) {
+			dispatched = true
 			err := t.callback(t.id)
 			if err != nil {
 				return err
 			}
 			if t.repeats {
 				t.update_deadline(now)
-				updated = true
-			} else {
-				self.timers = append(self.timers[:i], self.timers[i+1:]...)
+				self.timers = append(self.timers, t)
 			}
+		} else {
+			self.timers = append(self.timers, t)
 		}
 	}
-	if updated {
-		self.sort_timers()
+	if dispatched {
+		self.sort_timers() // needed because a timer callback could have added a new timer
 	}
 	return nil
 }
 
 func (self *Loop) sort_timers() {
-	sort.SliceStable(self.timers, func(a, b int) bool { return self.timers[a].deadline.Before(self.timers[b].deadline) })
+	slices.SortStableFunc(self.timers, func(a, b *timer) int { return a.deadline.Compare(b.deadline) })
 }

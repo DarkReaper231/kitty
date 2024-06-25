@@ -11,7 +11,7 @@ import (
 	"io"
 	"kitty"
 	"math"
-	not_rand "math/rand"
+	not_rand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,7 +95,7 @@ func transmit_shm(imgd *image_data, frame_num int, frame *image_frame) (err erro
 		}
 		defer f.Close()
 		data_size, _ = f.Seek(0, io.SeekEnd)
-		f.Seek(0, io.SeekStart)
+		_, _ = f.Seek(0, io.SeekStart)
 		mmap, err = shm.CreateTemp("icat-*", uint64(data_size))
 		if err != nil {
 			return fmt.Errorf("Failed to create a SHM file for transmission: %w", err)
@@ -108,7 +108,7 @@ func transmit_shm(imgd *image_data, frame_num int, frame *image_frame) (err erro
 				if errors.Is(err, io.EOF) {
 					break
 				}
-				mmap.Unlink()
+				_ = mmap.Unlink()
 				return fmt.Errorf("Failed to read data from image output data file: %w", err)
 			}
 		}
@@ -128,10 +128,10 @@ func transmit_shm(imgd *image_data, frame_num int, frame *image_frame) (err erro
 	gc := gc_for_image(imgd, frame_num, frame)
 	gc.SetTransmission(graphics.GRT_transmission_sharedmem)
 	gc.SetDataSize(uint64(data_size))
-	gc.WriteWithPayloadTo(os.Stdout, utils.UnsafeStringToBytes(mmap.Name()))
+	err = gc.WriteWithPayloadTo(os.Stdout, utils.UnsafeStringToBytes(mmap.Name()))
 	mmap.Close()
 
-	return nil
+	return
 }
 
 func transmit_file(imgd *image_data, frame_num int, frame *image_frame) (err error) {
@@ -144,7 +144,7 @@ func transmit_file(imgd *image_data, frame_num int, frame *image_frame) (err err
 		if err != nil {
 			return fmt.Errorf("Failed to convert image data output file: %s to absolute path with error: %w", frame.filename, err)
 		}
-		frame.filename = "" // so it isnt deleted in cleanup
+		frame.filename = "" // so it isn't deleted in cleanup
 	} else {
 		is_temp = true
 		if frame.shm != nil && frame.shm.FileSystemName() != "" {
@@ -174,8 +174,7 @@ func transmit_file(imgd *image_data, frame_num int, frame *image_frame) (err err
 	if data_size > 0 {
 		gc.SetDataSize(uint64(data_size))
 	}
-	gc.WriteWithPayloadTo(os.Stdout, utils.UnsafeStringToBytes(fname))
-	return nil
+	return gc.WriteWithPayloadTo(os.Stdout, utils.UnsafeStringToBytes(fname))
 }
 
 func transmit_stream(imgd *image_data, frame_num int, frame *image_frame) (err error) {
@@ -192,8 +191,7 @@ func transmit_stream(imgd *image_data, frame_num int, frame *image_frame) (err e
 		}
 	}
 	gc := gc_for_image(imgd, frame_num, frame)
-	gc.WriteWithPayloadTo(os.Stdout, data)
-	return nil
+	return gc.WriteWithPayloadTo(os.Stdout, data)
 }
 
 func calculate_in_cell_x_offset(width, cell_width int) int {
@@ -212,8 +210,8 @@ func calculate_in_cell_x_offset(width, cell_width int) int {
 }
 
 func place_cursor(imgd *image_data) {
-	cw := int(screen_size.Xpixel) / int(screen_size.Col)
-	ch := int(screen_size.Ypixel) / int(screen_size.Row)
+	cw := max(int(screen_size.Xpixel)/int(screen_size.Col), 1)
+	ch := max(int(screen_size.Ypixel)/int(screen_size.Row), 1)
 	imgd.cell_x_offset = calculate_in_cell_x_offset(imgd.canvas_width, cw)
 	imgd.width_cells = int(math.Ceil(float64(imgd.canvas_width) / float64(cw)))
 	imgd.height_cells = int(math.Ceil(float64(imgd.canvas_height) / float64(ch)))
@@ -267,7 +265,7 @@ func write_unicode_placeholder(imgd *image_data) {
 	id_char := string(images.NumberToDiacritic[(imgd.image_id>>24)&255])
 	for r := 0; r < imgd.height_cells; r++ {
 		if imgd.move_to.x > 0 {
-			fmt.Printf("\x1b[%dC", imgd.move_to.x)
+			fmt.Printf("\x1b[%dC", imgd.move_to.x-1)
 		} else {
 			os.Stdout.WriteString(prefix)
 		}
@@ -280,7 +278,7 @@ func write_unicode_placeholder(imgd *image_data) {
 
 var seen_image_ids *utils.Set[uint32]
 
-func transmit_image(imgd *image_data) {
+func transmit_image(imgd *image_data, no_trailing_newline bool) {
 	if seen_image_ids == nil {
 		seen_image_ids = utils.NewSet[uint32](32)
 	}
@@ -291,7 +289,7 @@ func transmit_image(imgd *image_data) {
 				frame.filename = ""
 			}
 			if frame.shm != nil {
-				frame.shm.Unlink()
+				_ = frame.shm.Unlink()
 				frame.shm.Close()
 				frame.shm = nil
 			}
@@ -386,11 +384,15 @@ func transmit_image(imgd *image_data) {
 				case opts.Loop > 0:
 					c.SetNumberOfLoops(uint64(opts.Loop) + 1)
 				}
-				c.WriteWithPayloadTo(os.Stdout, nil)
+				if imgd.err = c.WriteWithPayloadTo(os.Stdout, nil); imgd.err != nil {
+					return
+				}
 			case 1:
 				c := frame_control_cmd
 				c.SetAnimationControl(2) // set animation to loading mode
-				c.WriteWithPayloadTo(os.Stdout, nil)
+				if imgd.err = c.WriteWithPayloadTo(os.Stdout, nil); imgd.err != nil {
+					return
+				}
 			}
 		}
 	}
@@ -400,9 +402,11 @@ func transmit_image(imgd *image_data) {
 	if is_animated {
 		c := frame_control_cmd
 		c.SetAnimationControl(3) // set animation to normal mode
-		c.WriteWithPayloadTo(os.Stdout, nil)
+		if imgd.err = c.WriteWithPayloadTo(os.Stdout, nil); imgd.err != nil {
+			return
+		}
 	}
-	if imgd.move_to.x == 0 {
+	if imgd.move_to.x == 0 && !no_trailing_newline {
 		fmt.Println() // ensure cursor is on new line
 	}
 }

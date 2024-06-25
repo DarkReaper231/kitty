@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2018, Kovid Goyal <kovid at kovidgoyal.net>
 
 import base64
@@ -8,7 +8,7 @@ import re
 import sys
 from contextlib import suppress
 from functools import lru_cache, partial
-from time import monotonic, time_ns
+from time import time_ns
 from types import GeneratorType
 from typing import (
     TYPE_CHECKING,
@@ -19,6 +19,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Sequence,
     Tuple,
     Union,
     cast,
@@ -33,6 +34,7 @@ from .fast_data_types import (
     EllipticCurveKey,
     get_boss,
     get_options,
+    monotonic,
     read_command_response,
     send_data_to_peer,
 )
@@ -51,12 +53,16 @@ def encode_response_for_peer(response: Any) -> bytes:
     return b'\x1bP@kitty-cmd' + json.dumps(response).encode('utf-8') + b'\x1b\\'
 
 
-def parse_cmd(serialized_cmd: str, encryption_key: EllipticCurveKey) -> Dict[str, Any]:
+def parse_cmd(serialized_cmd: memoryview, encryption_key: EllipticCurveKey) -> Dict[str, Any]:
+    # See https://github.com/python/cpython/issues/74379 for why we cant use
+    # memoryview directly :((
     try:
-        pcmd = json.loads(serialized_cmd)
+        pcmd = json.loads(bytes(serialized_cmd))
     except Exception:
+        log_error('Failed to parse JSON payload of remote command, ignoring it')
         return {}
     if not isinstance(pcmd, dict) or 'version' not in pcmd:
+        log_error('JSON payload of remote command is invalid, must be an object with a version field')
         return {}
     pcmd.pop('password', None)
     if 'encrypted' in pcmd:
@@ -102,6 +108,27 @@ def is_cmd_allowed_loader(path: str) -> CMDChecker:
 def fnmatch_pattern(pat: str) -> 're.Pattern[str]':
     from fnmatch import translate
     return re.compile(translate(pat))
+
+
+def remote_control_allowed(
+    pcmd: Dict[str, Any], remote_control_passwords: Optional[Dict[str, Sequence[str]]],
+    window: Optional['Window'], extra_data: Dict[str, Any]
+) -> bool:
+    if not remote_control_passwords:
+        return True
+    pw = pcmd.get('password', '')
+    auth_items = remote_control_passwords.get(pw)
+    if pw == '!':
+        auth_items = None
+    if auth_items is None:
+        if '!' in remote_control_passwords:
+            raise PermissionError()
+        return False
+    from .remote_control import password_authorizer
+    pa = password_authorizer(auth_items)
+    if not pa.is_cmd_allowed(pcmd, window, False, extra_data):
+        raise PermissionError()
+    return True
 
 
 class PasswordAuthorizer:
@@ -153,7 +180,7 @@ def is_cmd_allowed(pcmd: Dict[str, Any], window: Optional['Window'], from_socket
         return True
     if 'cancel_async' in pcmd and pcmd.get('async_id'):
         # we allow these without authentication as they are sent on error
-        # conditions and we cant have users prompted for these. The worst side
+        # conditions and we can't have users prompted for these. The worst side
         # effect of a malicious cancel_async request is that it can prevent
         # another async request from getting a result, if it knows the async_id
         # of that request.
@@ -249,7 +276,8 @@ they will only work if this process is run within a kitty window.
 --password
 A password to use when contacting kitty. This will cause kitty to ask the user
 for permission to perform the specified action, unless the password has been
-accepted before or is pre-configured in :file:`kitty.conf`.
+accepted before or is pre-configured in :file:`kitty.conf`. To use a blank password
+specify :option:`kitten @ --use-password` as :code:`always`.
 
 
 --password-file
@@ -257,14 +285,14 @@ completion=type:file relative:conf kwds:-
 default=rc-pass
 A file from which to read the password. Trailing whitespace is ignored. Relative
 paths are resolved from the kitty configuration directory. Use - to read from STDIN.
-Used if no :option:`kitty @ --password` is supplied. Defaults to checking for the
+Used if no :option:`kitten @ --password` is supplied. Defaults to checking for the
 :file:`rc-pass` file in the kitty configuration directory.
 
 
 --password-env
 default=KITTY_RC_PASSWORD
 The name of an environment variable to read the password from.
-Used if no :option:`kitty @ --password-file` is supplied. Defaults
+Used if no :option:`kitten @ --password-file` is supplied. Defaults
 to checking the environment variable :envvar:`KITTY_RC_PASSWORD`.
 
 
@@ -273,7 +301,7 @@ default=if-available
 choices=if-available,never,always
 If no password is available, kitty will usually just send the remote control command
 without a password. This option can be used to force it to :code:`always` or :code:`never` use
-the supplied password.
+the supplied password. If set to always and no password is provided, the blank password is used.
 '''.format, appname=appname)
 
 

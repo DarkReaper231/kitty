@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -78,7 +80,7 @@ var SetBlockingRead TermiosOperation = SetReadTimeout(0)
 
 var SetRaw TermiosOperation = func(t *unix.Termios) {
 	// This attempts to replicate the behaviour documented for cfmakeraw in
-	// the termios(3) manpage, as Go doesnt wrap cfmakeraw probably because its not in POSIX
+	// the termios(3) manpage, as Go doesn't wrap cfmakeraw probably because its not in POSIX
 	t.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
 	t.Oflag &^= unix.OPOST
 	t.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
@@ -177,6 +179,9 @@ func (self *Term) set_termios_attrs(when uintptr, modify func(*unix.Termios)) (e
 }
 
 func (self *Term) ApplyOperations(when uintptr, operations ...TermiosOperation) (err error) {
+	if len(operations) == 0 {
+		return
+	}
 	return self.set_termios_attrs(when, func(t *unix.Termios) {
 		for _, op := range operations {
 			op(t)
@@ -212,7 +217,7 @@ func (self *Term) Restore() error {
 }
 
 func (self *Term) RestoreAndClose() error {
-	self.Restore()
+	_ = self.Restore()
 	return self.Close()
 }
 
@@ -238,7 +243,9 @@ func (self *Term) SuspendAndRun(callback func() error) error {
 		return err
 	}
 	err = callback()
-	resume()
+	if rerr := resume(); rerr != nil {
+		err = rerr
+	}
 	return err
 }
 
@@ -278,8 +285,19 @@ func (self *Term) ReadWithTimeout(b []byte, d time.Duration) (n int, err error) 
 	}
 }
 
-func (self *Term) Read(b []byte) (int, error) {
-	return self.os_file.Read(b)
+func is_temporary_read_error(err error) bool {
+	return errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK)
+}
+
+func (self *Term) Read(b []byte) (n int, err error) {
+	for {
+		n, err = self.os_file.Read(b)
+		// On macOS we get EAGAIN if another thread is writing to the tty at the same time
+		if err != nil && is_temporary_read_error(err) && n <= 0 {
+			continue
+		}
+		return
+	}
 }
 
 func (self *Term) Write(b []byte) (int, error) {
@@ -321,50 +339,47 @@ func (self *Term) DebugPrintln(a ...any) {
 		chunk := msg[i:end]
 		encoded = encoded[:cap(encoded)]
 		base64.StdEncoding.Encode(encoded, chunk)
-		self.WriteString("\x1bP@kitty-print|")
-		self.Write(encoded)
-		self.WriteString("\x1b\\")
+		_, _ = self.WriteString("\x1bP@kitty-print|")
+		_, _ = self.Write(encoded)
+		_, _ = self.WriteString("\x1b\\")
 	}
 }
 
-func (self *Term) GetSize() (*unix.Winsize, error) {
+func GetSize(fd int) (*unix.Winsize, error) {
 	for {
-		sz, err := unix.IoctlGetWinsize(self.Fd(), unix.TIOCGWINSZ)
+		sz, err := unix.IoctlGetWinsize(fd, unix.TIOCGWINSZ)
 		if err != unix.EINTR {
 			return sz, err
 		}
 	}
 }
 
-// go doesnt have a wrapper for ctermid()
+func (self *Term) GetSize() (*unix.Winsize, error) {
+	return GetSize(self.Fd())
+}
+
+// go doesn't have a wrapper for ctermid()
 func Ctermid() string { return "/dev/tty" }
 
+var KittyStdout = sync.OnceValue(func() *os.File {
+	if fds := os.Getenv(`KITTY_STDIO_FORWARDED`); fds != "" {
+		if fd, err := strconv.Atoi(fds); err == nil && fd > -1 {
+			if f := os.NewFile(uintptr(fd), "<kitty_stdout>"); f != nil {
+				return f
+			}
+		}
+	}
+	return nil
+})
+
 func DebugPrintln(a ...any) {
+	if f := KittyStdout(); f != nil {
+		fmt.Fprintln(f, a...)
+		return
+	}
 	term, err := OpenControllingTerm()
 	if err == nil {
 		defer term.Close()
 		term.DebugPrintln(a...)
-	}
-}
-
-func DrainControllingTTY(wait_for time.Duration) {
-	tty, err := OpenControllingTerm(SetRaw, SetNoEcho)
-	if err != nil {
-		return
-	}
-	sel := utils.CreateSelect(1)
-	sel.RegisterRead(tty.Fd())
-	for {
-		n, err := sel.Wait(wait_for)
-		if err == unix.EINTR {
-			continue
-		}
-		if err != nil {
-			return
-		}
-		if n > 0 && sel.IsReadyToRead(tty.Fd()) {
-			tty.Read(make([]byte, 256))
-		}
-		break
 	}
 }

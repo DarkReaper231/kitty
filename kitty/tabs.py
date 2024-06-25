@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
 import os
@@ -7,10 +7,11 @@ import stat
 import weakref
 from collections import deque
 from contextlib import suppress
+from gettext import gettext as _
 from operator import attrgetter
-from time import monotonic
 from typing import (
     Any,
+    Callable,
     Deque,
     Dict,
     Generator,
@@ -28,7 +29,7 @@ from typing import (
 from .borders import Border, Borders
 from .child import Child
 from .cli_stub import CLIOptions
-from .constants import appname, kitten_exe
+from .constants import appname
 from .fast_data_types import (
     GLFW_MOUSE_BUTTON_LEFT,
     GLFW_MOUSE_BUTTON_MIDDLE,
@@ -43,6 +44,7 @@ from .fast_data_types import (
     get_options,
     last_focused_os_window_id,
     mark_tab_bar_dirty,
+    monotonic,
     next_window_id,
     remove_tab,
     remove_window,
@@ -57,7 +59,7 @@ from .layout.interface import create_layout_object_for, evict_cached_layouts
 from .tab_bar import TabBar, TabBarData
 from .types import ac
 from .typing import EdgeLiteral, SessionTab, SessionType, TypedDict
-from .utils import log_error, platform_window_id, resolved_shell
+from .utils import cmdline_for_hold, log_error, platform_window_id, resolved_shell, shlex_split, which
 from .window import CwdRequest, Watchers, Window, WindowDict
 from .window_list import WindowList
 
@@ -80,6 +82,7 @@ class TabDict(TypedDict):
     layout_opts: Dict[str, Any]
     enabled_layouts: List[str]
     windows: List[WindowDict]
+    groups: List[Dict[str, Any]]
     active_window_history: List[int]
 
 
@@ -93,6 +96,7 @@ class SpecialWindowInstance(NamedTuple):
     env: Optional[Dict[str, str]]
     watchers: Optional[Watchers]
     overlay_behind: bool
+    hold: bool
 
 
 def SpecialWindow(
@@ -104,9 +108,10 @@ def SpecialWindow(
     overlay_for: Optional[int] = None,
     env: Optional[Dict[str, str]] = None,
     watchers: Optional[Watchers] = None,
-    overlay_behind: bool = False
+    overlay_behind: bool = False,
+    hold: bool = False,
 ) -> SpecialWindowInstance:
-    return SpecialWindowInstance(cmd, stdin, override_title, cwd_from, cwd, overlay_for, env, watchers, overlay_behind)
+    return SpecialWindowInstance(cmd, stdin, override_title, cwd_from, cwd, overlay_for, env, watchers, overlay_behind, hold)
 
 
 def add_active_id_to_history(items: Deque[int], item_id: int, maxlen: int = 64) -> None:
@@ -123,6 +128,7 @@ class Tab:  # {{{
     active_bg: Optional[int] = None
     inactive_fg: Optional[int] = None
     inactive_bg: Optional[int] = None
+    confirm_close_window_id: int = 0
 
     def __init__(
         self,
@@ -141,7 +147,7 @@ class Tab:  # {{{
         self.name = getattr(session_tab, 'name', '')
         self.enabled_layouts = [x.lower() for x in getattr(session_tab, 'enabled_layouts', None) or get_options().enabled_layouts]
         self.borders = Borders(self.os_window_id, self.id)
-        self.windows = WindowList(self)
+        self.windows: WindowList = WindowList(self)
         self._last_used_layout: Optional[str] = None
         self._current_layout_name: Optional[str] = None
         self.cwd = self.args.directory
@@ -161,15 +167,24 @@ class Tab:  # {{{
             self._set_current_layout(l0)
             self.startup(session_tab)
 
+    def has_single_window_visible(self) -> bool:
+        if self.current_layout.only_active_window_visible:
+            return True
+        for i, g in enumerate(self.windows.iter_all_layoutable_groups(only_visible=True)):
+            if i > 0:
+                return False
+        return True
+
     def set_enabled_layouts(self, val: Iterable[str]) -> None:
         self.enabled_layouts = [x.lower() for x in val] or ['tall']
         if self.current_layout.name not in self.enabled_layouts:
             self._set_current_layout(self.enabled_layouts[0])
         self.relayout()
 
-    def apply_options(self) -> None:
+    def apply_options(self, is_active: bool) -> None:
+        aw = self.active_window
         for window in self:
-            window.apply_options()
+            window.apply_options(is_active and aw is window)
         self.set_enabled_layouts(get_options().enabled_layouts)
 
     def take_over_from(self, other_tab: 'Tab') -> None:
@@ -206,7 +221,8 @@ class Tab:  # {{{
             if window.resize_spec is not None:
                 self.resize_window(*window.resize_spec)
 
-        self.windows.set_active_window_group_for(self.windows.all_windows[session_tab.active_window_idx])
+        with suppress(IndexError):
+            self.windows.set_active_window_group_for(self.windows.all_windows[session_tab.active_window_idx])
 
     def serialize_state(self) -> Dict[str, Any]:
         return {
@@ -287,15 +303,12 @@ class Tab:  # {{{
     def relayout_borders(self) -> None:
         tm = self.tab_manager_ref()
         if tm is not None:
-            w = self.active_window
             ly = self.current_layout
             self.borders(
                 all_windows=self.windows,
                 current_layout=ly, tab_bar_rects=tm.tab_bar_rects,
                 draw_window_borders=(ly.needs_window_borders and self.windows.num_visble_groups > 1) or ly.must_draw_borders
             )
-            if w is not None:
-                w.change_titlebar_color()
 
     def create_layout_object(self, name: str) -> Layout:
         return create_layout_object_for(name, self.os_window_id, self.id)
@@ -431,6 +444,7 @@ class Tab:  # {{{
         env: Optional[Dict[str, str]] = None,
         is_clone_launch: str = '',
         add_listen_on_env_var: bool = True,
+        hold: bool = False,
     ) -> Child:
         check_for_suitability = True
         if cmd is None:
@@ -446,7 +460,6 @@ class Tab:  # {{{
         if check_for_suitability:
             old_exe = cmd[0]
             if not os.path.isabs(old_exe):
-                from .utils import which
                 actual_exe = which(old_exe)
                 old_exe = actual_exe if actual_exe else os.path.abspath(old_exe)
             try:
@@ -463,18 +476,15 @@ class Tab:  # {{{
                         cwd = old_exe
                         cmd = resolved_shell(get_options())
                     elif not is_executable:
-                        import shlex
-
-                        from .utils import which
                         with suppress(OSError):
                             with open(old_exe) as f:
                                 if f.read(2) == '#!':
                                     line = f.read(4096).splitlines()[0]
-                                    cmd[:0] = shlex.split(line)
+                                    cmd[:0] = shlex_split(line)
                                 else:
                                     cmd[:0] = [resolved_shell(get_options())[0]]
                                 cmd[0] = which(cmd[0]) or cmd[0]
-                                cmd[:0] = [kitten_exe(), '__hold_till_enter__']
+                                cmd = cmdline_for_hold(cmd)
         fenv: Dict[str, str] = {}
         if env:
             fenv.update(env)
@@ -482,7 +492,7 @@ class Tab:  # {{{
         pwid = platform_window_id(self.os_window_id)
         if pwid is not None:
             fenv['WINDOWID'] = str(pwid)
-        ans = Child(cmd, cwd or self.cwd, stdin, fenv, cwd_from, is_clone_launch=is_clone_launch, add_listen_on_env_var=add_listen_on_env_var)
+        ans = Child(cmd, cwd or self.cwd, stdin, fenv, cwd_from, is_clone_launch=is_clone_launch, add_listen_on_env_var=add_listen_on_env_var, hold=hold)
         ans.fork()
         return ans
 
@@ -509,10 +519,12 @@ class Tab:  # {{{
         overlay_behind: bool = False,
         is_clone_launch: str = '',
         remote_control_passwords: Optional[Dict[str, Sequence[str]]] = None,
+        hold: bool = False,
     ) -> Window:
         child = self.launch_child(
             use_shell=use_shell, cmd=cmd, stdin=stdin, cwd_from=cwd_from, cwd=cwd, env=env,
-            is_clone_launch=is_clone_launch, add_listen_on_env_var=False if allow_remote_control and remote_control_passwords else True
+            is_clone_launch=is_clone_launch, add_listen_on_env_var=False if allow_remote_control and remote_control_passwords else True,
+            hold=hold,
         )
         window = Window(
             self, child, self.args, override_title=override_title,
@@ -542,7 +554,8 @@ class Tab:  # {{{
             override_title=special_window.override_title,
             cwd_from=special_window.cwd_from, cwd=special_window.cwd, overlay_for=special_window.overlay_for,
             env=special_window.env, location=location, copy_colors_from=copy_colors_from,
-            allow_remote_control=allow_remote_control, watchers=special_window.watchers, overlay_behind=special_window.overlay_behind
+            allow_remote_control=allow_remote_control, watchers=special_window.watchers, overlay_behind=special_window.overlay_behind,
+            hold=special_window.hold,
         )
 
     @ac('win', 'Close all windows in the tab other than the currently active window')
@@ -772,13 +785,17 @@ class Tab:  # {{{
     def move_window_backward(self) -> None:
         self.move_window(-1)
 
-    def list_windows(self, self_window: Optional[Window] = None) -> Generator[WindowDict, None, None]:
+    def list_windows(self, self_window: Optional[Window] = None, window_filter: Optional[Callable[[Window], bool]] = None) -> Generator[WindowDict, None, None]:
         active_window = self.active_window
         for w in self:
-            yield w.as_dict(
-                is_active=w is active_window,
-                is_focused=w.os_window_id == current_focused_os_window_id() and w is active_window,
-                is_self=w is self_window)
+            if window_filter is None or window_filter(w):
+                yield w.as_dict(
+                    is_active=w is active_window,
+                    is_focused=w.os_window_id == current_focused_os_window_id() and w is active_window,
+                    is_self=w is self_window)
+
+    def list_groups(self) -> List[Dict[str, Any]]:
+        return [g.as_simple_dict() for g in self.windows.groups]
 
     def matches_query(self, field: str, query: str, active_tab_manager: Optional['TabManager'] = None) -> bool:
         if field == 'title':
@@ -848,12 +865,13 @@ class Tab:  # {{{
 
 class TabManager:  # {{{
 
+    confirm_close_window_id: int = 0
+
     def __init__(self, os_window_id: int, args: CLIOptions, wm_class: str, wm_name: str, startup_session: Optional[SessionType] = None):
         self.os_window_id = os_window_id
         self.wm_class = wm_class
         self.recent_mouse_events: Deque[TabMouseEvent] = deque()
         self.wm_name = wm_name
-        self.last_active_tab_id = None
         self.args = args
         self.tab_bar_hidden = get_options().tab_bar_style == 'hidden'
         self.tabs: List[Tab] = []
@@ -973,6 +991,19 @@ class TabManager:  # {{{
         if len(self.tabs) > 1:
             self.set_active_tab_idx((self.active_tab_idx + len(self.tabs) + delta) % len(self.tabs))
 
+    def toggle_tab(self, match_expression: str) -> None:
+        tabs = set(get_boss().match_tabs(match_expression)) & set(self)
+        if not tabs:
+            get_boss().show_error(_('No matching tab'), _('No tab found matching the expression: {}').format(match_expression))
+            return
+        if self.active_tab and self.active_tab in tabs:
+            self.goto_tab(-1)
+        else:
+            for x in self:
+                if x in tabs:
+                    self.set_active_tab(x)
+                    break
+
     def tab_at_location(self, loc: str) -> Optional[Tab]:
         if loc == 'prev':
             if self.active_tab_history:
@@ -1013,21 +1044,29 @@ class TabManager:  # {{{
     def __len__(self) -> int:
         return len(self.tabs)
 
-    def list_tabs(self, self_window: Optional[Window] = None) -> Generator[TabDict, None, None]:
+    def list_tabs(
+        self, self_window: Optional[Window] = None,
+        tab_filter: Optional[Callable[[Tab], bool]] = None,
+        window_filter: Optional[Callable[[Window], bool]] = None
+    ) -> Generator[TabDict, None, None]:
         active_tab = self.active_tab
         for tab in self:
-            yield {
-                'id': tab.id,
-                'is_focused': tab is active_tab and tab.os_window_id == current_focused_os_window_id(),
-                'is_active': tab is active_tab,
-                'title': tab.name or tab.title,
-                'layout': str(tab.current_layout.name),
-                'layout_state': tab.current_layout.layout_state(),
-                'layout_opts': tab.current_layout.layout_opts.serialized(),
-                'enabled_layouts': tab.enabled_layouts,
-                'windows': list(tab.list_windows(self_window)),
-                'active_window_history': list(tab.windows.active_window_history),
-            }
+            if tab_filter is None or tab_filter(tab):
+                windows = list(tab.list_windows(self_window, window_filter))
+                if windows:
+                    yield {
+                        'id': tab.id,
+                        'is_focused': tab is active_tab and tab.os_window_id == current_focused_os_window_id(),
+                        'is_active': tab is active_tab,
+                        'title': tab.name or tab.title,
+                        'layout': str(tab.current_layout.name),
+                        'layout_state': tab.current_layout.layout_state(),
+                        'layout_opts': tab.current_layout.layout_opts.serialized(),
+                        'enabled_layouts': tab.enabled_layouts,
+                        'windows': windows,
+                        'groups': tab.list_groups(),
+                        'active_window_history': list(tab.windows.active_window_history),
+                    }
 
     def serialize_state(self) -> Dict[str, Any]:
         return {
@@ -1218,8 +1257,9 @@ class TabManager:  # {{{
         del self.tabs
 
     def apply_options(self) -> None:
+        at = self.active_tab
         for tab in self:
-            tab.apply_options()
+            tab.apply_options(at is tab)
         self.tab_bar_hidden = get_options().tab_bar_style == 'hidden'
         self.tab_bar.apply_options()
         self.update_tab_bar_data()

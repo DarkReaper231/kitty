@@ -24,19 +24,24 @@ import (
 	"kitty/tools/tui"
 	"kitty/tools/tui/loop"
 	"kitty/tools/utils"
+	"kitty/tools/utils/base85"
 	"kitty/tools/utils/shlex"
-
-	"github.com/jamesruan/go-rfc1924/base85"
 )
 
 const lowerhex = "0123456789abcdef"
 
 var ProtocolVersion [3]int = [3]int{0, 26, 0}
 
+type password struct {
+	val    string
+	is_set bool
+}
+
 type GlobalOptions struct {
-	to_network, to_address, password string
-	to_address_is_from_env_var       bool
-	already_setup                    bool
+	to_network, to_address     string
+	password                   password
+	to_address_is_from_env_var bool
+	already_setup              bool
 }
 
 var global_options GlobalOptions
@@ -52,14 +57,6 @@ func escape_list_of_strings(args []string) []escaped_string {
 	ans := make([]escaped_string, len(args))
 	for i, x := range args {
 		ans[i] = escaped_string(x)
-	}
-	return ans
-}
-
-func escape_dict_of_strings(args map[string]string) map[escaped_string]escaped_string {
-	ans := make(map[escaped_string]escaped_string, len(args))
-	for k, v := range args {
-		ans[escaped_string(k)] = escaped_string(v)
 	}
 	return ans
 }
@@ -144,25 +141,15 @@ func simple_serializer(rc *utils.RemoteControlCmd) (ans []byte, err error) {
 
 type serializer_func func(rc *utils.RemoteControlCmd) ([]byte, error)
 
-func debug_to_log(args ...any) {
-	f, err := os.OpenFile("/tmp/kdlog", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
-	if err == nil {
-		fmt.Fprintln(f, args...)
-		f.Close()
-	}
-}
-
-var serializer serializer_func = simple_serializer
-
-func create_serializer(password string, encoded_pubkey string, io_data *rc_io_data) (err error) {
+func create_serializer(password password, encoded_pubkey string, io_data *rc_io_data) (err error) {
 	io_data.serializer = simple_serializer
-	if password != "" {
+	if password.is_set {
 		encryption_version, pubkey, err := get_pubkey(encoded_pubkey)
 		if err != nil {
 			return err
 		}
 		io_data.serializer = func(rc *utils.RemoteControlCmd) (ans []byte, err error) {
-			ec, err := crypto.Encrypt_cmd(rc, global_options.password, pubkey, encryption_version)
+			ec, err := crypto.Encrypt_cmd(rc, global_options.password.val, pubkey, encryption_version)
 			if err != nil {
 				return
 			}
@@ -208,6 +195,7 @@ type rc_io_data struct {
 	serializer                 serializer_func
 	on_key_event               func(lp *loop.Loop, ke *loop.KeyEvent) error
 	string_response_is_err     bool
+	handle_response            func(data []byte) error
 	timeout                    time.Duration
 	multiple_payload_generator func(io_data *rc_io_data) (bool, error)
 
@@ -241,10 +229,10 @@ func get_response(do_io func(io_data *rc_io_data) ([]byte, error), io_data *rc_i
 			io_data.multiple_payload_generator = nil
 			io_data.rc.NoResponse = true
 			io_data.chunks_done = false
-			do_io(io_data)
+			_, _ = do_io(io_data)
 			err = fmt.Errorf("Timed out waiting for a response from kitty")
 		}
-		return
+		return nil, err
 	}
 	if len(serialized_response) == 0 {
 		if io_data.rc.NoResponse {
@@ -265,6 +253,16 @@ func get_response(do_io func(io_data *rc_io_data) ([]byte, error), io_data *rc_i
 	return
 }
 
+var running_shell = false
+
+type exit_error struct {
+	exit_code int
+}
+
+func (m *exit_error) Error() string {
+	return fmt.Sprintf("Subprocess exit with code: %d", m.exit_code)
+}
+
 func send_rc_command(io_data *rc_io_data) (err error) {
 	err = setup_global_options(io_data.cmd)
 	if err != nil {
@@ -279,25 +277,18 @@ func send_rc_command(io_data *rc_io_data) (err error) {
 		return
 	}
 	var response *Response
-	if global_options.to_network == "" {
-		response, err = get_response(do_tty_io, io_data)
-		if err != nil {
-			return
-		}
-	} else {
-		response, err = get_response(do_socket_io, io_data)
-		if err != nil {
-			return
-		}
-	}
+	response, err = get_response(utils.IfElse(global_options.to_network == "", do_tty_io, do_socket_io), io_data)
 	if err != nil || response == nil {
-		return err
+		return
 	}
 	if !response.Ok {
 		if response.Traceback != "" {
 			fmt.Fprintln(os.Stderr, response.Traceback)
 		}
 		return fmt.Errorf("%s", response.Error)
+	}
+	if io_data.handle_response != nil {
+		return io_data.handle_response(utils.UnsafeStringToBytes(response.Data.as_str))
 	}
 	if response.Data.is_string && io_data.string_response_is_err {
 		return fmt.Errorf("%s", response.Data.as_str)
@@ -308,25 +299,26 @@ func send_rc_command(io_data *rc_io_data) (err error) {
 	return
 }
 
-func get_password(password string, password_file string, password_env string, use_password string) (ans string, err error) {
+func get_password(password string, password_file string, password_env string, use_password string) (ans password, err error) {
 	if use_password == "never" {
 		return
 	}
 	if password != "" {
-		ans = password
+		ans.is_set, ans.val = true, password
 	}
-	if ans == "" && password_file != "" {
+	if !ans.is_set && password_file != "" {
 		if password_file == "-" {
 			if tty.IsTerminal(os.Stdin.Fd()) {
-				ans, err = tui.ReadPassword("Password: ", true)
+				p, err := tui.ReadPassword("Password: ", true)
 				if err != nil {
-					return
+					return ans, err
 				}
+				ans.is_set, ans.val = true, p
 			} else {
 				var q []byte
 				q, err = io.ReadAll(os.Stdin)
 				if err == nil {
-					ans = strings.TrimRight(string(q), " \n\t")
+					ans.is_set, ans.val = true, strings.TrimRight(string(q), " \n\t")
 				}
 				ttyf, err := os.Open(tty.Ctermid())
 				if err == nil {
@@ -338,7 +330,7 @@ func get_password(password string, password_file string, password_env string, us
 			var q []byte
 			q, err = os.ReadFile(password_file)
 			if err == nil {
-				ans = strings.TrimRight(string(q), " \n\t")
+				ans.is_set, ans.val = true, strings.TrimRight(string(q), " \n\t")
 			} else {
 				if errors.Is(err, os.ErrNotExist) {
 					err = nil
@@ -349,13 +341,14 @@ func get_password(password string, password_file string, password_env string, us
 			return
 		}
 	}
-	if ans == "" && password_env != "" {
-		ans = os.Getenv(password_env)
+	if !ans.is_set && password_env != "" {
+		ans.val, ans.is_set = os.LookupEnv(password_env)
 	}
-	if ans == "" && use_password == "always" {
-		return ans, fmt.Errorf("No password was found")
+	if !ans.is_set && use_password == "always" {
+		ans.is_set = true
+		return ans, nil
 	}
-	if len(ans) > 1024 {
+	if len(ans.val) > 1024 {
 		return ans, fmt.Errorf("Specified password is too long")
 	}
 	return ans, nil

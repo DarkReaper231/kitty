@@ -13,11 +13,11 @@ from kitty.types import AsyncResponse
 
 if TYPE_CHECKING:
     from kitty.boss import Boss as B
-    from kitty.tabs import Tab
+    from kitty.tabs import Tab as T
     from kitty.window import Window as W
     Window = W
     Boss = B
-    Tab
+    Tab = T
 else:
     Boss = Window = Tab = None
 RCOptions = R
@@ -29,6 +29,11 @@ class NoResponse:
 
 class RemoteControlError(Exception):
     pass
+
+
+class RemoteControlErrorWithoutTraceback(Exception):
+
+    hide_traceback = True
 
 
 class MatchError(ValueError):
@@ -83,7 +88,7 @@ MATCH_WINDOW_OPTION = '''\
 --match -m
 The window to match. Match specifications are of the form: :italic:`field:query`.
 Where :italic:`field` can be one of: :code:`id`, :code:`title`, :code:`pid`, :code:`cwd`, :code:`cmdline`, :code:`num`,
-:code:`env`, :code:`state` and :code:`recent`.
+:code:`env`, :code:`var`, :code:`state`, :code:`neighbor`, and :code:`recent`.
 :italic:`query` is the expression to match. Expressions can be either a number or a regular expression, and can be
 :ref:`combined using Boolean operators <search_syntax>`.
 
@@ -94,15 +99,21 @@ a number, not a regular expression. Negative values for :code:`id` match from th
 -1 is the most recently created window.
 
 The field :code:`num` refers to the window position in the current tab, starting from zero and counting clockwise (this
-is the same as the order in which the windows are reported by the :ref:`kitty @ ls <at-ls>` command).
+is the same as the order in which the windows are reported by the :ref:`kitten @ ls <at-ls>` command).
 
 The window id of the current window is available as the :envvar:`KITTY_WINDOW_ID` environment variable.
 
 The field :code:`recent` refers to recently active windows in the currently active tab, with zero being the currently
 active window, one being the previously active window and so on.
 
+The field :code:`neighbor` refers to a neighbor of the active window in the specified direction, which can be:
+:code:`left`, :code:`right`, :code:`top` or :code:`bottom`.
+
 When using the :code:`env` field to match on environment variables, you can specify only the environment variable name
 or a name and value, for example, :code:`env:MY_ENV_VAR=2`.
+
+Similarly, the :code:`var` field matches on user variables set on the window. You can specify name or name and value
+as with the :code:`env` field.
 
 The field :code:`state` matches on the state of the window. Supported states
 are: :code:`active`, :code:`focused`, :code:`needs_attention`,
@@ -115,13 +126,13 @@ remote control command is run. The value :code:`overlay_parent` matches the
 window that is under the :code:`self` window, when the self window is an
 overlay.
 
-Note that you can use the :ref:`kitty @ ls <at-ls>` command to get a list of windows.
+Note that you can use the :ref:`kitten @ ls <at-ls>` command to get a list of windows.
 '''
 MATCH_TAB_OPTION = '''\
 --match -m
 The tab to match. Match specifications are of the form: :italic:`field:query`.
 Where :italic:`field` can be one of: :code:`id`, :code:`index`, :code:`title`, :code:`window_id`, :code:`window_title`,
-:code:`pid`, :code:`cwd`, :code:`cmdline` :code:`env`, :code:`state` and :code:`recent`.
+:code:`pid`, :code:`cwd`, :code:`cmdline` :code:`env`, :code:`var`, :code:`state` and :code:`recent`.
 :italic:`query` is the expression to match. Expressions can be either a number or a regular expression, and can be
 :ref:`combined using Boolean operators <search_syntax>`.
 
@@ -143,14 +154,14 @@ active tab, one the previously active tab and so on.
 
 When using the :code:`env` field to match on environment variables, you can specify only the environment variable name
 or a name and value, for example, :code:`env:MY_ENV_VAR=2`. Tabs containing any window with the specified environment
-variables are matched.
+variables are matched. Similarly, :code:`var` matches tabs containing any window with the specified user variable.
 
 The field :code:`state` matches on the state of the tab. Supported states are:
 :code:`active`, :code:`focused`, :code:`needs_attention`, :code:`parent_active` and :code:`parent_focused`.
 Active tabs are the tabs that are active in their parent OS window. There is only one focused tab
 and it is the tab to which keyboard events are delivered. If no tab is focused, the last focused tab is matched.
 
-Note that you can use the :ref:`kitty @ ls <at-ls>` command to get a list of tabs.
+Note that you can use the :ref:`kitten @ ls <at-ls>` command to get a list of tabs.
 '''
 
 
@@ -213,7 +224,10 @@ class ArgsHandling:
                 yield f'args = append(args, "{x}")'
             yield '}'
         if self.minimum_count > -1:
-            yield f'if len(args) < {self.minimum_count} {{ return fmt.Errorf("%s", "Must specify at least {self.minimum_count} arguments to {cmd_name}") }}'
+            if self.minimum_count == 1:
+                yield f'if len(args) < {self.minimum_count} {{ return fmt.Errorf("%s", "Must specify at least one argument to {cmd_name}") }}'
+            else:
+                yield f'if len(args) < {self.minimum_count} {{ return fmt.Errorf("%s", "Must specify at least {self.minimum_count} arguments to {cmd_name}") }}'
         if self.args_choices:
             achoices = tuple(self.args_choices())
             yield 'achoices := map[string]bool{' + ' '.join(f'"{x}":true,' for x in achoices) + '}'
@@ -237,7 +251,10 @@ class ArgsHandling:
                 elif self.special_parse.startswith('+'):
                     fields, sp = self.special_parse[1:].split(':', 1)
                     handled_fields.update(set(fields.split(',')))
-                    yield f'err = {sp}'
+                    if sp.startswith('!'):
+                        yield f'io_data.multiple_payload_generator, err = {sp[1:]}'
+                    else:
+                        yield f'err = {sp}'
                 else:
                     yield f'{dest}, err = {self.special_parse}'
                 yield 'if err != nil { return err }'
@@ -317,6 +334,7 @@ class RemoteCommand:
     argspec = args_count = args_completion = ArgsHandling()
     field_to_option_map: Optional[Dict[str, str]] = None
     reads_streaming_data: bool = False
+    disallow_responses: bool = False
 
     def __init__(self) -> None:
         self.desc = self.desc or self.short_desc
@@ -369,20 +387,24 @@ class RemoteCommand:
             return [t]
         return []
 
-    def windows_for_payload(self, boss: 'Boss', window: Optional['Window'], payload_get: PayloadGetType) -> List['Window']:
+    def windows_for_payload(
+        self, boss: 'Boss', window: Optional['Window'], payload_get: PayloadGetType,
+        window_match_name: str = 'match_window', tab_match_name: str = 'match_tab',
+    ) -> List['Window']:
         if payload_get('all'):
             windows = list(boss.all_windows)
         else:
             window = window or boss.active_window
             windows = [window] if window else []
-            if payload_get('match_window'):
-                windows = list(boss.match_windows(payload_get('match_window')))
+            if payload_get(window_match_name):
+                windows = list(boss.match_windows(payload_get(window_match_name)))
                 if not windows:
-                    raise MatchError(payload_get('match_window'))
-            if payload_get('match_tab'):
-                tabs = tuple(boss.match_tabs(payload_get('match_tab')))
+                    raise MatchError(payload_get(window_match_name))
+            if payload_get(tab_match_name):
+                tabs = tuple(boss.match_tabs(payload_get(tab_match_name)))
                 if not tabs:
-                    raise MatchError(payload_get('match_tab'), 'tabs')
+                    raise MatchError(payload_get(tab_match_name), 'tabs')
+                windows = []
                 for tab in tabs:
                     windows += list(tab)
         return windows

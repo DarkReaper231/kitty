@@ -1,18 +1,25 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPLv3 Copyright: 2019, Kovid Goyal <kovid at kovidgoyal.net>
 
 import re
 from base64 import standard_b64decode
 from collections import OrderedDict
+from contextlib import suppress
+from enum import Enum
 from itertools import count
 from typing import Callable, Dict, Optional
 
 from .constants import is_macos, logo_png_file
-from .fast_data_types import get_boss
+from .fast_data_types import current_focused_os_window_id, get_boss
 from .types import run_once
-from .utils import log_error
+from .utils import get_custom_window_icon, log_error
 
-NotifyImplementation = Callable[[str, str, str], None]
+
+class Urgency(Enum):
+    Low: int = 0
+    Normal: int = 1
+    Critical: int = 2
+
 
 if is_macos:
     from .fast_data_types import cocoa_send_notification
@@ -25,8 +32,9 @@ if is_macos:
         icon: bool = True,
         identifier: Optional[str] = None,
         subtitle: Optional[str] = None,
+        urgency: Urgency = Urgency.Normal,
     ) -> None:
-        cocoa_send_notification(identifier, title, body, subtitle)
+        cocoa_send_notification(identifier, title, body, subtitle, urgency.value)
 
 else:
 
@@ -54,17 +62,27 @@ else:
         icon: bool = True,
         identifier: Optional[str] = None,
         subtitle: Optional[str] = None,
+        urgency: Urgency = Urgency.Normal,
     ) -> None:
         icf = ''
         if icon is True:
-            icf = logo_png_file
-        alloc_id = dbus_send_notification(application, icf, title, body, 'Click to see changes', timeout)
+            icf = get_custom_window_icon()[1] or logo_png_file
+        alloc_id = dbus_send_notification(application, icf, title, body, 'Click to see changes', timeout, urgency.value)
         if alloc_id and identifier is not None:
             alloc_map[alloc_id] = identifier
 
+class NotifyImplementation:
+    def __call__(self, title: str, body: str, identifier: str, urgency: Urgency = Urgency.Normal) -> None:
+        notify(title, body, identifier=identifier, urgency=urgency)
 
-def notify_implementation(title: str, body: str, identifier: str) -> None:
-    notify(title, body, identifier=identifier)
+notify_implementation = NotifyImplementation()
+
+
+class OnlyWhen(Enum):
+    unset = ''
+    always = 'always'
+    unfocused = 'unfocused'
+    invisible = 'invisible'
 
 
 class NotificationCommand:
@@ -74,9 +92,13 @@ class NotificationCommand:
     title: str = ''
     body: str = ''
     actions: str = ''
+    only_when: OnlyWhen = OnlyWhen.unset
+    urgency: Optional[Urgency] = None
 
     def __repr__(self) -> str:
-        return f'NotificationCommand(identifier={self.identifier!r}, title={self.title!r}, body={self.body!r}, actions={self.actions!r}, done={self.done!r})'
+        return (
+            f'NotificationCommand(identifier={self.identifier!r}, title={self.title!r}, body={self.body!r},'
+            f'actions={self.actions!r}, done={self.done!r}, urgency={self.urgency})')
 
 
 def parse_osc_9(raw: str) -> NotificationCommand:
@@ -125,6 +147,12 @@ def parse_osc_99(raw: str) -> NotificationCommand:
                 cmd.done = v != '0'
             elif k == 'a':
                 cmd.actions += f',{v}'
+            elif k == 'o':
+                with suppress(ValueError):
+                    cmd.only_when = OnlyWhen(v)
+            elif k == 'u':
+                with suppress(Exception):
+                    cmd.urgency = Urgency(int(v))
     if payload_type not in ('body', 'title'):
         log_error(f'Malformed OSC 99: unknown payload type: {payload_type}')
         return NotificationCommand()
@@ -153,6 +181,10 @@ def merge_osc_99(prev: NotificationCommand, cmd: NotificationCommand) -> Notific
     cmd.actions = limit_size(f'{prev.actions},{cmd.actions}')
     cmd.title = limit_size(prev.title + cmd.title)
     cmd.body = limit_size(prev.body + cmd.body)
+    if cmd.only_when is OnlyWhen.unset:
+        cmd.only_when = prev.only_when
+    if cmd.urgency is None:
+        cmd.urgency = prev.urgency
     return cmd
 
 
@@ -208,9 +240,23 @@ def reset_registry() -> None:
 def notify_with_command(cmd: NotificationCommand, window_id: int, notify_implementation: NotifyImplementation = notify_implementation) -> None:
     title = cmd.title or cmd.body
     body = cmd.body if cmd.title else ''
+    if not title:
+        return
+    urgency = Urgency.Normal if cmd.urgency is None else cmd.urgency
+    if cmd.only_when is not OnlyWhen.always and cmd.only_when is not OnlyWhen.unset:
+        w = get_boss().window_id_map.get(window_id)
+        if w is None:
+            return
+        boss = get_boss()
+        window_has_keyboard_focus = w.is_active and w.os_window_id == current_focused_os_window_id()
+        if window_has_keyboard_focus:
+            return
+        if cmd.only_when is OnlyWhen.invisible:
+            if w.os_window_id == current_focused_os_window_id() and w.tabref() is boss.active_tab and w.is_visible_in_layout:
+                return  # window is in the active OS window and the active tab and is visible in the tab layout
     if title:
         identifier = f'i{next(id_counter)}'
-        notify_implementation(title, body, identifier)
+        notify_implementation(title, body, identifier, urgency)
         register_identifier(identifier, cmd, window_id)
 
 

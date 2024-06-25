@@ -91,11 +91,17 @@ class WindowGroup:
             'windows': [w.serialize_state() for w in self.windows]
         }
 
+    def as_simple_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'windows': [w.id for w in self.windows],
+        }
+
     def decoration(self, which: EdgeLiteral, border_mult: int = 1, is_single_window: bool = False) -> int:
         if not self.windows:
             return 0
         w = self.windows[0]
-        return w.effective_margin(which, is_single_window=is_single_window) + w.effective_border() * border_mult + w.effective_padding(which)
+        return w.effective_margin(which) + w.effective_border() * border_mult + w.effective_padding(which)
 
     def effective_padding(self, which: EdgeLiteral) -> int:
         if not self.windows:
@@ -393,6 +399,12 @@ class WindowList:
             n = max(0, min(n, self.num_groups - 1))
         if 0 <= n < self.num_groups:
             return self.id_map.get(self.groups[n].active_window_id)
+        return None
+
+    def active_window_in_group_id(self, group_id: int) -> Optional[WindowType]:
+        for g in self.groups:
+            if g.id == group_id:
+                return self.id_map.get(g.active_window_id)
         return None
 
     def activate_next_window_group(self, delta: int) -> None:

@@ -30,7 +30,7 @@ type file_based_mmap struct {
 
 func file_mmap(f *os.File, size uint64, access AccessFlags, truncate bool, special_name string) (MMap, error) {
 	if truncate {
-		err := truncate_or_unlink(f, size)
+		err := truncate_or_unlink(f, size, os.Remove)
 		if err != nil {
 			return nil, err
 		}
@@ -48,9 +48,9 @@ func (self *file_based_mmap) Seek(offset int64, whence int) (ret int64, err erro
 	switch whence {
 	case io.SeekStart:
 		self.pos = offset
-	case os.SEEK_END:
+	case io.SeekEnd:
 		self.pos = int64(len(self.region)) + offset
-	case os.SEEK_CUR:
+	case io.SeekCurrent:
 		self.pos += offset
 	}
 	return self.pos, nil

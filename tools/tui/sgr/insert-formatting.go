@@ -4,6 +4,7 @@ package sgr
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -11,8 +12,6 @@ import (
 	"kitty/tools/utils"
 	"kitty/tools/utils/style"
 	"kitty/tools/wcswidth"
-
-	"golang.org/x/exp/slices"
 )
 
 var _ = fmt.Print
@@ -447,7 +446,7 @@ func InsertFormatting(text string, spans ...*Span) string {
 	var in_span *Span
 	ans := make([]byte, 0, 2*len(text))
 	var overall_sgr_state SGR
-	slices.SortFunc(spans, func(a, b *Span) bool { return a.Offset < b.Offset })
+	slices.SortFunc(spans, func(a, b *Span) int { return a.Offset - b.Offset })
 	text_len := 0
 	var ep *wcswidth.EscapeCodeParser
 

@@ -19,7 +19,7 @@ class SetWindowTitle(RemoteCommand):
 
     short_desc = 'Set the window title'
     desc = (
-        'Set the title for the specified windows. If you use the :option:`kitty @ set-window-title --match` option'
+        'Set the title for the specified windows. If you use the :option:`kitten @ set-window-title --match` option'
         ' the title will be set for all matched windows. By default, only the window'
         ' in which the command is run is affected. If you do not specify a title, the'
         ' last title set by the child process running in the window will be used.'
@@ -42,13 +42,16 @@ again. If you want to allow other programs to change it afterwards, use this opt
         return ans
 
     def response_from_kitty(self, boss: Boss, window: Optional[Window], payload_get: PayloadGetType) -> ResponseType:
+        title = payload_get('title')
+        if payload_get('temporary') and title is not None:
+            title = memoryview(title.encode('utf-8'))
         for window in self.windows_for_match_payload(boss, window, payload_get):
             if window:
                 if payload_get('temporary'):
                     window.override_title = None
-                    window.title_changed(payload_get('title'))
+                    window.title_changed(title)
                 else:
-                    window.set_title(payload_get('title'))
+                    window.set_title(title)
         return None
 
 

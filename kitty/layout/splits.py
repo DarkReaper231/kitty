@@ -165,6 +165,36 @@ class Pair:
             return id_window_map[wid].effective_border()
         return 0
 
+    def minimum_width(self, id_window_map: Dict[int, WindowGroup]) -> int:
+        if self.one is None or self.two is None or not self.horizontal:
+            return lgd.cell_width
+        bw = self.effective_border(id_window_map) if lgd.draw_minimal_borders else 0
+        ans = 2 * bw
+        if isinstance(self.one, Pair):
+            ans += self.one.minimum_width(id_window_map)
+        else:
+            ans += lgd.cell_width
+        if isinstance(self.two, Pair):
+            ans += self.two.minimum_width(id_window_map)
+        else:
+            ans += lgd.cell_width
+        return ans
+
+    def minimum_height(self, id_window_map: Dict[int, WindowGroup]) -> int:
+        if self.one is None or self.two is None or self.horizontal:
+            return lgd.cell_height
+        bw = self.effective_border(id_window_map) if lgd.draw_minimal_borders else 0
+        ans = 2 * bw
+        if isinstance(self.one, Pair):
+            ans += self.one.minimum_height(id_window_map)
+        else:
+            ans += lgd.cell_height
+        if isinstance(self.two, Pair):
+            ans += self.two.minimum_height(id_window_map)
+        else:
+            ans += lgd.cell_height
+        return ans
+
     def layout_pair(
         self,
         left: int, top: int, width: int, height: int,
@@ -191,8 +221,13 @@ class Pair:
             self.apply_window_geometry(q, geom, id_window_map, layout_object)
             return
         if self.horizontal:
-            w1 = max(2*lgd.cell_width + 1, int(self.bias * width) - bw)
-            w2 = max(2*lgd.cell_width + 1, width - w1 - bw2)
+            min_w1 = self.one.minimum_width(id_window_map) if isinstance(self.one, Pair) else lgd.cell_width
+            min_w2 = self.two.minimum_width(id_window_map) if isinstance(self.two, Pair) else lgd.cell_width
+            w1 = max(min_w1, int(self.bias * width) - bw)
+            w2 = width - w1 - bw2
+            if w2 < min_w2 and w1 >= min_w1 + bw2:
+                w2 = min_w2
+                w1 = width - w2
             self.first_extent = Extent(max(0, left - bw), left + w1 + bw)
             self.second_extent = Extent(left + w1 + bw, left + width + bw)
             if isinstance(self.one, Pair):
@@ -217,8 +252,13 @@ class Pair:
                 geom = window_geometry_from_layouts(xl, yl)
                 self.apply_window_geometry(self.two, geom, id_window_map, layout_object)
         else:
-            h1 = max(2*lgd.cell_height + 1, int(self.bias * height) - bw)
-            h2 = max(2*lgd.cell_height + 1, height - h1 - bw2)
+            min_h1 = self.one.minimum_height(id_window_map) if isinstance(self.one, Pair) else lgd.cell_height
+            min_h2 = self.two.minimum_height(id_window_map) if isinstance(self.two, Pair) else lgd.cell_height
+            h1 = max(min_h1, int(self.bias * height) - bw)
+            h2 = height - h1 - bw2
+            if h2 < min_h2 and h1 >= min_h1 + bw2:
+                h2 = min_h2
+                h1 = height - h2
             self.first_extent = Extent(max(0, top - bw), top + h1 + bw)
             self.second_extent = Extent(top + h1 + bw, top + height + bw)
             if isinstance(self.one, Pair):
@@ -247,7 +287,7 @@ class Pair:
         if is_horizontal == self.horizontal and not self.is_redundant:
             if which == 2:
                 increment *= -1
-            new_bias = max(0.1, min(self.bias + increment, 0.9))
+            new_bias = max(0, min(self.bias + increment, 1))
             if new_bias != self.bias:
                 self.bias = new_bias
                 return True
@@ -517,6 +557,17 @@ class Splits(Layout):
         if pair is not None:
             pair.neighbors_for_window(wg.id, ans, self, all_windows)
         return ans
+
+    def move_window(self, all_windows: WindowList, delta: int = 1) -> bool:
+        before = all_windows.active_group
+        if before is None:
+            return False
+        before_idx = all_windows.active_group_idx
+        moved = super().move_window(all_windows, delta)
+        after = all_windows.groups[before_idx]
+        if moved and before.id != after.id:
+            self.pairs_root.swap_windows(before.id, after.id)
+        return moved
 
     def move_window_to_group(self, all_windows: WindowList, group: int) -> bool:
         before = all_windows.active_group

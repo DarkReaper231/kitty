@@ -4,14 +4,15 @@
 import importlib
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from contextlib import contextmanager
 from functools import lru_cache
 from tempfile import TemporaryDirectory
+from threading import Thread
 from typing import (
     Any,
     Callable,
@@ -26,11 +27,13 @@ from typing import (
     Tuple,
 )
 
+from . import BaseTest
+
 
 def contents(package: str) -> Iterator[str]:
     try:
         if sys.version_info[:2] < (3, 10):
-            raise ImportError('importlib.resources.files() doesnt work with frozen builds on python 3.9')
+            raise ImportError("importlib.resources.files() doesn't work with frozen builds on python 3.9")
         from importlib.resources import files
     except ImportError:
         from importlib.resources import contents
@@ -113,7 +116,11 @@ def run_cli(suite: unittest.TestSuite, verbosity: int = 4) -> bool:
     r.resultclass = unittest.TextTestResult
     runner = r(verbosity=verbosity)
     runner.tb_locals = True  # type: ignore
-    result = runner.run(suite)
+    from . import forwardable_stdio
+    with forwardable_stdio():
+        result = runner.run(suite)
+    sys.stdout.flush()
+    sys.stderr.flush()
     return result.wasSuccessful()
 
 
@@ -139,18 +146,51 @@ def go_exe() -> str:
     return shutil.which('go') or ''
 
 
-def run_go(packages: Set[str], names: str) -> 'subprocess.Popen[bytes]':
+class GoProc(Thread):
+
+    def __init__(self, cmd: List[str]):
+        super().__init__(name='GoProc')
+        from kitty.constants import kitty_exe
+        env = os.environ.copy()
+        env['KITTY_PATH_TO_KITTY_EXE'] = kitty_exe()
+        self.stdout = b''
+        self.start_time = time.monotonic()
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+        self.start()
+
+    @property
+    def runtime(self):
+        return self.end_time - self.start_time
+
+    @property
+    def returncode(self):
+        return self.proc.returncode
+
+    def run(self) -> None:
+        self.stdout, _ = self.proc.communicate()
+        self.proc.stdout.close()
+
+    def wait(self, timeout=None) -> None:
+        try:
+            self.join(timeout)
+        except KeyboardInterrupt:
+            self.proc.terminate()
+            if self.proc.wait(0.1) is None:
+                self.proc.kill()
+        self.join()
+        self.end_time = time.monotonic()
+        return self.stdout.decode('utf-8', 'replace'), self.proc.returncode
+
+
+def run_go(packages: Set[str], names: str) -> GoProc:
     go = go_exe()
     go_pkg_args = [f'kitty/{x}' for x in packages]
     cmd = [go, 'test', '-v']
     for name in names:
         cmd.extend(('-run', name))
     cmd += go_pkg_args
-    env = os.environ.copy()
-    from kitty.constants import kitty_exe
-    env['KITTY_PATH_TO_KITTY_EXE'] = kitty_exe()
-    print(shlex.join(cmd), flush=True)
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    return GoProc(cmd)
+
 
 
 def reduce_go_pkgs(module: str, names: Sequence[str]) -> Set[str]:
@@ -167,34 +207,32 @@ def reduce_go_pkgs(module: str, names: Sequence[str]) -> Set[str]:
     return go_packages
 
 
-def run_python_tests(args: Any, go_proc: 'Optional[subprocess.Popen[bytes]]' = None) -> None:
+def run_python_tests(args: Any, go_proc: 'Optional[GoProc]' = None) -> None:
     tests = find_all_tests()
 
     def print_go() -> None:
-        try:
-            go_proc.wait()
-        except KeyboardInterrupt:
-            go_proc.terminate()
-            if go_proc.wait(0.1) is None:
-                go_proc.kill()
-
-        print(go_proc.stdout.read().decode('utf-8', 'replace'), end='', flush=True)
-        go_proc.stdout.close()
-        go_proc.wait()
+        stdout, rc = go_proc.wait()
+        if go_proc.returncode == 0 and tests._tests:
+            print(f'All Go tests succeeded, ran in {go_proc.runtime:.1f} seconds', flush=True)
+        else:
+            print(stdout, end='', flush=True)
+        return rc
 
     if args.module:
         tests = filter_tests_by_module(tests, args.module)
         if not tests._tests:
             if go_proc:
-                print_go()
-                raise SystemExit(go_proc.returncode)
+                raise SystemExit(print_go())
             raise SystemExit('No test module named %s found' % args.module)
 
     if args.name:
         tests = filter_tests_by_name(tests, *args.name)
         if not tests._tests and not go_proc:
             raise SystemExit('No test named %s found' % args.name)
-    python_tests_ok = run_cli(tests, args.verbosity)
+    if tests._tests:
+        python_tests_ok = run_cli(tests, args.verbosity)
+    else:
+        python_tests_ok = True
     exit_code = 0 if python_tests_ok else 1
     if go_proc:
         print_go()
@@ -206,6 +244,7 @@ def run_python_tests(args: Any, go_proc: 'Optional[subprocess.Popen[bytes]]' = N
 
 
 def run_tests(report_env: bool = False) -> None:
+    report_env = report_env or BaseTest.is_ci
     import argparse
 
     parser = argparse.ArgumentParser()
@@ -226,11 +265,17 @@ def run_tests(report_env: bool = False) -> None:
     if args.name and args.name[0] in ('type-check', 'type_check', 'mypy'):
         type_check()
     go_pkgs = reduce_go_pkgs(args.module, args.name)
+    os.environ['ASAN_OPTIONS'] = 'detect_leaks=0'  # ensure subprocesses dont fail because of leak detection
     if go_pkgs:
-        go_proc: 'Optional[subprocess.Popen[bytes]]' = run_go(go_pkgs, args.name)
+        go_proc: 'Optional[GoProc]' = run_go(go_pkgs, args.name)
     else:
         go_proc = None
     with env_for_python_tests(report_env):
+        if go_pkgs:
+            if report_env:
+                print('Go executable:', go_exe())
+            print('Go packages being tested:', ' '.join(go_pkgs))
+        sys.stdout.flush()
         run_python_tests(args, go_proc)
 
 
@@ -257,12 +302,20 @@ def env_for_python_tests(report_env: bool = False) -> Iterator[None]:
     launcher_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kitty', 'launcher')
     path = f'{launcher_dir}{os.pathsep}{path}'
     python_for_type_check()
-    if os.environ.get('CI') == 'true' or report_env:
+    print('Running under CI:', BaseTest.is_ci)
+    if report_env:
         print('Using PATH in test environment:', path)
         print('Python:', python_for_type_check())
+        from kitty.fast_data_types import has_avx2, has_sse4_2
+        print(f'Intrinsics: {has_avx2=} {has_sse4_2=}')
+    # we need fonts installed in the user home directory as well, so initialize
+    # fontconfig before nuking $HOME and friends
+    from kitty.fonts.common import all_fonts_map
+    all_fonts_map(True)
 
     with TemporaryDirectory() as tdir, env_vars(
         HOME=tdir,
+        KT_ORIGINAL_HOME=os.path.expanduser('~'),
         USERPROFILE=tdir,
         PATH=path,
         TERM='xterm-kitty',

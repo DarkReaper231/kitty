@@ -142,7 +142,7 @@ func (self *Handler) initialize() {
 func (self *Handler) generate_diff() {
 	self.diff_map = nil
 	jobs := make([]diff_job, 0, 32)
-	self.collection.Apply(func(path, typ, changed_path string) error {
+	_ = self.collection.Apply(func(path, typ, changed_path string) error {
 		if typ == "diff" {
 			if is_path_text(path) && is_path_text(changed_path) {
 				jobs = append(jobs, diff_job{path, changed_path})
@@ -188,7 +188,7 @@ func (self *Handler) highlight_all() {
 }
 
 func (self *Handler) load_all_images() {
-	self.collection.Apply(func(path, item_type, changed_path string) error {
+	_ = self.collection.Apply(func(path, item_type, changed_path string) error {
 		if path != "" && is_image(path) {
 			image_collection.AddPaths(path)
 			self.image_count++
@@ -627,11 +627,9 @@ func (self *Handler) dispatch_action(name, args string) error {
 			}
 			done = self.scroll_lines(amt) != 0
 		default:
-			npos := self.scroll_pos
+			npos := ScrollPos{}
 			if strings.Contains(args, `end`) {
 				npos = self.max_scroll_pos
-			} else {
-				npos = ScrollPos{}
 			}
 			done = npos != self.scroll_pos
 			self.scroll_pos = npos

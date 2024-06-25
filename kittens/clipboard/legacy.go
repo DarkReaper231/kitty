@@ -87,7 +87,7 @@ func preread_stdin() (data_src io.Reader, tempfile *os.File, err error) {
 		if err != nil {
 			return nil, nil, fmt.Errorf("Failed to copy data from STDIN pipe to temp file with error: %w", err)
 		}
-		tempfile.Seek(0, os.SEEK_SET)
+		tempfile.Seek(0, io.SeekStart)
 		data_src = tempfile
 	} else if stdin_data != nil {
 		data_src = bytes.NewBuffer(stdin_data)
@@ -99,7 +99,9 @@ func run_plain_text_loop(opts *Options) (err error) {
 	stdin_is_tty := tty.IsTerminal(os.Stdin.Fd())
 	var data_src io.Reader
 	var tempfile *os.File
-	if !stdin_is_tty {
+	if !stdin_is_tty && !opts.GetClipboard {
+		// we dont read STDIN when getting clipboard as it makes it hard to use the kitten in contexts where
+		// the user does not control STDIN such as being execed from other programs.
 		data_src, tempfile, err = preread_stdin()
 		if err != nil {
 			return err
@@ -162,7 +164,7 @@ func run_plain_text_loop(opts *Options) (err error) {
 		return "", nil
 	}
 
-	lp.OnWriteComplete = func(id loop.IdType) error {
+	lp.OnWriteComplete = func(id loop.IdType, has_pending_writes bool) error {
 		if id == enc_writer.last_written_id {
 			return write_one_chunk()
 		}

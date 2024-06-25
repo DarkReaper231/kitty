@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -44,7 +45,7 @@ func load_mime_file(filename string, mime_map map[string]string) error {
 	return nil
 }
 
-var UserMimeMap = (&Once[map[string]string]{Run: func() map[string]string {
+var UserMimeMap = sync.OnceValue(func() map[string]string {
 	conf_path := filepath.Join(ConfigDir(), "mime.types")
 	ans := make(map[string]string, 32)
 	err := load_mime_file(conf_path, ans)
@@ -52,11 +53,18 @@ var UserMimeMap = (&Once[map[string]string]{Run: func() map[string]string {
 		fmt.Fprintln(os.Stderr, "Failed to parse", conf_path, "for MIME types with error:", err)
 	}
 	return ans
-}}).Get
+})
 
-func is_rcfile(path string) bool {
+func is_special_file(path string) string {
 	name := filepath.Base(path)
-	return strings.HasSuffix(name, "rc") && !strings.Contains(name, ".")
+	lname := strings.ToLower(name)
+	if lname == "makefile" || strings.HasPrefix(lname, "makefile.") {
+		return "text/makefile"
+	}
+	if strings.HasSuffix(name, "rc") && !strings.Contains(name, ".") {
+		return "text/plain"
+	}
+	return ""
 }
 
 func GuessMimeType(filename string) string {
@@ -74,8 +82,8 @@ func GuessMimeType(filename string) string {
 			if mime_with_parameters == "" {
 				mime_with_parameters = KnownExtensions[lext]
 			}
-			if mime_with_parameters == "" && is_rcfile(filename) {
-				mime_with_parameters = "text/plain"
+			if mime_with_parameters == "" {
+				mime_with_parameters = is_special_file(filename)
 			}
 			if mime_with_parameters == "" {
 				return ""

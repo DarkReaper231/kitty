@@ -10,7 +10,7 @@ from kitty.constants import website_url
 
 definition = Definition(
     'kitty',
-    Action('map', 'parse_map', {'keymap': 'KeyMap', 'sequence_map': 'SequenceMap', 'alias_map': 'AliasMap'},
+    Action('map', 'parse_map', {'keyboard_modes': 'KeyboardModeMap', 'alias_map': 'AliasMap'},
            ['KeyDefinition', 'kitty.fast_data_types.SingleKey']),
     Action('mouse_map', 'parse_mouse_map', {'mousemap': 'MouseMap'}, ['MouseMapping']),
     has_color_table=True,
@@ -32,33 +32,25 @@ kitty has very powerful font management. You can configure individual font faces
 and even specify special fonts for particular characters.
 ''')
 
-opt('font_family', 'monospace',
+opt('font_family', 'monospace', option_type='parse_font_spec',
     long_text='''
 You can specify different fonts for the bold/italic/bold-italic variants.
-To get a full list of supported fonts use the ``kitty +list-fonts`` command.
-By default they are derived automatically, by the OSes font system. When
-:opt:`bold_font` or :opt:`bold_italic_font` is set to :code:`auto` on macOS, the
-priority of bold fonts is semi-bold, bold, heavy. Setting them manually is
-useful for font families that have many weight variants like Book, Medium,
-Thick, etc.
-For example::
-
-    font_family      Operator Mono Book
-    bold_font        Operator Mono Medium
-    italic_font      Operator Mono Book Italic
-    bold_italic_font Operator Mono Medium Italic
+The easiest way to select fonts is to run the ``kitten choose-fonts`` command
+which will present a nice UI for you to select the fonts you want with previews
+and support for selecting variable fonts and font features. If you want to learn
+to select fonts manually, read the :ref:`font specification syntax <font_spec_syntax>`.
 '''
     )
 
-opt('bold_font', 'auto')
+opt('bold_font', 'auto', option_type='parse_font_spec')
 
-opt('italic_font', 'auto')
+opt('italic_font', 'auto', option_type='parse_font_spec')
 
-opt('bold_italic_font', 'auto')
+opt('bold_italic_font', 'auto', option_type='parse_font_spec')
 
 opt('font_size', '11.0',
     option_type='to_font_size', ctype='double',
-    long_text='Font size (in pts)'
+    long_text='Font size (in pts).'
     )
 
 opt('force_ltr', 'no',
@@ -68,7 +60,7 @@ kitty does not support BIDI (bidirectional text), however, for RTL scripts,
 words are automatically displayed in RTL. That is to say, in an RTL script, the
 words "HELLO WORLD" display in kitty as "WORLD HELLO", and if you try to select
 a substring of an RTL-shaped string, you will get the character that would be
-there had the the string been LTR. For example, assuming the Hebrew word
+there had the string been LTR. For example, assuming the Hebrew word
 ירושלים, selecting the character that on the screen appears to be ם actually
 writes into the selection buffer the character י. kitty's default behavior is
 useful in conjunction with a filter to reverse the word order, however, if you
@@ -132,12 +124,13 @@ Note that this refers to programming ligatures, typically implemented using the
 '''
     )
 
-opt('+font_features', 'none',
-    option_type='font_features',
-    add_to_default=False,
-    long_text='''
-Choose exactly which OpenType features to enable or disable. This is useful as
-some fonts might have features worthwhile in a terminal. For example, Fira Code
+opt('+font_features', 'none', option_type='font_features', ctype='!font_features',
+    add_to_default=False, long_text='''
+Choose exactly which OpenType features to enable or disable. Note that for the
+main fonts, features can be specified when selecting the font using the choose-fonts kitten.
+This setting is useful for fallback fonts.
+
+Some fonts might have features worthwhile in a terminal. For example, Fira Code
 includes a discretionary feature, :code:`zero`, which in that font changes the
 appearance of the zero (0), to make it more easily distinguishable from Ø. Fira
 Code also includes other discretionary features known as Stylistic Sets which
@@ -154,19 +147,8 @@ feature in the italic font but not in the regular font.
 On Linux, font features are first read from the FontConfig database and then
 this option is applied, so they can be configured in a single, central place.
 
-To get the PostScript name for a font, use ``kitty +list-fonts --psnames``:
-
-.. code-block:: sh
-
-    $ kitty +list-fonts --psnames | grep Fira
-    Fira Code
-    Fira Code Bold (FiraCode-Bold)
-    Fira Code Light (FiraCode-Light)
-    Fira Code Medium (FiraCode-Medium)
-    Fira Code Regular (FiraCode-Regular)
-    Fira Code Retina (FiraCode-Retina)
-
-The part in brackets is the PostScript name.
+To get the PostScript name for a font, use the ``fc-scan file.ttf`` command on Linux
+or the `Font Book tool on macOS <https://apple.stackexchange.com/questions/79875/how-can-i-get-the-postscript-name-of-a-ttf-font-installed-in-os-x>`__.
 
 Enable alternate zero and oldstyle numerals::
 
@@ -276,9 +258,14 @@ ranging from :code:`0` to :code:`100`. If the difference in luminance of the
 foreground and background is below this threshold, the foreground color will be set
 to white if the background is dark or black if the background is light. The default
 value is :code:`0`, which means no overriding is performed. Useful when working with applications
-that use colors that do not contrast well with your preferred color scheme. Note that this
-will not work in situations where kitty has to render in multiple passes, for example,
-when rendering with images under text or with non-opaque background and images.
+that use colors that do not contrast well with your preferred color scheme.
+
+WARNING: Some programs use characters (such as block characters) for graphics
+display and may expect to be able to set the foreground and background to the
+same color (or similar colors).  If you see unexpected stripes, dots, lines,
+incorrect color, no color where you expect color, or any kind of graphic
+display problem try setting :opt:`text_fg_override_threshold` to :code:`0` to
+see if this is the cause of the problem.
 ''')
 
 egr()  # }}}
@@ -291,11 +278,13 @@ opt('cursor', '#cccccc',
     option_type='to_color_or_none',
     long_text='''
 Default cursor color. If set to the special value :code:`none` the cursor will
-be rendered with a "reverse video" effect. It's color will be the color of the
+be rendered with a "reverse video" effect. Its color will be the color of the
 text in the cell it is over and the text will be rendered with the background
 color of the cell. Note that if the program running in the terminal sets a
 cursor color, this takes precedence. Also, the cursor colors are modified if
-the cell background and foreground colors have very low contrast.
+the cell background and foreground colors have very low contrast. Note that some
+themes set this value, so if you want to override it, place your value after
+the lines where the theme file is included.
 '''
     )
 
@@ -304,8 +293,9 @@ opt('cursor_text_color', '#111111',
     long_text='''
 The color of text under the cursor. If you want it rendered with the
 background color of the cell underneath instead, use the special keyword:
-background. Note that if :opt:`cursor` is set to :code:`none` then this option
-is ignored.
+`background`. Note that if :opt:`cursor` is set to :code:`none` then this option
+is ignored. Note that some themes set this value, so if you want to override it,
+place your value after the lines where the theme file is included.
 '''
     )
 
@@ -321,6 +311,12 @@ cursor shape to :code:`beam` at shell prompts. You can avoid this by setting
 :opt:`shell_integration` to :code:`no-cursor`.
 '''
     )
+
+opt('cursor_shape_unfocused', 'hollow', option_type='to_cursor_unfocused_shape', ctype='int', long_text='''
+Defines the text cursor shape when the OS window is not focused. The unfocused
+cursor shape can be one of :code:`block`, :code:`beam`, :code:`underline`,
+:code:`hollow`.
+''')
 
 opt('cursor_beam_thickness', '1.5',
     option_type='positive_float', ctype='float',
@@ -348,6 +344,7 @@ Stop blinking cursor after the specified number of seconds of keyboard
 inactivity. Set to zero to never stop blinking.
 '''
     )
+
 egr()  # }}}
 
 
@@ -365,6 +362,14 @@ using :opt:`scrollback_pager_history_size`. Note that on config reload if this
 is changed it will only affect newly created windows, not existing ones.
 '''
     )
+
+opt('scrollback_indicator_opacity', '1.0',
+    option_type='unit_float', ctype='float', long_text='''
+The opacity of the scrollback indicator which is a small colored rectangle that moves
+along the right hand side of the window as you scroll, indicating what fraction you
+have scrolled. The default is one which means fully opaque, aka visible.
+Set to a value between zero and one to make the indicator less visible.''')
+
 
 opt('scrollback_pager', 'less --chop-long-lines --RAW-CONTROL-CHARS +INPUT_LINE_NUMBER',
     option_type='to_cmdline',
@@ -387,7 +392,7 @@ Separate scrollback history size (in MB), used only for browsing the scrollback
 buffer with pager. This separate buffer is not available for interactive
 scrolling but will be piped to the pager program when viewing scrollback buffer
 in a separate window. The current implementation stores the data in UTF-8, so
-approximatively 10000 lines per megabyte at 100 chars per line, for pure ASCII,
+approximately 10000 lines per megabyte at 100 chars per line, for pure ASCII,
 unformatted text. A value of zero or less disables this feature. The maximum
 allowed size is 4GB. Note that on config reload if this is changed it will only
 affect newly created windows, not existing ones.
@@ -462,7 +467,7 @@ opt('url_style', 'curly',
 opt('open_url_with', 'default',
     option_type='to_cmdline',
     long_text='''
-The program to open clicked URLs. The special value :code:`default` with first
+The program to open clicked URLs. The special value :code:`default` will first
 look for any URL handlers defined via the :doc:`open_actions` facility and if
 non are found, it will use the Operating System's default URL handler
 (:program:`open` on macOS and :program:`xdg-open` on Linux).
@@ -481,7 +486,8 @@ opt('detect_urls', 'yes',
     long_text='''
 Detect URLs under the mouse. Detected URLs are highlighted with an underline and
 the mouse cursor becomes a hand over them. Even if this option is disabled, URLs
-are still clickable.
+are still clickable. See also the :opt:`underline_hyperlinks` option to control
+how hyperlinks (as opposed to plain text URLs) are displayed.
 '''
     )
 
@@ -505,6 +511,18 @@ When the mouse hovers over a terminal hyperlink, show the actual URL that will
 be activated when the hyperlink is clicked.
 ''')
 
+
+opt('underline_hyperlinks', 'hover', choices=('hover', 'always', 'never'),
+    ctype='underline_hyperlinks', long_text='''
+Control how hyperlinks are underlined. They can either be underlined on mouse
+:code:`hover`, :code:`always` (i.e. permanently underlined) or :code:`never` which means
+that kitty will not apply any underline styling to hyperlinks.
+Uses the :opt:`url_style` and :opt:`url_color` settings for the underline style. Note
+that reloading the config and changing this value to/from :code:`always` will only
+affect text subsequently received by kitty.
+''')
+
+
 opt('copy_on_select', 'no',
     option_type='copy_on_select',
     long_text='''
@@ -525,7 +543,7 @@ clipboard.
 '''
     )
 
-opt('paste_actions', 'quote-urls-at-prompt',
+opt('paste_actions', 'quote-urls-at-prompt,confirm',
     option_type='paste_actions',
     long_text='''
 A comma separated list of actions to take when pasting text into the terminal.
@@ -534,13 +552,23 @@ The supported paste actions are:
 :code:`quote-urls-at-prompt`:
     If the text being pasted is a URL and the cursor is at a shell prompt,
     automatically quote the URL (needs :opt:`shell_integration`).
+:code:`replace-dangerous-control-codes`
+    Replace dangerous control codes from pasted text, without confirmation.
+:code:`replace-newline`
+    Replace the newline character from pasted text, without confirmation.
 :code:`confirm`:
-    Confirm the paste if bracketed paste mode is not active or there is
-    a large amount of text being pasted.
+    Confirm the paste if the text to be pasted contains any terminal control codes
+    as this can be dangerous, leading to code execution if the shell/program running
+    in the terminal does not properly handle these.
+:code:`confirm-if-large`
+    Confirm the paste if it is very large (larger than 16KB) as pasting
+    large amounts of text into shells can be very slow.
 :code:`filter`:
     Run the filter_paste() function from the file :file:`paste-actions.py` in
     the kitty config directory on the pasted text. The text returned by the
     function will be actually pasted.
+:code:`no-op`:
+    Has no effect.
 '''
     )
 
@@ -587,30 +615,67 @@ opt('focus_follows_mouse', 'no',
     option_type='to_bool', ctype='bool',
     long_text='''
 Set the active window to the window under the mouse when moving the mouse around.
+On macOS, this will also cause the OS Window under the mouse to be focused automatically when the
+mouse enters it.
 '''
     )
 
+pointer_shape_names = (
+# start pointer shape names (auto generated by gen-key-constants.py do not edit)
+    'arrow',
+    'beam',
+    'text',
+    'pointer',
+    'hand',
+    'help',
+    'wait',
+    'progress',
+    'crosshair',
+    'cell',
+    'vertical-text',
+    'move',
+    'e-resize',
+    'ne-resize',
+    'nw-resize',
+    'n-resize',
+    'se-resize',
+    'sw-resize',
+    's-resize',
+    'w-resize',
+    'ew-resize',
+    'ns-resize',
+    'nesw-resize',
+    'nwse-resize',
+    'zoom-in',
+    'zoom-out',
+    'alias',
+    'copy',
+    'not-allowed',
+    'no-drop',
+    'grab',
+    'grabbing',
+# end pointer shape names
+)
+
 opt('pointer_shape_when_grabbed', 'arrow',
-    choices=('arrow', 'beam', 'hand'), ctype='pointer_shape',
+    choices=pointer_shape_names, ctype='pointer_shape',
     long_text='''
 The shape of the mouse pointer when the program running in the terminal grabs
-the mouse. Valid values are: :code:`arrow`, :code:`beam` and :code:`hand`.
+the mouse.
 '''
     )
 
 opt('default_pointer_shape', 'beam',
-    choices=('arrow', 'beam', 'hand'), ctype='pointer_shape',
+    choices=pointer_shape_names, ctype='pointer_shape',
     long_text='''
-The default shape of the mouse pointer. Valid values are: :code:`arrow`,
-:code:`beam` and :code:`hand`.
+The default shape of the mouse pointer.
 '''
     )
 
 opt('pointer_shape_when_dragging', 'beam',
-    choices=('arrow', 'beam', 'hand'), ctype='pointer_shape',
+    choices=pointer_shape_names, ctype='pointer_shape',
     long_text='''
-The default shape of the mouse pointer when dragging across text. Valid values
-are: :code:`arrow`, :code:`beam` and :code:`hand`.
+The default shape of the mouse pointer when dragging across text.
 '''
     )
 
@@ -642,10 +707,10 @@ You can run kitty with the :option:`kitty --debug-input` command line option
 to see mouse events. See the builtin actions below to get a sense of what is
 possible.
 
-If you want to unmap an action, map it to :ac:`no_op`. For example, to disable
+If you want to unmap a button, map it to nothing. For example, to disable
 opening of URLs with a plain click::
 
-    mouse_map left click ungrabbed no_op
+    mouse_map left click ungrabbed
 
 See all the mappable actions including mouse actions :doc:`here </actions>`.
 
@@ -722,6 +787,8 @@ mma('Select a line',
 mma('Select line from point',
     'select_line_from_point ctrl+alt+left triplepress ungrabbed mouse_selection line_from_point',
     long_text='Select from the clicked point to the end of the line.'
+    ' If you would like to select the word at the point and then extend to the rest of the line,'
+    ' change `line_from_point` to `word_and_line_from_point`.'
     )
 
 mma('Extend the current selection',
@@ -759,6 +826,8 @@ mma('Select a line even when grabbed',
 mma('Select line from point even when grabbed',
     'select_line_from_point_grabbed ctrl+shift+alt+left triplepress ungrabbed,grabbed mouse_selection line_from_point',
     long_text='Select from the clicked point to the end of the line even when grabbed.'
+    ' If you would like to select the word at the point and then extend to the rest of the line,'
+    ' change `line_from_point` to `word_and_line_from_point`.'
     )
 
 mma('Extend the current selection even when grabbed',
@@ -795,7 +864,7 @@ Delay before input from the program running in the terminal is processed (in
 milliseconds). Note that decreasing it will increase responsiveness, but also
 increase CPU usage and might cause flicker in full screen programs that redraw
 the entire screen on each loop, because kitty is so fast that partial screen
-updates will be drawn.
+updates will be drawn. This setting is ignored when the input buffer is almost full.
 '''
     )
 
@@ -843,7 +912,7 @@ opt('window_alert_on_bell', 'yes',
     option_type='to_bool', ctype='bool',
     long_text='''
 Request window attention on bell. Makes the dock icon bounce on macOS or the
-taskbar flash on linux.
+taskbar flash on Linux.
 '''
     )
 
@@ -876,7 +945,7 @@ opt('bell_path', 'none',
 Path to a sound file to play as the bell sound. If set to :code:`none`, the
 system default bell sound is used. Must be in a format supported by the
 operating systems sound API, such as WAV or OGA on Linux (libcanberra) or AIFF,
-MP3 or WAV on macOS (NSSound)
+MP3 or WAV on macOS (NSSound).
 '''
     )
 
@@ -987,14 +1056,28 @@ bottom and left.
 '''
     )
 
+opt('single_window_padding_width', '-1',
+    option_type='optional_edge_width',
+    long_text='''
+The window padding to use when only a single window is visible (in pts). Negative
+values will cause the value of :opt:`window_padding_width` to be used instead. A
+single value sets all four sides. Two values set the vertical and horizontal
+sides. Three values set top, horizontal and bottom. Four values set top, right,
+bottom and left.
+'''
+    )
+
 opt('placement_strategy', 'center',
-    choices=('center', 'top-left'),
+    choices=('top-left', 'top', 'top-right', 'left', 'center', 'right', 'bottom-left', 'bottom', 'bottom-right'),
     long_text='''
 When the window size is not an exact multiple of the cell size, the cell area of
 the terminal window will have some extra padding on the sides. You can control
 how that padding is distributed with this option. Using a value of
 :code:`center` means the cell area will be placed centrally. A value of
 :code:`top-left` means the padding will be only at the bottom and right edges.
+The value can be one of: :code:`top-left`, :code:`top`, :code:`top-right`,
+:code:`left`, :code:`center`, :code:`right`, :code:`bottom-left`,
+:code:`bottom`, :code:`bottom-right`.
 '''
     )
 
@@ -1028,10 +1111,12 @@ opt('hide_window_decorations', 'no',
     option_type='hide_window_decorations', ctype='uint',
     long_text='''
 Hide the window decorations (title-bar and window borders) with :code:`yes`. On
-macOS, :code:`titlebar-only` can be used to only hide the titlebar. Whether this
-works and exactly what effect it has depends on the window manager/operating
+macOS, :code:`titlebar-only` and :code:`titlebar-and-corners` can be used to only hide the titlebar and the rounded corners.
+Whether this works and exactly what effect it has depends on the window manager/operating
 system. Note that the effects of changing this option when reloading config
-are undefined.
+are undefined. When using :code:`titlebar-only`, it is useful to also set
+:opt:`window_margin_width` and :opt:`placement_strategy` to prevent the rounded
+corners from clipping text. Or use :code:`titlebar-and-corners`.
 '''
     )
 
@@ -1064,24 +1149,31 @@ faded and one being fully opaque.
 '''
     )
 
+opt('window_logo_scale', '0', option_type='window_logo_scale', ctype='!window_logo_scale', long_text='''
+The percentage (0-100] of the window size to which the logo should scale. Using a single
+number means the logo is scaled to that percentage of the shortest window dimension, while preseving
+aspect ratio of the logo image.
 
-opt('resize_debounce_time', '0.1',
-    option_type='positive_float', ctype='time',
-    long_text='''
-The time to wait before redrawing the screen when a resize event is received (in
-seconds). On platforms such as macOS, where the operating system sends events
-corresponding to the start and end of a resize, this number is ignored.
-'''
-    )
+Using two numbers means the width and height of the logo are scaled to the respective
+percentage of the window's width and height.
 
-opt('resize_draw_strategy', 'static',
-    option_type='resize_draw_strategy', ctype='int',
+Using zero as the percentage disables scaling in that dimension. A single zero (the default)
+disables all scaling of the window logo.
+''')
+
+opt('resize_debounce_time', '0.1 0.5',
+    option_type='resize_debounce_time', ctype='!resize_debounce_time',
     long_text='''
-Choose how kitty draws a window while a resize is in progress. A value of
-:code:`static` means draw the current window contents, mostly unchanged. A value
-of :code:`scale` means draw the current window contents scaled. A value of
-:code:`blank` means draw a blank window. A value of :code:`size` means show the
-window size in cells.
+The time to wait (in seconds) before asking the program running in kitty to resize and
+redraw the screen during a live resize of the OS window, when no new resize
+events have been received, i.e. when resizing is either paused or finished.
+On platforms such as macOS, where the operating system sends events corresponding
+to the start and end of a live resize, the second number is used for
+redraw-after-pause since kitty can distinguish between a pause and end of
+resizing. On such systems the first number is ignored and redraw is immediate
+after end of resize. On other systems only the first number is used so that kitty
+is "ready" quickly after the end of resizing, while not also continuously
+redrawing, to save energy.
 '''
     )
 
@@ -1098,10 +1190,10 @@ does not currently work on Wayland.
 
 opt('visual_window_select_characters', defval=string.digits[1:] + '0' + string.ascii_uppercase,
     option_type='visual_window_select_characters',
-    long_text='''
+    long_text=r'''
 The list of characters for visual window selection. For example, for selecting a
 window to focus on with :sc:`focus_visible_window`. The value should be a series
-of unique numbers or alphabets, case insensitive, from the set :code:`[0-9A-Z]`.
+of unique numbers or alphabets, case insensitive, from the set :code:`0-9A-Z\`-=[];',./\\`.
 Specify your preference as a string of characters.
 '''
     )
@@ -1258,7 +1350,7 @@ use :code:`{sup.index}`. All data available is:
 :code:`title`
     The current tab title.
 :code:`index`
-    The tab index useable with :ac:`goto_tab N <goto_tab>` shortcuts.
+    The tab index usable with :ac:`goto_tab N <goto_tab>` shortcuts.
 :code:`layout_name`
     The current layout name.
 :code:`num_windows`
@@ -1275,6 +1367,8 @@ use :code:`{sup.index}`. All data available is:
     :code:`active_oldest_exe` for the oldest foreground process.
 :code:`max_title_length`
     The maximum title length available.
+:code:`keyboard_mode`
+    The name of the current :ref:`keyboard mode <modal_mappings>` or the empty string if no keyboard mode is active.
 
 Note that formatting is done by Python's string formatting machinery, so you can
 use, for instance, :code:`{layout_name[:2].upper()}` to show only the first two
@@ -1357,23 +1451,38 @@ opt('background_opacity', '1.0',
     option_type='unit_float', ctype='float',
     long_text='''
 The opacity of the background. A number between zero and one, where one is
-opaque and zero is fully transparent. This will only work if supported by the OS
-(for instance, when using a compositor under X11). Note that it only sets the
-background color's opacity in cells that have the same background color as the
-default terminal background, so that things like the status bar in vim,
+opaque and zero is fully transparent. This will only work if supported by the
+OS (for instance, when using a compositor under X11). Note that it only sets
+the background color's opacity in cells that have the same background color as
+the default terminal background, so that things like the status bar in vim,
 powerline prompts, etc. still look good. But it means that if you use a color
 theme with a background color in your editor, it will not be rendered as
 transparent. Instead you should change the default background color in your
 kitty config and not use a background color in the editor color scheme. Or use
-the escape codes to set the terminals default colors in a shell script to launch
-your editor. Be aware that using a value less than 1.0 is a (possibly
-significant) performance hit. If you want to dynamically change transparency of
-windows, set :opt:`dynamic_background_opacity` to :code:`yes` (this is off by
-default as it has a performance cost). Changing this option when reloading the
-config will only work if :opt:`dynamic_background_opacity` was enabled in the
-original config.
+the escape codes to set the terminals default colors in a shell script to
+launch your editor. Be aware that using a value less than 1.0 is a (possibly
+significant) performance hit. When using a low value for this setting, it is
+desirable that you set the :opt:`background` color to a color the matches the
+general color of the desktop background, for best text rendering.  If you want
+to dynamically change transparency of windows, set
+:opt:`dynamic_background_opacity` to :code:`yes` (this is off by default as it
+has a performance cost). Changing this option when reloading the config will
+only work if :opt:`dynamic_background_opacity` was enabled in the original
+config.
 '''
     )
+
+opt('background_blur', '0', option_type='int', ctype='int',
+    long_text='''
+Set to a positive value to enable background blur (blurring of the visuals
+behind a transparent window) on platforms that support it. Only takes effect
+when :opt:`background_opacity` is less than one. On macOS, this will also
+control the :italic:`blur radius` (amount of blurring). Setting it to too high
+a value will cause severe performance issues and/or rendering artifacts.
+Usually, values up to 64 work well. Note that this might cause performance issues,
+depending on how the platform implements it, so use with care. Currently supported
+on macOS and KDE.
+''')
 
 opt('background_image', 'none',
     option_type='config_or_absolute_path', ctype='!background_image',
@@ -1381,11 +1490,13 @@ opt('background_image', 'none',
     )
 
 opt('background_image_layout', 'tiled',
-    choices=('mirror-tiled', 'scaled', 'tiled', 'clamped', 'centered'),
+    choices=('mirror-tiled', 'scaled', 'tiled', 'clamped', 'centered', 'cscaled'),
     ctype='bglayout',
     long_text='''
 Whether to tile, scale or clamp the background image. The value can be one of
-:code:`tiled`, :code:`mirror-tiled`, :code:`scaled`, :code:`clamped` or :code:`centered`.
+:code:`tiled`, :code:`mirror-tiled`, :code:`scaled`, :code:`clamped`, :code:`centered`
+or :code:`cscaled`. The :code:`scaled` and :code:`cscaled` values scale the image to the
+window size, with :code:`cscaled` preserving the image aspect ratio.
 '''
     )
 
@@ -1424,7 +1535,7 @@ gaps for a *separated* look.
 '''
     )
 
-opt('dim_opacity', '0.75',
+opt('dim_opacity', '0.4',
     option_type='unit_float', ctype='float',
     long_text='''
 How much to dim text that has the DIM/FAINT attribute set. One means no dimming
@@ -2770,7 +2881,7 @@ The shell program to execute. The default value of :code:`.` means to use
 whatever shell is set as the default shell for the current user. Note that on
 macOS if you change this, you might need to add :code:`--login` and
 :code:`--interactive` to ensure that the shell starts in interactive mode and
-reads its startup rc files.
+reads its startup rc files. Environment variables are expanded in this setting.
 '''
     )
 
@@ -2791,9 +2902,9 @@ doesn't work, kitty will cycle through various known editors (:program:`vim`,
 opt('close_on_child_death', 'no',
     option_type='to_bool', ctype='bool',
     long_text='''
-Close the window when the child process (shell) exits. With the default value
+Close the window when the child process (usually the shell) exits. With the default value
 :code:`no`, the terminal will remain open when the child exits as long as there
-are still processes outputting to the terminal (for example disowned or
+are still other processes outputting to the terminal (for example disowned or
 backgrounded processes). When enabled with :code:`yes`, the window will close as
 soon as the child process exits. Note that setting it to :code:`yes` means that
 any background processes still using the terminal can fail silently because
@@ -2820,7 +2931,7 @@ Glob patterns can be used too, for example::
 
 To get a list of available actions, run::
 
-    kitty @ --help
+    kitten @ --help
 
 A set of actions to be allowed when no password is sent can be specified by
 using an empty password. For example::
@@ -2870,18 +2981,18 @@ prevents any form of remote control. The meaning of the various values are:
 
 opt('listen_on', 'none',
     long_text='''
-Listen to the specified UNIX socket for remote control connections. Note that
-this will apply to all kitty instances. It can be overridden by the
-:option:`kitty --listen-on` command line option, which also supports listening
-on a TCP socket. This option accepts only UNIX sockets, such as
+Listen to the specified socket for remote control connections. Note that this
+will apply to all kitty instances. It can be overridden by the :option:`kitty
+--listen-on` command line option. For UNIX sockets, such as
 :code:`unix:${TEMP}/mykitty` or :code:`unix:@mykitty` (on Linux). Environment
 variables are expanded and relative paths are resolved with respect to the
 temporary directory. If :code:`{kitty_pid}` is present, then it is replaced by
 the PID of the kitty process, otherwise the PID of the kitty process is
-appended to the value, with a hyphen. See the help for :option:`kitty
---listen-on` for more details. Note that this will be ignored unless
-:opt:`allow_remote_control` is set to either: :code:`yes`, :code:`socket` or
-:code:`socket-only`.
+appended to the value, with a hyphen. For TCP sockets such as
+:code:`tcp:localhost:0` a random port is always used even if a non-zero port
+number is specified.  See the help for :option:`kitty --listen-on` for more
+details. Note that this will be ignored unless :opt:`allow_remote_control` is
+set to either: :code:`yes`, :code:`socket` or :code:`socket-only`.
 Changing this option by reloading the config is not supported.
 '''
     )
@@ -2959,7 +3070,8 @@ using the :option:`kitty --session` :code:`=none` command line option for indivi
 instances. See :ref:`sessions` in the kitty documentation for details. Note that
 relative paths are interpreted with respect to the kitty config directory.
 Environment variables in the path are expanded. Changing this option by
-reloading the config is not supported.
+reloading the config is not supported. Note that if kitty is invoked with command line
+arguments specifying a command to run, this option is ignored.
 '''
     )
 
@@ -3016,7 +3128,7 @@ jumping to previous prompts, browsing the output of the previous command in a
 pager, etc. on supported shells. Set to :code:`disabled` to turn off shell
 integration, completely. It is also possible to disable individual features, set
 to a space separated list of these values: :code:`no-rc`, :code:`no-cursor`,
-:code:`no-title`, :code:`no-cwd`, :code:`no-prompt-mark`, :code:`no-complete`.
+:code:`no-title`, :code:`no-cwd`, :code:`no-prompt-mark`, :code:`no-complete`, :code:`no-sudo`.
 See :ref:`Shell integration <shell_integration>` for details.
 '''
     )
@@ -3052,8 +3164,60 @@ in the newly cloned window. The supported strategies are:
     Source the file pointed to by the environment variable
     :envvar:`KITTY_CLONE_SOURCE_PATH`.
 
-This option must be a comma separated list of the above values. This only
-source the first valid one in the above order.
+This option must be a comma separated list of the above values. Only the
+first valid match, in the order specified, is sourced.
+'''
+    )
+
+opt('notify_on_cmd_finish', 'never', option_type='notify_on_cmd_finish', long_text='''
+Show a desktop notification when a long-running command finishes
+(needs :opt:`shell_integration`).
+The possible values are:
+
+:code:`never`
+    Never send a notification.
+
+:code:`unfocused`
+    Only send a notification when the window does not have keyboard focus.
+
+:code:`invisible`
+    Only send a notification when the window both is unfocused and not visible
+    to the user, for example, because it is in an inactive tab or its OS window
+    is not currently active.
+
+:code:`always`
+    Always send a notification, regardless of window state.
+
+There are two optional arguments:
+
+First, the minimum duration for what is considered a
+long running command. The default is 5 seconds. Specify a second argument
+to set the duration. For example: :code:`invisible 15`.
+Do not set the value too small, otherwise a command that launches a new OS Window
+and exits will spam a notification.
+
+Second, the action to perform. The default is :code:`notify`. The possible values are:
+
+:code:`notify`
+    Send a desktop notification.
+
+:code:`bell`
+    Ring the terminal bell.
+
+:code:`command`
+    Run a custom command. All subsequent arguments are the cmdline to run.
+
+Some more examples::
+
+    # Send a notification when a command takes more than 5 seconds in an unfocused window
+    notify_on_cmd_finish unfocused
+    # Send a notification when a command takes more than 10 seconds in a invisible window
+    notify_on_cmd_finish invisible 10.0
+    # Ring a bell when a command takes more than 10 seconds in a invisible window
+    notify_on_cmd_finish invisible 10.0 bell
+    # Run 'notify-send' when a command takes more than 10 seconds in a invisible window
+    # Here %c is replaced by the current command line and %s by the job exit code
+    notify_on_cmd_finish invisible 10.0 command notify-send "job finished with status: %s" %c
 '''
     )
 
@@ -3070,26 +3234,58 @@ work. Changing this option by reloading the config will only affect newly
 created windows.
 '''
     )
+
+opt('terminfo_type', 'path', choices=('path', 'direct', 'none'),
+    long_text='''
+The value of the :envvar:`TERMINFO` environment variable to set. This variable is
+used by programs running in the terminal to search for terminfo databases. The default value
+of :code:`path` causes kitty to set it to a filesystem location containing the
+kitty terminfo database. A value of :code:`direct` means put the entire database into
+the env var directly. This can be useful when connecting to containers, for example. But,
+note that not all software supports this. A value of :code:`none` means do not touch the variable.
+'''
+    )
+
+
+opt('forward_stdio', 'no', option_type='to_bool', long_text='''
+Forward STDOUT and STDERR of the kitty process to child processes
+as file descriptors 3 and 4. This is useful for debugging as it
+allows child processes to print to kitty's STDOUT directly. For example,
+:code:`echo hello world >&3` in a shell will print to the parent kitty's
+STDOUT. When enabled, this also sets the :code:`KITTY_STDIO_FORWARDED=3`
+environment variable so child processes know about the forwarding.
+''')
+
+opt('+menu_map', '',
+    option_type='menu_map', add_to_default=False, ctype='!menu_map',
+    long_text='''
+Specify entries for various menus in kitty. Currently only the global menubar on macOS
+is supported. For example::
+
+   menu_map global "Actions::Launch something special" launch --hold --type=os-window sh -c "echo hello world"
+
+This will create a menu entry named "Launch something special" in an "Actions" menu in the macOS global menubar.
+Sub-menus can be created by adding more levels separated by the :code:`::` characters.
+'''
+    )
+
+
 egr()  # }}}
 
 
 # os {{{
 agr('os', 'OS specific tweaks')
 
-opt('wayland_titlebar_color', 'system',
-    option_type='titlebar_color',
-    long_text='''
+opt('wayland_titlebar_color', 'system', option_type='titlebar_color', ctype='uint', long_text='''
 The color of the kitty window's titlebar on Wayland systems with client
 side window decorations such as GNOME. A value of :code:`system` means to use
-the default system color, a value of :code:`background` means to use the
-background color of the currently active window and finally you can use an
+the default system colors, a value of :code:`background` means to use the
+background color of the currently active kitty window and finally you can use an
 arbitrary color, such as :code:`#12af59` or :code:`red`.
 '''
     )
 
-opt('macos_titlebar_color', 'system',
-    option_type='macos_titlebar_color',
-    long_text='''
+opt('macos_titlebar_color', 'system', option_type='macos_titlebar_color', ctype='int', long_text='''
 The color of the kitty window's titlebar on macOS. A value of
 :code:`system` means to use the default system color, :code:`light` or
 :code:`dark` can also be used to set it explicitly. A value of
@@ -3143,8 +3339,7 @@ opt('macos_window_resizable', 'yes',
     option_type='to_bool', ctype='bool',
     long_text='''
 Disable this if you want kitty top-level OS windows to not be resizable on
-macOS. Changing this option by reloading the config will only affect newly
-created OS windows.
+macOS.
 '''
     )
 
@@ -3220,6 +3415,14 @@ based on the system state is chosen automatically. Set it to :code:`x11` or
 config is not supported.
 '''
     )
+
+opt('wayland_enable_ime', 'yes', option_type='to_bool', ctype='bool', long_text='''
+Enable Input Method Extension on Wayland. This is typically used for
+inputting text in East Asian languages. However, its implementation in
+Wayland is often buggy and introduces latency into the input loop,
+so disable this if you know you dont need it. Changing this option
+by reloading the config is not supported, it will not have any effect.
+''')
 egr()  # }}}
 
 
@@ -3232,59 +3435,19 @@ at :ref:`Functional key definitions <functional>`. For modifier keys, the names
 are :kbd:`ctrl` (:kbd:`control`, :kbd:`⌃`), :kbd:`shift` (:kbd:`⇧`), :kbd:`alt`
 (:kbd:`opt`, :kbd:`option`, :kbd:`⌥`), :kbd:`super` (:kbd:`cmd`, :kbd:`command`,
 :kbd:`⌘`).
-See also: :link:`GLFW mods <https://www.glfw.org/docs/latest/group__mods.html>`
 
-On Linux you can also use XKB key names to bind keys that are not supported by
-GLFW. See :link:`XKB keys
-<https://github.com/xkbcommon/libxkbcommon/blob/master/include/xkbcommon/xkbcommon-keysyms.h>`
-for a list of key names. The name to use is the part after the :code:`XKB_KEY_`
-prefix. Note that you can only use an XKB key name for keys that are not known
-as GLFW keys.
+Simple shortcut mapping is done with the :code:`map` directive. For full details
+on advanced mapping including modal and per application maps, see :doc:`mapping`.
+Some quick examples to illustrate common tasks::
 
-Finally, you can use raw system key codes to map keys, again only for keys that
-are not known as GLFW keys. To see the system key code for a key, start kitty
-with the :option:`kitty --debug-input` option, kitty will output some debug text
-for every key event. In that text look for :code:`native_code`, the value
-of that becomes the key name in the shortcut. For example:
-
-.. code-block:: none
-
-    on_key_input: glfw key: 0x61 native_code: 0x61 action: PRESS mods: none text: 'a'
-
-Here, the key name for the :kbd:`A` key is :code:`0x61` and you can use it with::
-
-    map ctrl+0x61 something
-
-to map :kbd:`Ctrl+A` to something.
-
-You can use the special action :ac:`no_op` to unmap a keyboard shortcut that is
-assigned in the default configuration::
-
-    map kitty_mod+space no_op
-
-If you would like kitty to completely ignore a key event, not even sending it to
-the program running in the terminal, map it to :ac:`discard_event`::
-
-    map kitty_mod+f1 discard_event
-
-You can combine multiple actions to be triggered by a single shortcut with
-:ac:`combine` action, using the syntax below::
-
-    map key combine <separator> action1 <separator> action2 <separator> action3 ...
-
-For example::
-
+    # unmap a keyboard shortcut, passing it to the program running in kitty
+    map kitty_mod+space
+    # completely ignore a keyboard event
+    map ctrl+alt+f1 discard_event
+    # combine multiple actions
     map kitty_mod+e combine : new_window : next_layout
-
-This will create a new window and switch to the next available layout.
-
-You can use multi-key shortcuts with the syntax shown below::
-
-    map key1>key2>key3 action
-
-For example::
-
-    map ctrl+f>2 set_font_size 20
+    # multi-key shortcuts
+    map ctrl+x>ctrl+y>z action
 
 The full list of actions that can be mapped to key presses is available
 :doc:`here </actions>`.
@@ -3650,10 +3813,10 @@ map('Seventh window',
     only='macos',
     )
 
-map('Eight window',
+map('Eighth window',
     'eighth_window kitty_mod+8 eighth_window',
     )
-map('Eight window',
+map('Eighth window',
     'eighth_window cmd+8 eighth_window',
     only='macos',
     )
@@ -3903,7 +4066,7 @@ map('Open the selected file at the selected line',
     'goto_file_line kitty_mod+p>n kitten hints --type linenum',
     long_text='''
 Select something that looks like :code:`filename:linenum` and open it in
-:program:`vim` at the specified line number.
+your default editor at the specified line number.
 '''
     )
 
@@ -3985,7 +4148,7 @@ map('Reset background opacity',
 
 map('Reset the terminal',
     'reset_terminal kitty_mod+delete clear_terminal reset active',
-    long_text='''
+    long_text=r'''
 You can create shortcuts to clear/reset the terminal. For example::
 
     # Reset the terminal
@@ -3996,8 +4159,10 @@ You can create shortcuts to clear/reset the terminal. For example::
     map f1 clear_terminal scrollback active
     # Scroll the contents of the screen into the scrollback
     map f1 clear_terminal scroll active
-    # Clear everything up to the line with the cursor
+    # Clear everything on screen up to the line with the cursor or the start of the current prompt (needs shell integration)
     map f1 clear_terminal to_cursor active
+    # Same as above except cleared lines are moved into scrollback
+    map f1 clear_terminal to_cursor_scroll active
 
 If you want to operate on all kitty windows instead of just the current one, use
 :italic:`all` instead of :italic:`active`.
@@ -4019,15 +4184,22 @@ clearing of the current window:
         printf "\e[H\e[22J"
     }
 
-For instance, using these functions, it is possible to remap :kbd:`Ctrl+L` to both scroll the current screen
-contents into the scrollback buffer and clear the screen, instead of just
-clearing the screen. For ZSH, in :file:`~/.zshrc` after the above functions, add:
+For instance, using these escape codes, it is possible to remap :kbd:`Ctrl+L`
+to both scroll the current screen contents into the scrollback buffer and clear
+the screen, instead of just clearing the screen. For ZSH, in :file:`~/.zshrc`, add:
 
 .. code-block:: zsh
 
-    zle -N clear-screen-saving-contents-in-scrollback
-    bindkey '^l' clear-screen-saving-contents-in-scrollback
+    ctrl_l() {
+        builtin print -rn -- $'\r\e[0J\e[H\e[22J' >"$TTY"
+        builtin zle .reset-prompt
+        builtin zle -R
+    }
+    zle -N ctrl_l
+    bindkey '^l' ctrl_l
 
+Alternatively, you can just add :code:`map ctrl+l clear_terminal to_cursor_scroll active` to :file:`kitty.conf` which
+works with no changes to the shell rc files, but only clears up to the prompt, it does not clear anytext at the prompt itself.
 '''
     )
 
@@ -4089,7 +4261,7 @@ This will send "Special text" when you press the :kbd:`Ctrl+Alt+A` key
 combination. The text to be sent decodes :link:`ANSI C escapes <https://www.gnu.org/software/bash/manual/html_node/ANSI_002dC-Quoting.html>`
 so you can use escapes like :code:`\\\\e` to send control codes or :code:`\\\\u21fb` to send
 Unicode characters (or you can just input the Unicode characters directly as
-UTF-8 text). You can use ``kitty +kitten show_key`` to get the key escape
+UTF-8 text). You can use ``kitten show-key`` to get the key escape
 codes you want to emulate.
 
 The first argument to :code:`send_text` is the keyboard modes in which to

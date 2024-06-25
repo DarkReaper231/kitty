@@ -4,6 +4,7 @@ package unicode_input
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -11,8 +12,6 @@ import (
 	"kitty/tools/utils"
 	"kitty/tools/utils/style"
 	"kitty/tools/wcswidth"
-
-	"golang.org/x/exp/slices"
 )
 
 var _ = fmt.Print
@@ -51,15 +50,21 @@ func ljust(s string, sz int) string {
 	return s
 }
 
+type scroll_data struct {
+	num_items_per_page int
+	scroll_rows        int
+}
+
 type table struct {
-	emoji_variation          string
-	layout_dirty             bool
-	last_rows, last_cols     int
-	codepoints               []rune
-	current_idx, scroll_rows int
-	text                     string
-	num_cols, num_rows       int
-	mode                     Mode
+	emoji_variation      string
+	layout_dirty         bool
+	last_rows, last_cols int
+	codepoints           []rune
+	current_idx          int
+	scroll_data          scroll_data
+	text                 string
+	num_cols, num_rows   int
+	mode                 Mode
 
 	green, reversed, intense_gray func(...any) string
 }
@@ -81,6 +86,7 @@ func (self *table) current_codepoint() rune {
 }
 
 func (self *table) set_codepoints(codepoints []rune, mode Mode, current_idx int) {
+	delta := len(codepoints) - len(self.codepoints)
 	self.codepoints = codepoints
 	if self.codepoints != nil && mode != FAVORITES && mode != HEX {
 		slices.Sort(self.codepoints)
@@ -93,7 +99,9 @@ func (self *table) set_codepoints(codepoints []rune, mode Mode, current_idx int)
 	if self.current_idx >= len(self.codepoints) {
 		self.current_idx = 0
 	}
-	self.scroll_rows = 0
+	if delta != 0 {
+		self.scroll_data = scroll_data{}
+	}
 }
 
 func (self *table) codepoint_at_hint(hint string) rune {
@@ -194,11 +202,17 @@ func (self *table) layout(rows, cols int) string {
 	}
 	col_width := longest + 2
 	col_width = utils.Min(col_width, 40)
-	space_for_desc = col_width - 2 - idx_size - 4
 	self.num_cols = utils.Max(cols/col_width, 1)
+	if self.num_cols == 1 {
+		col_width = cols
+	}
+	space_for_desc = col_width - 2 - idx_size - 4
 	self.num_rows = rows
 	rows_left := rows
-	skip_scroll := self.scroll_rows * self.num_cols
+	if self.scroll_data.num_items_per_page != self.num_cols*self.num_rows {
+		self.update_scroll_data()
+	}
+	skip_scroll := self.scroll_data.scroll_rows * self.num_cols
 
 	for i, cd := range parts {
 		if skip_scroll > 0 {
@@ -207,7 +221,7 @@ func (self *table) layout(rows, cols int) string {
 		}
 		cell(i, cd)
 		output.WriteString("  ")
-		if i > 0 && (i+1)%self.num_cols == 0 {
+		if self.num_cols == 1 || (i > 0 && (i+1)%self.num_cols == 0) {
 			rows_left -= 1
 			if rows_left == 0 {
 				break
@@ -218,6 +232,12 @@ func (self *table) layout(rows, cols int) string {
 
 	self.text = output.String()
 	return self.text
+}
+
+func (self *table) update_scroll_data() {
+	self.scroll_data.num_items_per_page = self.num_rows * self.num_cols
+	page_num := self.current_idx / self.scroll_data.num_items_per_page
+	self.scroll_data.scroll_rows = self.num_rows * page_num
 }
 
 func (self *table) move_current(rows, cols int) {
@@ -234,13 +254,5 @@ func (self *table) move_current(rows, cols int) {
 		self.current_idx = utils.Max(0, utils.Min(self.current_idx, len(self.codepoints)-1))
 		self.layout_dirty = true
 	}
-	first_visible := self.scroll_rows * self.num_cols
-	last_visible := first_visible + ((self.num_cols * self.num_rows) - 1)
-	scroll_amount := self.num_rows
-	if self.current_idx < first_visible {
-		self.scroll_rows = utils.Max(self.scroll_rows-scroll_amount, 0)
-	}
-	if self.current_idx > last_visible {
-		self.scroll_rows += scroll_amount
-	}
+	self.update_scroll_data()
 }

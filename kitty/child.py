@@ -1,17 +1,18 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
 import os
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, suppress
+from itertools import count
 from typing import TYPE_CHECKING, DefaultDict, Dict, Generator, List, Optional, Sequence, Tuple
 
 import kitty.fast_data_types as fast_data_types
 
 from .constants import handled_signals, is_freebsd, is_macos, kitten_exe, kitty_base_dir, shell_path, terminfo_dir
 from .types import run_once
-from .utils import log_error, which
+from .utils import cmdline_for_hold, log_error, which
 
 try:
     from typing import TypedDict
@@ -179,10 +180,18 @@ def getpid() -> str:
     return str(os.getpid())
 
 
+@run_once
+def base64_terminfo_data() -> str:
+    return (b'b64:' + fast_data_types.base64_encode(fast_data_types.terminfo_data(), True)).decode('ascii')
+
+
 class ProcessDesc(TypedDict):
     cwd: Optional[str]
     pid: int
     cmdline: Optional[Sequence[str]]
+
+
+child_counter = count()
 
 
 class Child:
@@ -200,13 +209,15 @@ class Child:
         cwd_from: Optional['CwdRequest'] = None,
         is_clone_launch: str = '',
         add_listen_on_env_var: bool = True,
+        hold: bool = False,
     ):
         self.is_clone_launch = is_clone_launch
+        self.id = next(child_counter)
         self.add_listen_on_env_var = add_listen_on_env_var
         self.argv = list(argv)
         if cwd_from:
             try:
-                cwd = cwd_from.modify_argv_for_launch_with_cwd(self.argv) or cwd
+                cwd = cwd_from.modify_argv_for_launch_with_cwd(self.argv, env) or cwd
             except Exception as err:
                 log_error(f'Failed to read cwd of {cwd_from} with error: {err}')
         else:
@@ -214,16 +225,21 @@ class Child:
         self.cwd = os.path.abspath(cwd)
         self.stdin = stdin
         self.env = env or {}
+        self.final_env:Dict[str, str] = {}
+        self.is_default_shell = bool(self.argv and self.argv[0] == shell_path)
+        self.should_run_via_run_shell_kitten = is_macos and self.is_default_shell
+        self.hold = hold
 
-    def final_env(self) -> Dict[str, str]:
+    def get_final_env(self) -> Dict[str, str]:
         from kitty.options.utils import DELETE_ENV_VAR
         env = default_env().copy()
+        opts = fast_data_types.get_options()
         boss = fast_data_types.get_boss()
         if is_macos and env.get('LC_CTYPE') == 'UTF-8' and not getattr(sys, 'kitty_run_data').get(
                 'lc_ctype_before_python') and not getattr(default_env, 'lc_ctype_set_by_user', False):
             del env['LC_CTYPE']
         env.update(self.env)
-        env['TERM'] = fast_data_types.get_options().term
+        env['TERM'] = opts.term
         env['COLORTERM'] = 'truecolor'
         env['KITTY_PID'] = getpid()
         env['KITTY_PUBLIC_KEY'] = boss.encryption_public_key
@@ -236,13 +252,17 @@ class Child:
             # can use it to display the current directory name rather
             # than the resolved path
             env['PWD'] = self.cwd
-        tdir = checked_terminfo_dir()
-        if tdir:
-            env['TERMINFO'] = tdir
+        if opts.terminfo_type == 'path':
+            tdir = checked_terminfo_dir()
+            if tdir:
+                env['TERMINFO'] = tdir
+        elif opts.terminfo_type == 'direct':
+            env['TERMINFO'] = base64_terminfo_data()
         env['KITTY_INSTALLATION_DIR'] = kitty_base_dir
-        opts = fast_data_types.get_options()
+        if opts.forward_stdio:
+            env['KITTY_STDIO_FORWARDED'] = '3'
         self.unmodified_argv = list(self.argv)
-        if 'disabled' not in opts.shell_integration:
+        if not self.should_run_via_run_shell_kitten and 'disabled' not in opts.shell_integration:
             from .shell_integration import modify_shell_environ
             modify_shell_environ(opts, env, self.argv)
         env = {k: v for k, v in env.items() if v is not DELETE_ENV_VAR}
@@ -256,6 +276,7 @@ class Child:
     def fork(self) -> Optional[int]:
         if self.forked:
             return None
+        opts = fast_data_types.get_options()
         self.forked = True
         master, slave = openpty()
         stdin, self.stdin = self.stdin, None
@@ -268,10 +289,10 @@ class Child:
             os.set_inheritable(stdin_read_fd, True)
         else:
             stdin_read_fd = stdin_write_fd = -1
-        env = tuple(f'{k}={v}' for k, v in self.final_env().items())
+        self.final_env = self.get_final_env()
         argv = list(self.argv)
-        exe = argv[0]
-        if is_macos and exe == shell_path:
+        cwd = self.cwd
+        if self.should_run_via_run_shell_kitten:
             # bash will only source ~/.bash_profile if it detects it is a login
             # shell (see the invocation section of the bash man page), which it
             # does if argv[0] is prefixed by a hyphen see
@@ -286,12 +307,32 @@ class Child:
             # https://github.com/kovidgoyal/kitty/issues/1870
             # xterm, urxvt, konsole and gnome-terminal do not do it in my
             # testing.
-            argv[0] = (f'-{exe.split("/")[-1]}')
-        self.final_exe = which(exe) or exe
+            import shlex
+            ksi = ' '.join(opts.shell_integration)
+            if ksi == 'invalid':
+                ksi = 'enabled'
+            argv = [kitten_exe(), 'run-shell', '--shell', shlex.join(argv), '--shell-integration', ksi]
+            if is_macos:
+                # In addition for getlogin() to work we need to run the shell
+                # via the /usr/bin/login wrapper, sigh.
+                # And login on macOS looks for .hushlogin in CWD instead of
+                # HOME, bloody idiotic so we cant cwd when running it.
+                # https://github.com/kovidgoyal/kitty/issues/6511
+                import pwd
+                user = pwd.getpwuid(os.geteuid()).pw_name
+                if cwd:
+                    argv.append('--cwd=' + cwd)
+                    cwd = os.path.expanduser('~')
+                argv = ['/usr/bin/login', '-f', '-l', '-p', user] + argv
+        self.final_exe = final_exe = which(argv[0]) or argv[0]
         self.final_argv0 = argv[0]
+        if self.hold:
+            argv = cmdline_for_hold(argv)
+            final_exe = argv[0]
+        env = tuple(f'{k}={v}' for k, v in self.final_env.items())
         pid = fast_data_types.spawn(
-            self.final_exe, self.cwd, tuple(argv), env, master, slave, stdin_read_fd, stdin_write_fd,
-            ready_read_fd, ready_write_fd, tuple(handled_signals), kitten_exe())
+            final_exe, cwd, tuple(argv), env, master, slave, stdin_read_fd, stdin_write_fd,
+            ready_read_fd, ready_write_fd, tuple(handled_signals), kitten_exe(), opts.forward_stdio)
         os.close(slave)
         self.pid = pid
         self.child_fd = master
@@ -302,6 +343,14 @@ class Child:
         self.terminal_ready_fd = ready_write_fd
         if self.child_fd is not None:
             os.set_blocking(self.child_fd, False)
+        if not is_macos:
+            ppid = getpid()
+            try:
+                fast_data_types.systemd_move_pid_into_new_scope(pid, f'kitty-{ppid}-{self.id}.scope', f'kitty child process: {pid} launched by: {ppid}')
+            except NotImplementedError:
+                pass
+            except OSError as err:
+                log_error("Could not move child process into a systemd scope: " + str(err))
         return pid
 
     def __del__(self) -> None:
@@ -363,9 +412,9 @@ class Child:
     def environ(self) -> Dict[str, str]:
         try:
             assert self.pid is not None
-            return environ_of_process(self.pid)
+            return environ_of_process(self.pid) or self.final_env.copy()
         except Exception:
-            return {}
+            return self.final_env.copy()
 
     @property
     def current_cwd(self) -> Optional[str]:

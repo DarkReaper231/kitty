@@ -221,6 +221,9 @@ load_glfw(const char* path) {
     *(void **) (&glfwSetWindowAttrib_impl) = dlsym(handle, "glfwSetWindowAttrib");
     if (glfwSetWindowAttrib_impl == NULL) fail("Failed to load glfw function glfwSetWindowAttrib with error: %s", dlerror());
 
+    *(void **) (&glfwSetWindowBlur_impl) = dlsym(handle, "glfwSetWindowBlur");
+    if (glfwSetWindowBlur_impl == NULL) fail("Failed to load glfw function glfwSetWindowBlur with error: %s", dlerror());
+
     *(void **) (&glfwSetWindowUserPointer_impl) = dlsym(handle, "glfwSetWindowUserPointer");
     if (glfwSetWindowUserPointer_impl == NULL) fail("Failed to load glfw function glfwSetWindowUserPointer with error: %s", dlerror());
 
@@ -413,9 +416,6 @@ load_glfw(const char* path) {
     *(void **) (&glfwGetCocoaWindow_impl) = dlsym(handle, "glfwGetCocoaWindow");
     if (glfwGetCocoaWindow_impl == NULL) dlerror(); // clear error indicator
 
-    *(void **) (&glfwHideCocoaTitlebar_impl) = dlsym(handle, "glfwHideCocoaTitlebar");
-    if (glfwHideCocoaTitlebar_impl == NULL) dlerror(); // clear error indicator
-
     *(void **) (&glfwGetNSGLContext_impl) = dlsym(handle, "glfwGetNSGLContext");
     if (glfwGetNSGLContext_impl == NULL) dlerror(); // clear error indicator
 
@@ -443,6 +443,9 @@ load_glfw(const char* path) {
     *(void **) (&glfwCocoaRequestRenderFrame_impl) = dlsym(handle, "glfwCocoaRequestRenderFrame");
     if (glfwCocoaRequestRenderFrame_impl == NULL) dlerror(); // clear error indicator
 
+    *(void **) (&glfwCocoaSetWindowResizeCallback_impl) = dlsym(handle, "glfwCocoaSetWindowResizeCallback");
+    if (glfwCocoaSetWindowResizeCallback_impl == NULL) dlerror(); // clear error indicator
+
     *(void **) (&glfwGetX11Display_impl) = dlsym(handle, "glfwGetX11Display");
     if (glfwGetX11Display_impl == NULL) dlerror(); // clear error indicator
 
@@ -451,6 +454,9 @@ load_glfw(const char* path) {
 
     *(void **) (&glfwSetPrimarySelectionString_impl) = dlsym(handle, "glfwSetPrimarySelectionString");
     if (glfwSetPrimarySelectionString_impl == NULL) dlerror(); // clear error indicator
+
+    *(void **) (&glfwCocoaSetWindowChrome_impl) = dlsym(handle, "glfwCocoaSetWindowChrome");
+    if (glfwCocoaSetWindowChrome_impl == NULL) dlerror(); // clear error indicator
 
     *(void **) (&glfwGetPrimarySelectionString_impl) = dlsym(handle, "glfwGetPrimarySelectionString");
     if (glfwGetPrimarySelectionString_impl == NULL) dlerror(); // clear error indicator
@@ -464,11 +470,23 @@ load_glfw(const char* path) {
     *(void **) (&glfwWaylandActivateWindow_impl) = dlsym(handle, "glfwWaylandActivateWindow");
     if (glfwWaylandActivateWindow_impl == NULL) dlerror(); // clear error indicator
 
+    *(void **) (&glfwWaylandMissingCapabilities_impl) = dlsym(handle, "glfwWaylandMissingCapabilities");
+    if (glfwWaylandMissingCapabilities_impl == NULL) dlerror(); // clear error indicator
+
     *(void **) (&glfwWaylandRunWithActivationToken_impl) = dlsym(handle, "glfwWaylandRunWithActivationToken");
     if (glfwWaylandRunWithActivationToken_impl == NULL) dlerror(); // clear error indicator
 
     *(void **) (&glfwWaylandSetTitlebarColor_impl) = dlsym(handle, "glfwWaylandSetTitlebarColor");
     if (glfwWaylandSetTitlebarColor_impl == NULL) dlerror(); // clear error indicator
+
+    *(void **) (&glfwWaylandRedrawCSDWindowTitle_impl) = dlsym(handle, "glfwWaylandRedrawCSDWindowTitle");
+    if (glfwWaylandRedrawCSDWindowTitle_impl == NULL) dlerror(); // clear error indicator
+
+    *(void **) (&glfwWaylandSetupLayerShellForNextWindow_impl) = dlsym(handle, "glfwWaylandSetupLayerShellForNextWindow");
+    if (glfwWaylandSetupLayerShellForNextWindow_impl == NULL) dlerror(); // clear error indicator
+
+    *(void **) (&glfwWaylandCompositorPID_impl) = dlsym(handle, "glfwWaylandCompositorPID");
+    if (glfwWaylandCompositorPID_impl == NULL) dlerror(); // clear error indicator
 
     *(void **) (&glfwDBusUserNotify_impl) = dlsym(handle, "glfwDBusUserNotify");
     if (glfwDBusUserNotify_impl == NULL) dlerror(); // clear error indicator

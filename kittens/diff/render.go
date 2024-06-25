@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 
@@ -158,7 +159,7 @@ var format_as_sgr struct {
 	title, margin, added, removed, added_margin, removed_margin, filler, margin_filler, hunk_margin, hunk, selection, search string
 }
 
-var statusline_format, added_count_format, removed_count_format, message_format, selection_format func(...any) string
+var statusline_format, added_count_format, removed_count_format, message_format func(...any) string
 
 func create_formatters() {
 	ctx := style.Context{AllowEscapeCodes: true}
@@ -390,8 +391,6 @@ func image_lines(left_path, right_path string, screen_size screen_size, margin_s
 	return append(ans, ll), nil
 }
 
-type formatter = func(...any) string
-
 func first_binary_line(left_path, right_path string, columns, margin_size int, renderer func(path string) (string, error)) (*LogicalLine, error) {
 	available_cols := columns/2 - margin_size
 	ll := LogicalLine{
@@ -571,7 +570,15 @@ func lines_for_diff(left_path string, right_path string, patch *Patch, columns, 
 		is_full_width: true,
 	}
 	if patch.Len() == 0 {
-		for _, line := range splitlines("The files are identical", columns-margin_size) {
+		txt := "The files are identical"
+		if lstat, err := os.Stat(left_path); err == nil {
+			if rstat, err := os.Stat(right_path); err == nil {
+				if lstat.Mode() != rstat.Mode() {
+					txt = fmt.Sprintf("Mode changed: %s to %s", lstat.Mode(), rstat.Mode())
+				}
+			}
+		}
+		for _, line := range splitlines(txt, columns-margin_size) {
 			sl := ScreenLine{}
 			sl.left.marked_up_text = line
 			ht.screen_lines = append(ht.screen_lines, &sl)
@@ -752,12 +759,12 @@ func render(collection *Collection, diff_map map[string]*Patch, screen_size scre
 		}
 		return nil
 	})
-	return &LogicalLines{lines: ans[:len(ans)-1], margin_size: margin_size, columns: columns}, err
-}
-
-func (self *LogicalLines) num_of_screen_lines() (ans int) {
-	for _, l := range self.lines {
-		ans += len(l.screen_lines)
+	var ll []*LogicalLine
+	if len(ans) > 1 {
+		ll = ans[:len(ans)-1]
+	} else {
+		// Having am empty list of lines causes panics later on
+		ll = []*LogicalLine{{line_type: EMPTY_LINE, screen_lines: []*ScreenLine{{}}}}
 	}
-	return
+	return &LogicalLines{lines: ll, margin_size: margin_size, columns: columns}, err
 }

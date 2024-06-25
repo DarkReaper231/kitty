@@ -13,6 +13,8 @@
 #endif
 
 #include "data-types.h"
+#include "charsets.h"
+#include "base64.h"
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -24,7 +26,6 @@
 #include "modes.h"
 #include <stddef.h>
 #include <termios.h>
-#include <signal.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <locale.h>
@@ -50,7 +51,7 @@ static PyObject*
 process_group_map(void) {
     int num_of_processes = proc_listallpids(NULL, 0);
     size_t bufsize = sizeof(pid_t) * (num_of_processes + 1024);
-    FREE_AFTER_FUNCTION pid_t *buf = malloc(bufsize);
+    RAII_ALLOC(pid_t, buf, malloc(bufsize));
     if (!buf) return PyErr_NoMemory();
     num_of_processes = proc_listallpids(buf, (int)bufsize);
     PyObject *ans = PyTuple_New(num_of_processes);
@@ -74,6 +75,36 @@ redirect_std_streams(PyObject UNUSED *self, PyObject *args) {
     if (freopen(devnull, "w", stderr) == NULL)  return PyErr_SetFromErrno(PyExc_OSError);
     Py_RETURN_NONE;
 }
+
+static PyObject*
+pybase64_encode(PyObject UNUSED *self, PyObject *args) {
+    int add_padding = 0;
+    RAII_PY_BUFFER(view);
+    if (!PyArg_ParseTuple(args, "s*|p", &view, &add_padding)) return NULL;
+    size_t sz = required_buffer_size_for_base64_encode(view.len);
+    PyObject *ans = PyBytes_FromStringAndSize(NULL, sz);
+    if (!ans) return NULL;
+    base64_encode8(view.buf, view.len, (unsigned char*)PyBytes_AS_STRING(ans), &sz, add_padding);
+    if (_PyBytes_Resize(&ans, sz) != 0) return NULL;
+    return ans;
+}
+
+static PyObject*
+pybase64_decode(PyObject UNUSED *self, PyObject *args) {
+    RAII_PY_BUFFER(view);
+    if (!PyArg_ParseTuple(args, "s*", &view)) return NULL;
+    size_t sz = required_buffer_size_for_base64_decode(view.len);
+    PyObject *ans = PyBytes_FromStringAndSize(NULL, sz);
+    if (!ans) return NULL;
+    if (!base64_decode8(view.buf, view.len, (unsigned char*)PyBytes_AS_STRING(ans), &sz)) {
+        Py_DECREF(ans);
+        PyErr_SetString(PyExc_ValueError, "Invalid base64 input data");
+        return NULL;
+    }
+    if (_PyBytes_Resize(&ans, sz) != 0) return NULL;
+    return ans;
+}
+
 
 static PyObject*
 pyset_iutf8(PyObject UNUSED *self, PyObject *args) {
@@ -218,7 +249,7 @@ get_docs_ref_map(PyObject *self UNUSED, PyObject *args UNUSED) {
 
 static PyObject*
 wrapped_kittens(PyObject *self UNUSED, PyObject *args UNUSED) {
-    const char *wrapped_kitten_names = WRAPPED_KITTENS;
+    static const char *wrapped_kitten_names = WRAPPED_KITTENS;
     PyObject *ans = PyUnicode_FromString(wrapped_kitten_names);
     if (ans == NULL) return NULL;
     PyObject *s = PyUnicode_Split(ans, NULL, -1);
@@ -294,7 +325,110 @@ expand_ansi_c_escapes(PyObject *self UNUSED, PyObject *src) {
     return ans;
 }
 
+START_ALLOW_CASE_RANGE
+static PyObject*
+c0_replace_bytes(const char *input_data, Py_ssize_t input_sz) {
+    RAII_PyObject(ans, PyBytes_FromStringAndSize(NULL, input_sz * 3));
+    if (!ans) return NULL;
+    char *output = PyBytes_AS_STRING(ans);
+    char buf[4];
+    Py_ssize_t j = 0;
+    for (Py_ssize_t i = 0; i < input_sz; i++) {
+        const char x = input_data[i];
+        switch (x) {
+            case C0_EXCEPT_NL_SPACE_TAB: {
+                const uint32_t ch = 0x2400 + x;
+                const unsigned sz = encode_utf8(ch, buf);
+                for (unsigned c = 0; c < sz; c++, j++) output[j] = buf[c];
+            } break;
+            default:
+                output[j++] = x; break;
+        }
+    }
+    if (_PyBytes_Resize(&ans, j) != 0) return NULL;
+    Py_INCREF(ans);
+    return ans;
+}
+
+static PyObject*
+c0_replace_unicode(PyObject *input) {
+    RAII_PyObject(ans, PyUnicode_New(PyUnicode_GET_LENGTH(input), 1114111));
+    if (!ans) return NULL;
+    void *input_data = PyUnicode_DATA(input);
+    int input_kind = PyUnicode_KIND(input);
+    void *output_data = PyUnicode_DATA(ans);
+    int output_kind = PyUnicode_KIND(ans);
+    Py_UCS4 maxchar = 0;
+    bool changed = false;
+    for (Py_ssize_t i = 0; i < PyUnicode_GET_LENGTH(input); i++) {
+        Py_UCS4 ch = PyUnicode_READ(input_kind, input_data, i);
+        switch(ch) { case C0_EXCEPT_NL_SPACE_TAB: ch += 0x2400; changed = true; }
+        if (ch > maxchar) maxchar = ch;
+        PyUnicode_WRITE(output_kind, output_data, i, ch);
+    }
+    if (!changed) { Py_INCREF(input); return input; }
+    if (maxchar > 65535) { Py_INCREF(ans); return ans; }
+    RAII_PyObject(ans2, PyUnicode_New(PyUnicode_GET_LENGTH(ans), maxchar));
+    if (!ans2) return NULL;
+    if (PyUnicode_CopyCharacters(ans2, 0, ans, 0, PyUnicode_GET_LENGTH(ans)) == -1) return NULL;
+    Py_INCREF(ans2); return ans2;
+}
+END_ALLOW_CASE_RANGE
+
+static PyObject*
+replace_c0_codes_except_nl_space_tab(PyObject *self UNUSED, PyObject *obj) {
+    if (PyUnicode_Check(obj)) {
+        return c0_replace_unicode(obj);
+    } else if (PyBytes_Check(obj)) {
+        return c0_replace_bytes(PyBytes_AS_STRING(obj), PyBytes_GET_SIZE(obj));
+    } else if (PyMemoryView_Check(obj)) {
+        Py_buffer *buf = PyMemoryView_GET_BUFFER(obj);
+        return c0_replace_bytes(buf->buf, buf->len);
+    } else if (PyByteArray_Check(obj)) {
+        return c0_replace_bytes(PyByteArray_AS_STRING(obj), PyByteArray_GET_SIZE(obj));
+    } else {
+        PyErr_SetString(PyExc_TypeError, "Input must be bytes, memoryview, bytearray or unicode");
+        return NULL;
+    }
+}
+
+
+static PyObject*
+find_in_memoryview(PyObject *self UNUSED, PyObject *args) {
+    unsigned char q;
+    RAII_PY_BUFFER(view);
+    if (!PyArg_ParseTuple(args, "y*b", &view, &q)) return NULL;
+    const char *buf = view.buf, *p = memchr(buf, q, view.len);
+    Py_ssize_t ans = -1;
+    if (p) ans = p - buf;
+    return PyLong_FromSsize_t(ans);
+}
+
+#include "terminfo.h"
+
+static PyObject*
+py_terminfo_data(PyObject *self UNUSED, PyObject *args UNUSED) {
+    return PyBytes_FromStringAndSize((const char*)terminfo_data, arraysz(terminfo_data));
+}
+
+static PyObject*
+py_monotonic(PyObject *self UNUSED, PyObject *args UNUSED) {
+    return PyFloat_FromDouble(monotonic_t_to_s_double(monotonic()));
+}
+
+static PyObject*
+py_timed_debug_print(PyObject *self UNUSED, PyObject *args) {
+    const char *payload; Py_ssize_t sz;
+    if (!PyArg_ParseTuple(args, "s#", &payload, &sz)) return NULL;
+    const char *fmt = "%.*s";
+    if (sz && payload[sz-1] == '\n') { fmt = "%.*s\n"; sz--; }
+    timed_debug_print(fmt, sz, payload);
+    Py_RETURN_NONE;
+}
+
+
 static PyMethodDef module_methods[] = {
+    METHODB(replace_c0_codes_except_nl_space_tab, METH_O),
     {"wcwidth", (PyCFunction)wcwidth_wrap, METH_O, ""},
     {"expand_ansi_c_escapes", (PyCFunction)expand_ansi_c_escapes, METH_O, ""},
     {"get_docs_ref_map", (PyCFunction)get_docs_ref_map, METH_NOARGS, ""},
@@ -306,14 +440,18 @@ static PyMethodDef module_methods[] = {
     {"raw_tty", raw_tty, METH_VARARGS, ""},
     {"close_tty", close_tty, METH_VARARGS, ""},
     {"set_iutf8_fd", (PyCFunction)pyset_iutf8, METH_VARARGS, ""},
+    {"base64_encode", (PyCFunction)pybase64_encode, METH_VARARGS, ""},
+    {"base64_decode", (PyCFunction)pybase64_decode, METH_VARARGS, ""},
     {"thread_write", (PyCFunction)cm_thread_write, METH_VARARGS, ""},
-    {"parse_bytes", (PyCFunction)parse_bytes, METH_VARARGS, ""},
-    {"parse_bytes_dump", (PyCFunction)parse_bytes_dump, METH_VARARGS, ""},
     {"redirect_std_streams", (PyCFunction)redirect_std_streams, METH_VARARGS, ""},
     {"locale_is_valid", (PyCFunction)locale_is_valid, METH_VARARGS, ""},
     {"shm_open", (PyCFunction)py_shm_open, METH_VARARGS, ""},
     {"shm_unlink", (PyCFunction)py_shm_unlink, METH_VARARGS, ""},
     {"wrapped_kitten_names", (PyCFunction)wrapped_kittens, METH_NOARGS, ""},
+    {"terminfo_data", (PyCFunction)py_terminfo_data, METH_NOARGS, ""},
+    {"monotonic", (PyCFunction)py_monotonic, METH_NOARGS, ""},
+    {"timed_debug_print", (PyCFunction)py_timed_debug_print, METH_VARARGS, ""},
+    {"find_in_memoryview", (PyCFunction)find_in_memoryview, METH_VARARGS, ""},
 #ifdef __APPLE__
     METHODB(user_cache_dir, METH_NOARGS),
     METHODB(process_group_map, METH_NOARGS),
@@ -338,6 +476,8 @@ static struct PyModuleDef module = {
 extern int init_LineBuf(PyObject *);
 extern int init_HistoryBuf(PyObject *);
 extern int init_Cursor(PyObject *);
+extern int init_Shlex(PyObject *);
+extern int init_Parser(PyObject *);
 extern int init_DiskCache(PyObject *);
 extern bool init_child_monitor(PyObject *);
 extern int init_Line(PyObject *);
@@ -359,6 +499,7 @@ extern bool init_logging(PyObject *module);
 extern bool init_png_reader(PyObject *module);
 extern bool init_utmp(PyObject *module);
 extern bool init_loop_utils(PyObject *module);
+extern bool init_systemd_module(PyObject *module);
 #ifdef __APPLE__
 extern int init_CoreText(PyObject *);
 extern bool init_cocoa(PyObject *module);
@@ -401,6 +542,8 @@ PyInit_fast_data_types(void) {
     if (!init_HistoryBuf(m)) return NULL;
     if (!init_Line(m)) return NULL;
     if (!init_Cursor(m)) return NULL;
+    if (!init_Shlex(m)) return NULL;
+    if (!init_Parser(m)) return NULL;
     if (!init_DiskCache(m)) return NULL;
     if (!init_child_monitor(m)) return NULL;
     if (!init_ColorProfile(m)) return NULL;
@@ -428,6 +571,7 @@ PyInit_fast_data_types(void) {
     if (!init_utmp(m)) return NULL;
     if (!init_loop_utils(m)) return NULL;
     if (!init_crypto_library(m)) return NULL;
+    if (!init_systemd_module(m)) return NULL;
 
     CellAttrs a;
 #define s(name, attr) { a.val = 0; a.attr = 1; PyModule_AddIntConstant(m, #name, shift_to_first_set_bit(a)); }
@@ -449,11 +593,12 @@ PyInit_fast_data_types(void) {
     PyModule_AddIntMacro(m, DECCOLM);
     PyModule_AddIntMacro(m, DECOM);
     PyModule_AddIntMacro(m, IRM);
-    PyModule_AddIntMacro(m, CSI);
-    PyModule_AddIntMacro(m, DCS);
-    PyModule_AddIntMacro(m, APC);
-    PyModule_AddIntMacro(m, OSC);
     PyModule_AddIntMacro(m, FILE_TRANSFER_CODE);
+    PyModule_AddIntMacro(m, ESC_CSI);
+    PyModule_AddIntMacro(m, ESC_OSC);
+    PyModule_AddIntMacro(m, ESC_APC);
+    PyModule_AddIntMacro(m, ESC_DCS);
+    PyModule_AddIntMacro(m, ESC_PM);
 #ifdef __APPLE__
     // Apple says its SHM_NAME_MAX but SHM_NAME_MAX is not actually declared in typical CrApple style.
     // This value is based on experimentation and from qsharedmemory.cpp in Qt

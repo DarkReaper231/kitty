@@ -1,12 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
 import re
 from binascii import hexlify, unhexlify
-from typing import TYPE_CHECKING, Dict, Generator, Optional, cast
+from typing import Dict, Generator, Optional, cast
 
-if TYPE_CHECKING:
-    from .options.types import Options
+from kitty.options.types import Options
 
 
 def modify_key_bytes(keybytes: bytes, amt: int) -> bytes:
@@ -25,7 +24,7 @@ def encode_keystring(keybytes: bytes) -> str:
     return keybytes.decode('ascii').replace('\033', r'\E')
 
 
-names = 'xterm-kitty', 'KovIdTTY'
+names = Options.term, 'KovIdTTY'
 
 termcap_aliases = {
     'TN': 'name'
@@ -53,13 +52,14 @@ bool_capabilities = {
     # Terminfo extension used by tmux to detect true color support (non-standard)
     'Tc',
     # Indicates support for styled and colored underlines (non-standard) as
-    # described at:
-    # https://github.com/kovidgoyal/kitty/blob/master/protocol-extensions.asciidoc
+    # described at: https://sw.kovidgoyal.net/kitty/underlines/
     'Su',
     # Indicates support for full keyboard mode (non-standard) as
     # described at:
     # https://github.com/kovidgoyal/kitty/blob/master/protocol-extensions.asciidoc
     'fullkbd',
+    # Terminal supports focus events: https://lists.gnu.org/archive/html/bug-ncurses/2023-10/msg00117.html
+    'XF',
 
     # The following are entries that we don't use
     # # background color erase
@@ -181,7 +181,14 @@ string_capabilities = {
     'kbs': r'\177',
     # Mouse event has occurred
     'kmous': r'\E[M',
+
+    # These break mouse events in htop so they are disabled
+    # Turn on mouse reporting
+    # 'XM': '\E[?1006;1004;1000%?%p1%{1}%=%th%el%;',
+    # Expected format for mouse reporting escape codes
+    # 'xm': r'\E[<%i%p3%d;%p1%d;%p2%d;%?%p4%tM%em%;',
     # Scroll backwards (reverse index)
+
     'kri': r'\E[1;2A',
     # scroll forwards (index)
     'kind': r'\E[1;2B',
@@ -245,7 +252,7 @@ string_capabilities = {
     # From status line (end window title string)
     'fsl': r'^G',
     # Disable status line (clear window title)
-    'dsl': r'\E]2;\007',
+    'dsl': r'\E]2;\E\\',
     # Move to specified line
     'vpa': r'\E[%i%p1%dd',
     # Enter italics mode
@@ -266,6 +273,19 @@ string_capabilities = {
     'setrgbf': r'\E[38:2:%p1%d:%p2%d:%p3%dm',
     # Set RGB background color (non-standard used by neovim)
     'setrgbb': r'\E[48:2:%p1%d:%p2%d:%p3%dm',
+    # DECSCUSR Set cursor style
+    'Ss': r'\E[%p1%d\sq',
+    # DECSCUSR Reset cursor style to power-on default
+    'Se': r'\E[2\sq',
+    # Set cursor color
+    'Cs': r'\E]12;%p1%s\007',
+    # Reset cursor color
+    'Cr': r'\E]112\007',
+    # Indicates support for styled and colored underlines (non-standard) as
+    # described at: https://sw.kovidgoyal.net/kitty/underlines/
+    # 'Setulc' is equivalent to the 'Su' boolean capability. Until
+    # standardized, specify both for application compatibility.
+    'Setulc': r'\E[58:2:%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m',
 
     # The following entries are for compatibility with xterm,
     # and shell scripts using e.g. `tput u7` to emit a CPR escape
@@ -275,6 +295,26 @@ string_capabilities = {
     'u7': r'\E[6n',
     'u8': r'\E[?%[;0123456789]c',
     'u9': r'\E[c',
+
+    # Bracketed paste, added to ncurses 6.4 in 2023
+    'PS': r'\E[200~',
+    'PE': r'\E[201~',
+    'BE': r'\E[?2004h',
+    'BD': r'\E[?2004l',
+
+    # XTVERSION
+    'XR': r'\E[>0q',
+    # OSC 52 clipboard access
+    'Ms': r'\E]52;%p1%s;%p2%s\E\\',
+    # Send device attributes (report version)
+    'RV': r'\E[>c',
+    # Focus In and Out events
+    'kxIN': r'\E[I',
+    'kxOUT': r'\E[O',
+    # Enable/disable focus reporting
+    # Add to ncurses in: https://lists.gnu.org/archive/html/bug-ncurses/2023-10/msg00117.html
+    'fe': r'\E[?1004h',
+    'fd': r'\E[?1004l',
 
     # The following are entries that we don't use
     # # turn on blank mode, (characters invisible)
@@ -448,7 +488,7 @@ queryable_capabilities = cast(Dict[str, str], numeric_capabilities.copy())
 queryable_capabilities.update(string_capabilities)
 extra = (bool_capabilities | numeric_capabilities.keys() | string_capabilities.keys()) - set(termcap_aliases.values())
 no_termcap_for = frozenset(
-    'Su Smulx Sync Tc setrgbf setrgbb fullkbd kUP kDN kbeg kBEG'.split() + [
+    'XR XM xm Ms RV kxIN kxOUT Cr Cs Se Ss Setulc Su Smulx Sync Tc PS PE BE BD setrgbf setrgbb fullkbd kUP kDN kbeg kBEG fe fd XF'.split() + [
         f'k{key}{mod}'
         for key in 'UP DN RIT LFT BEG END HOM IC DC PRV NXT'.split()
         for mod in range(3, 8)])
@@ -477,12 +517,13 @@ def key_as_bytes(name: str) -> bytes:
     return ans.encode('ascii')
 
 
-def get_capabilities(query_string: str, opts: 'Options') -> Generator[str, None, None]:
+def get_capabilities(query_string: str, opts: 'Options', window_id: int = 0, os_window_id: int = 0) -> Generator[str, None, None]:
     from .fast_data_types import ERROR_PREFIX
 
     def result(encoded_query_name: str, x: Optional[str] = None) -> str:
-        if x is None:
-            return f'0+r{encoded_query_name}'
+        if not x:
+            valid = 0 if x is None else 1
+            return f'{valid}+r{encoded_query_name}'
         return f'1+r{encoded_query_name}={hexlify(str(x).encode("utf-8")).decode("ascii")}'
 
     for encoded_query_name in query_string.split(';'):
@@ -492,7 +533,7 @@ def get_capabilities(query_string: str, opts: 'Options') -> Generator[str, None,
         elif name.startswith('kitty-query-'):
             from kittens.query_terminal.main import get_result
             name = name[len('kitty-query-'):]
-            rval = get_result(name)
+            rval = get_result(name, window_id, os_window_id)
             if rval is None:
                 from .utils import log_error
                 log_error('Unknown kitty terminfo query:', name)
@@ -500,6 +541,9 @@ def get_capabilities(query_string: str, opts: 'Options') -> Generator[str, None,
             else:
                 yield result(encoded_query_name, rval)
         else:
+            if name in bool_capabilities:
+                yield result(encoded_query_name, '')
+                continue
             try:
                 val = queryable_capabilities[name]
             except KeyError:

@@ -4,11 +4,13 @@ package loop
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -20,8 +22,8 @@ import (
 var SIGNULL unix.Signal
 
 func new_loop() *Loop {
-	l := Loop{controlling_term: nil, timers_temp: make([]*timer, 4)}
-	l.terminal_options.alternate_screen = true
+	l := Loop{controlling_term: nil}
+	l.terminal_options.Alternate_screen = true
 	l.terminal_options.restore_colors = true
 	l.terminal_options.kitty_keyboard_mode = DISAMBIGUATE_KEYS | REPORT_ALTERNATE_KEYS | REPORT_ALL_KEYS_AS_ESCAPE_CODES | REPORT_TEXT_WITH_KEYS
 	l.escape_code_parser.HandleCSI = l.handle_csi
@@ -42,9 +44,25 @@ func is_temporary_error(err error) bool {
 }
 
 func kill_self(sig unix.Signal) {
-	unix.Kill(os.Getpid(), sig)
+	_ = unix.Kill(os.Getpid(), sig)
 	// Give the signal time to be delivered
 	time.Sleep(20 * time.Millisecond)
+}
+
+func (self *Loop) set_pointer_shapes(ps []PointerShape) {
+	self.pointer_shapes = ps
+	if len(ps) > 0 {
+		s := strings.Builder{}
+		s.WriteString("\x1b]22;>")
+		for i, x := range ps {
+			s.WriteString(x.String())
+			if i+1 < len(ps) {
+				s.WriteByte(',')
+			}
+		}
+		s.WriteString("\x1b\\")
+		self.QueueWriteString(s.String())
+	}
 }
 
 func (self *Loop) update_screen_size() error {
@@ -155,6 +173,24 @@ func (self *Loop) handle_dcs(raw []byte) error {
 	if self.OnRCResponse != nil && bytes.HasPrefix(raw, utils.UnsafeStringToBytes("@kitty-cmd")) {
 		return self.OnRCResponse(raw[len("@kitty-cmd"):])
 	}
+	if self.OnQueryResponse != nil && (bytes.HasPrefix(raw, utils.UnsafeStringToBytes("1+r")) || bytes.HasPrefix(raw, utils.UnsafeStringToBytes("0+r"))) {
+		valid := raw[0] == '1'
+		s := utils.NewSeparatorScanner(utils.UnsafeBytesToString(raw[3:]), ";")
+		for s.Scan() {
+			key, val, _ := strings.Cut(s.Text(), "=")
+			if k, err := hex.DecodeString(key); err == nil {
+				if bytes.HasPrefix(k, utils.UnsafeStringToBytes("kitty-query-")) {
+					k = k[len("kitty-query-"):]
+					if v, err := hex.DecodeString(val); err == nil {
+						if err = self.OnQueryResponse(string(k), string(v), valid); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
 	if self.OnEscapeCode != nil {
 		return self.OnEscapeCode(DCS, raw)
 	}
@@ -189,21 +225,32 @@ func (self *Loop) handle_rune(raw rune) error {
 	return nil
 }
 
-func (self *Loop) handle_end_of_bracketed_paste() {
+func (self *Loop) handle_end_of_bracketed_paste() error {
 	if self.OnText != nil {
-		self.OnText("", false, false)
+		return self.OnText("", false, false)
 	}
+	return nil
 }
 
 func (self *Loop) on_signal(s unix.Signal) error {
 	switch s {
 	case unix.SIGINT:
+		if self.OnSIGINT != nil {
+			if handled, err := self.OnSIGINT(); handled {
+				return err
+			}
+		}
 		return self.on_SIGINT()
 	case unix.SIGPIPE:
 		return self.on_SIGPIPE()
 	case unix.SIGWINCH:
 		return self.on_SIGWINCH()
 	case unix.SIGTERM:
+		if self.OnSIGTERM != nil {
+			if handled, err := self.OnSIGTERM(); handled {
+				return err
+			}
+		}
 		return self.on_SIGTERM()
 	case unix.SIGTSTP:
 		return self.on_SIGTSTP()
@@ -255,7 +302,7 @@ func (self *Loop) run() (err error) {
 	signal.Notify(signal_channel, handled_signals...)
 	defer signal.Reset(handled_signals...)
 
-	controlling_term, err := tty.OpenControllingTerm()
+	controlling_term, err := tty.OpenControllingTerm(tty.SetRaw)
 	if err != nil {
 		return err
 	}
@@ -264,23 +311,23 @@ func (self *Loop) run() (err error) {
 		controlling_term.RestoreAndClose()
 		self.controlling_term = nil
 	}()
-	err = controlling_term.ApplyOperations(tty.TCSANOW, tty.SetRaw)
-	if err != nil {
-		return nil
-	}
 
 	self.keep_going = true
 	self.pending_mouse_events = utils.NewRingBuffer[MouseEvent](4)
-	tty_write_channel := make(chan *write_msg, 1) // buffered so there is no race between initial queueing and startup of writer thread
+	// tty_write_channel is buffered so there is no race between initial
+	// queueing and startup of writer thread and also as a performance
+	// optimization to avoid copying unnecessarily to pending_writes
+	self.tty_write_channel = make(chan write_msg, 512)
+	self.write_msg_id_counter = 0
 	write_done_channel := make(chan IdType)
 	self.wakeup_channel = make(chan byte, 256)
-	self.pending_writes = make([]*write_msg, 0, 256)
+	self.pending_writes = make([]write_msg, 0, 256)
 	err_channel := make(chan error, 8)
 	self.death_signal = SIGNULL
 	self.escape_code_parser.Reset()
 	self.exit_code = 0
 	self.atomic_update_active = false
-	self.timers = make([]*timer, 0, 1)
+	self.timers, self.timers_temp = make([]*timer, 0, 8), make([]*timer, 0, 8)
 	no_timeout_channel := make(<-chan time.Time)
 	finalizer := ""
 
@@ -335,15 +382,17 @@ func (self *Loop) run() (err error) {
 			self.QueueWriteString(finalizer)
 		}
 		if needs_reset_escape_codes {
+			self.ClearPointerShapes()
 			self.QueueWriteString(self.terminal_options.ResetStateEscapeCodes())
 		}
 		// flush queued data and wait for it to be written for a timeout, then wait for writer to shutdown
-		flush_writer(w_w, tty_write_channel, write_done_channel, self.pending_writes, 2*time.Second)
+		flush_writer(w_w, self.tty_write_channel, write_done_channel, self.pending_writes, 2*time.Second)
 		self.pending_writes = nil
+		self.tty_write_channel = nil
 		wait_for_tty_reader_to_quit()
 	}()
 
-	go write_to_tty(w_r, controlling_term, tty_write_channel, err_channel, write_done_channel)
+	go write_to_tty(w_r, controlling_term, self.tty_write_channel, err_channel, write_done_channel)
 
 	if self.OnInitialize != nil {
 		finalizer, err = self.OnInitialize()
@@ -353,9 +402,10 @@ func (self *Loop) run() (err error) {
 	}
 
 	self.SuspendAndRun = func(run func() error) (err error) {
+		ps := self.ClearPointerShapes()
 		write_id := self.QueueWriteString(self.terminal_options.ResetStateEscapeCodes())
 		needs_reset_escape_codes = false
-		if err = self.wait_for_write_to_complete(write_id, tty_write_channel, write_done_channel, 2*time.Second); err != nil {
+		if err = self.wait_for_write_to_complete(write_id, self.tty_write_channel, write_done_channel, 2*time.Second); err != nil {
 			return err
 		}
 		shutdown_tty_reader()
@@ -374,19 +424,21 @@ func (self *Loop) run() (err error) {
 			return err
 		}
 		write_id = self.QueueWriteString(self.terminal_options.SetStateEscapeCodes())
+		self.set_pointer_shapes(ps)
 		needs_reset_escape_codes = true
-		return self.wait_for_write_to_complete(write_id, tty_write_channel, write_done_channel, 2*time.Second)
+		return self.wait_for_write_to_complete(write_id, self.tty_write_channel, write_done_channel, 2*time.Second)
 	}
 
 	self.on_SIGTSTP = func() error {
+		ps := self.ClearPointerShapes()
 		write_id := self.QueueWriteString(self.terminal_options.ResetStateEscapeCodes())
 		needs_reset_escape_codes = false
-		err := self.wait_for_write_to_complete(write_id, tty_write_channel, write_done_channel, 2*time.Second)
+		err := self.wait_for_write_to_complete(write_id, self.tty_write_channel, write_done_channel, 2*time.Second)
 		if err != nil {
 			return err
 		}
 		err = controlling_term.SuspendAndRun(func() error {
-			unix.Kill(os.Getpid(), unix.SIGSTOP)
+			_ = unix.Kill(os.Getpid(), unix.SIGSTOP)
 			time.Sleep(20 * time.Millisecond)
 			return nil
 		})
@@ -394,8 +446,9 @@ func (self *Loop) run() (err error) {
 			return err
 		}
 		write_id = self.QueueWriteString(self.terminal_options.SetStateEscapeCodes())
+		self.set_pointer_shapes(ps)
 		needs_reset_escape_codes = true
-		err = self.wait_for_write_to_complete(write_id, tty_write_channel, write_done_channel, 2*time.Second)
+		err = self.wait_for_write_to_complete(write_id, self.tty_write_channel, write_done_channel, 2*time.Second)
 		if err != nil {
 			return err
 		}
@@ -406,7 +459,7 @@ func (self *Loop) run() (err error) {
 	}
 
 	for self.keep_going {
-		self.flush_pending_writes(tty_write_channel)
+		self.flush_pending_writes(self.tty_write_channel)
 		timeout_chan := no_timeout_channel
 		if len(self.timers) > 0 {
 			now := time.Now()
@@ -436,9 +489,9 @@ func (self *Loop) run() (err error) {
 				}
 			}
 		case msg_id := <-write_done_channel:
-			self.flush_pending_writes(tty_write_channel)
+			self.flush_pending_writes(self.tty_write_channel)
 			if self.OnWriteComplete != nil {
-				err = self.OnWriteComplete(msg_id)
+				err = self.OnWriteComplete(msg_id, msg_id < self.write_msg_id_counter)
 				if err != nil {
 					return err
 				}

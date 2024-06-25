@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 # License: GPLv3 Copyright: 2020, Kovid Goyal <kovid at kovidgoyal.net>
 
-from typing import Any, Callable, Dict, NamedTuple, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
 
 from .constants import is_macos, is_wayland
+from .fast_data_types import get_options
+from .options.types import Options
 from .types import FloatEdges
 from .typing import EdgeLiteral
 from .utils import log_error
@@ -26,12 +28,27 @@ class WindowSizeData(NamedTuple):
     remember_window_size: bool
     single_window_margin_width: FloatEdges
     window_margin_width: FloatEdges
+    single_window_padding_width: FloatEdges
     window_padding_width: FloatEdges
 
 
 def sanitize_window_size(x: Any) -> int:
     ans = int(x)
     return max(20, min(ans, 50000))
+
+
+def edge_spacing(which: EdgeLiteral, opts:Optional[Union[WindowSizeData, Options]] = None) -> float:
+    if opts is None:
+        opts = get_options()
+    margin: float = getattr(opts.single_window_margin_width, which)
+    if margin < 0:
+        margin = getattr(opts.window_margin_width, which)
+
+    padding: float = getattr(opts.single_window_padding_width, which)
+    if padding < 0:
+        padding = getattr(opts.window_padding_width, which)
+    return float(padding + margin)
+
 
 
 def initial_window_size_func(opts: WindowSizeData, cached_values: Dict[str, Any]) -> Callable[[int, int, float, float, float, float], Tuple[int, int]]:
@@ -61,15 +78,21 @@ def initial_window_size_func(opts: WindowSizeData, cached_values: Dict[str, Any]
                 ans = getattr(opts.window_margin_width, which)
             return ans
 
+        def effective_padding(which: EdgeLiteral) -> float:
+            ans: float = getattr(opts.single_window_padding_width, which)
+            if ans < 0:
+                ans = getattr(opts.window_padding_width, which)
+            return ans
+
         if w_unit == 'cells':
             spacing = effective_margin('left') + effective_margin('right')
-            spacing += opts.window_padding_width.left + opts.window_padding_width.right
+            spacing += effective_padding('left') + effective_padding('right')
             width = cell_width * w / xscale + (dpi_x / 72) * spacing + 1
         else:
             width = w
         if h_unit == 'cells':
             spacing = effective_margin('top') + effective_margin('bottom')
-            spacing += opts.window_padding_width.top + opts.window_padding_width.bottom
+            spacing += effective_padding('top') + effective_padding('bottom')
             height = cell_height * h / yscale + (dpi_y / 72) * spacing + 1
         else:
             height = h

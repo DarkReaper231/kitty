@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2017, Kovid Goyal <kovid at kovidgoyal.net>
 
 OPTIONS = '''\
@@ -68,14 +68,19 @@ option.
 --detection-timeout
 type=float
 default=10
-The amount of time (in seconds) to wait for a response form the terminal, when
+The amount of time (in seconds) to wait for a response from the terminal, when
 detecting image display support.
+
+
+--use-window-size
+Instead of querying the terminal for the window size, use the specified size, which must
+be of the format: width_in_cells,height_in_cells,width_in_pixels,height_in_pixels
 
 
 --print-window-size
 type=bool-set
 Print out the window size as <:italic:`width`>x<:italic:`height`> (in pixels) and quit. This is a
-convenience method to query the window size if using :code:`kitty +kitten icat`
+convenience method to query the window size if using :code:`kitten icat`
 from a scripting language that cannot make termios calls.
 
 
@@ -127,7 +132,11 @@ type=bool-set
 Use the Unicode placeholder method to display the images. Useful to display
 images from within full screen terminal programs that do not understand the
 kitty graphics protocol such as multiplexers or editors. See
-:ref:`graphics_unicode_placeholders` for details.
+:ref:`graphics_unicode_placeholders` for details. Note that when using this
+method, placed (with :option:`--place`) images that do not fit on the screen,
+will get wrapped at the screen edge instead of getting truncated. This
+wrapping is per line and therefore the image will look like it is interleaved
+with blank lines.
 
 
 --passthrough
@@ -146,6 +155,12 @@ default=0
 The graphics protocol id to use for the created image. Normally, a random id is created if needed.
 This option allows control of the id. When multiple images are sent, sequential ids starting from the specified id
 are used. Valid ids are from 1 to 4294967295. Numbers outside this range are automatically wrapped.
+
+
+--no-trailing-newline -n
+type=bool-set
+By default, the cursor is moved to the next line after displaying an image. This option, prevents that. Should not be used
+when catting multiple images. Also has no effect when the :option:`--place` option is used.
 '''
 
 help_text = (

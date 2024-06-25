@@ -7,20 +7,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"kitty"
-	"kitty/tools/config"
-	"kitty/tools/utils"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/dlclark/regexp2"
 	"github.com/seancfoley/ipaddress-go/ipaddr"
-	"golang.org/x/exp/slices"
+
+	"kitty"
+	"kitty/tools/config"
+	"kitty/tools/tty"
+	"kitty/tools/utils"
 )
 
 var _ = fmt.Print
@@ -162,7 +165,7 @@ func linenum_group_processor(gd map[string]string) {
 	gd[`path`] = utils.Expanduser(gd[`path`])
 }
 
-var PostProcessorMap = (&utils.Once[map[string]PostProcessorFunc]{Run: func() map[string]PostProcessorFunc {
+var PostProcessorMap = sync.OnceValue(func() map[string]PostProcessorFunc {
 	return map[string]PostProcessorFunc{
 		"url": func(text string, s, e int) (int, int) {
 			if s > 4 && text[s-5:s] == "link:" { // asciidoc URLs
@@ -200,37 +203,151 @@ var PostProcessorMap = (&utils.Once[map[string]PostProcessorFunc]{Run: func() ma
 			return s, e
 		},
 	}
-}}).Get
+})
 
 type KittyOpts struct {
 	Url_prefixes              *utils.Set[string]
+	Url_excluded_characters   string
 	Select_by_word_characters string
 }
 
 func read_relevant_kitty_opts(path string) KittyOpts {
-	ans := KittyOpts{Select_by_word_characters: kitty.KittyConfigDefaults.Select_by_word_characters}
+	ans := KittyOpts{
+		Select_by_word_characters: kitty.KittyConfigDefaults.Select_by_word_characters,
+		Url_excluded_characters:   kitty.KittyConfigDefaults.Url_excluded_characters}
 	handle_line := func(key, val string) error {
 		switch key {
 		case "url_prefixes":
 			ans.Url_prefixes = utils.NewSetWithItems(strings.Split(val, " ")...)
 		case "select_by_word_characters":
 			ans.Select_by_word_characters = strings.TrimSpace(val)
+		case "url_excluded_characters":
+			if s, err := config.StringLiteral(val); err == nil {
+				ans.Url_excluded_characters = s
+			}
 		}
 		return nil
 	}
 	cp := config.ConfigParser{LineHandler: handle_line}
-	cp.ParseFiles(path)
+	_ = cp.ParseFiles(path) // ignore errors and use defaults
 	if ans.Url_prefixes == nil {
 		ans.Url_prefixes = utils.NewSetWithItems(kitty.KittyConfigDefaults.Url_prefixes...)
 	}
 	return ans
 }
 
-var RelevantKittyOpts = (&utils.Once[KittyOpts]{Run: func() KittyOpts {
+var RelevantKittyOpts = sync.OnceValue(func() KittyOpts {
 	return read_relevant_kitty_opts(filepath.Join(utils.ConfigDir(), "kitty.conf"))
-}}).Get
+})
 
-func functions_for(opts *Options) (pattern string, post_processors []PostProcessorFunc, group_processors []GroupProcessorFunc) {
+var debugprintln = tty.DebugPrintln
+var _ = debugprintln
+
+func url_excluded_characters_as_ranges_for_regex(extra_excluded string) string {
+	// See https://url.spec.whatwg.org/#url-code-points
+	ans := strings.Builder{}
+	ans.Grow(4096)
+	type cr struct{ start, end rune }
+	ranges := []cr{}
+	r := func(start rune, end ...rune) {
+		if len(end) == 0 {
+			ranges = append(ranges, cr{start, start})
+		} else {
+			ranges = append(ranges, cr{start, end[0]})
+		}
+	}
+	if !strings.Contains(extra_excluded, "\n") {
+		r('\n')
+	}
+	if !strings.Contains(extra_excluded, "\r") {
+		r('\r')
+	}
+	r('!')
+	r('$')
+	r('&')
+	r('#')
+	r('\'')
+	r('/')
+	r(':')
+	r(';')
+	r('@')
+	r('_')
+	r('~')
+	r('(')
+	r(')')
+	r('*')
+	r('+')
+	r(',')
+	r('-')
+	r('.')
+	r('=')
+	r('?')
+	r('%')
+	r('a', 'z')
+	r('A', 'Z')
+	r('0', '9')
+	slices.SortFunc(ranges, func(a, b cr) int { return int(a.start - b.start) })
+	var prev rune = -1
+	for _, cr := range ranges {
+		if cr.start-1 > prev+1 {
+			ans.WriteString(regexp.QuoteMeta(string(prev + 1)))
+			ans.WriteRune('-')
+			ans.WriteString(regexp.QuoteMeta(string(cr.start - 1)))
+		}
+		prev = cr.end
+	}
+	ans.WriteString(regexp.QuoteMeta(string(ranges[len(ranges)-1].end + 1)))
+	ans.WriteRune('-')
+	ans.WriteRune(0x9f)
+	ans.WriteString(`\x{d800}-\x{dfff}`)
+	ans.WriteString(`\x{fdd0}-\x{fdef}`)
+	w := func(x rune) { ans.WriteRune(x) }
+
+	w(0xFFFE)
+	w(0xFFFF)
+	w(0x1FFFE)
+	w(0x1FFFF)
+	w(0x2FFFE)
+	w(0x2FFFF)
+	w(0x3FFFE)
+	w(0x3FFFF)
+	w(0x4FFFE)
+	w(0x4FFFF)
+	w(0x5FFFE)
+	w(0x5FFFF)
+	w(0x6FFFE)
+	w(0x6FFFF)
+	w(0x7FFFE)
+	w(0x7FFFF)
+	w(0x8FFFE)
+	w(0x8FFFF)
+	w(0x9FFFE)
+	w(0x9FFFF)
+	w(0xAFFFE)
+	w(0xAFFFF)
+	w(0xBFFFE)
+	w(0xBFFFF)
+	w(0xCFFFE)
+	w(0xCFFFF)
+	w(0xDFFFE)
+	w(0xDFFFF)
+	w(0xEFFFE)
+	w(0xEFFFF)
+	w(0xFFFFE)
+	w(0xFFFFF)
+
+	if strings.Contains(extra_excluded, "-") {
+		extra_excluded = strings.ReplaceAll(extra_excluded, "-", "")
+		extra_excluded = regexp.QuoteMeta(extra_excluded) + "-"
+	} else {
+		extra_excluded = regexp.QuoteMeta(extra_excluded)
+	}
+	ans.WriteString(extra_excluded)
+	return ans.String()
+
+}
+
+func functions_for(opts *Options) (pattern string, post_processors []PostProcessorFunc, group_processors []GroupProcessorFunc, err error) {
 	switch opts.Type {
 	case "url":
 		var url_prefixes *utils.Set[string]
@@ -239,7 +356,14 @@ func functions_for(opts *Options) (pattern string, post_processors []PostProcess
 		} else {
 			url_prefixes = utils.NewSetWithItems(strings.Split(opts.UrlPrefixes, ",")...)
 		}
-		pattern = fmt.Sprintf(`(?:%s)://[^%s]{3,}`, strings.Join(url_prefixes.AsSlice(), "|"), URL_DELIMITERS)
+		url_excluded_characters := RelevantKittyOpts().Url_excluded_characters
+		if opts.UrlExcludedCharacters != "default" {
+			if url_excluded_characters, err = config.StringLiteral(opts.UrlExcludedCharacters); err != nil {
+				err = fmt.Errorf("Failed to parse --url-excluded-characters value: %#v with error: %w", opts.UrlExcludedCharacters, err)
+				return
+			}
+		}
+		pattern = fmt.Sprintf(`(?:%s)://[^%s]{3,}`, strings.Join(url_prefixes.AsSlice(), "|"), url_excluded_characters_as_ranges_for_regex(url_excluded_characters))
 		post_processors = append(post_processors, PostProcessorMap()["url"])
 	case "path":
 		pattern = path_regex()
@@ -396,8 +520,8 @@ func mark(r *regexp2.Regexp, post_processors []PostProcessorFunc, group_processo
 			if idx > 0 && g.IsNamed {
 				c := g.LastCapture()
 				if s, e := c.Byte_Offsets.Start, c.Byte_Offsets.End; s > -1 && e > -1 {
-					s = utils.Max(s, match_start)
-					e = utils.Min(e, match_end)
+					s = max(s, match_start)
+					e = min(e, match_end)
 					gd[g.Name] = sanitize_pat.ReplaceAllLiteralString(text[s:e], "")
 				}
 			}
@@ -412,8 +536,8 @@ func mark(r *regexp2.Regexp, post_processors []PostProcessorFunc, group_processo
 		if opts.Type == "regex" && len(m.Groups) > 1 && !m.HasNamedGroups() {
 			cp := m.Groups[1].LastCapture()
 			ms, me := cp.Byte_Offsets.Start, cp.Byte_Offsets.End
-			match_start = utils.Max(match_start, ms)
-			match_end = utils.Min(match_end, me)
+			match_start = max(match_start, ms)
+			match_end = min(match_end, me)
 			full_match = sanitize_pat.ReplaceAllLiteralString(text[match_start:match_end], "")
 		}
 		if full_match != "" {
@@ -425,7 +549,7 @@ func mark(r *regexp2.Regexp, post_processors []PostProcessorFunc, group_processo
 	return
 }
 
-type ErrNoMatches struct{ Type string }
+type ErrNoMatches struct{ Type, Pattern string }
 
 func is_word_char(ch rune, current_chars []rune) bool {
 	return unicode.IsLetter(ch) || unicode.IsNumber(ch) || (unicode.IsMark(ch) && len(current_chars) > 0 && unicode.IsLetter(current_chars[len(current_chars)-1]))
@@ -517,19 +641,27 @@ func (self *ErrNoMatches) Error() string {
 	case "hyperlinks":
 		none_of = "hyperlinks"
 	}
+	if self.Pattern != "" {
+		return fmt.Sprintf("No %s found with pattern: %s", none_of, self.Pattern)
+	}
 	return fmt.Sprintf("No %s found", none_of)
 }
 
 func find_marks(text string, opts *Options, cli_args ...string) (sanitized_text string, ans []Mark, index_map map[int]*Mark, err error) {
 	sanitized_text, hyperlinks := process_escape_codes(text)
+	used_pattern := ""
 
 	run_basic_matching := func() error {
-		pattern, post_processors, group_processors := functions_for(opts)
+		pattern, post_processors, group_processors, err := functions_for(opts)
+		if err != nil {
+			return err
+		}
 		r, err := regexp2.Compile(pattern, regexp2.RE2)
 		if err != nil {
 			return fmt.Errorf("Failed to compile the regex pattern: %#v with error: %w", pattern, err)
 		}
 		ans = mark(r, post_processors, group_processors, sanitized_text, opts)
+		used_pattern = pattern
 		return nil
 	}
 
@@ -563,7 +695,7 @@ func find_marks(text string, opts *Options, cli_args ...string) (sanitized_text 
 	} else if opts.Type == "hyperlink" {
 		ans = hyperlinks
 	} else if opts.Type == "word" {
-		ans = mark_words(text, opts)
+		ans = mark_words(sanitized_text, opts)
 	} else {
 		err = run_basic_matching()
 		if err != nil {
@@ -572,10 +704,10 @@ func find_marks(text string, opts *Options, cli_args ...string) (sanitized_text 
 	}
 process_answer:
 	if len(ans) == 0 {
-		return "", nil, nil, &ErrNoMatches{Type: opts.Type}
+		return "", nil, nil, &ErrNoMatches{Type: opts.Type, Pattern: used_pattern}
 	}
 	largest_index := ans[len(ans)-1].Index
-	offset := utils.Max(0, opts.HintsOffset)
+	offset := max(0, opts.HintsOffset)
 	index_map = make(map[int]*Mark, len(ans))
 	for i := range ans {
 		m := &ans[i]

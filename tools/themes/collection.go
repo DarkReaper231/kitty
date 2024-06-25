@@ -10,13 +10,16 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"kitty/tools/cli"
@@ -25,11 +28,6 @@ import (
 	"kitty/tools/tui/subseq"
 	"kitty/tools/utils"
 	"kitty/tools/utils/style"
-
-	"github.com/shirou/gopsutil/v3/process"
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
-	"golang.org/x/sys/unix"
 )
 
 var _ = fmt.Print
@@ -335,7 +333,9 @@ func set_comment_in_zip_file(path string, comment string) error {
 	defer src.Close()
 	buf := bytes.Buffer{}
 	dest := zip.NewWriter(&buf)
-	dest.SetComment(comment)
+	if err = dest.SetComment(comment); err != nil {
+		return err
+	}
 	for _, sf := range src.File {
 		err = dest.Copy(sf)
 		if err != nil {
@@ -343,8 +343,7 @@ func set_comment_in_zip_file(path string, comment string) error {
 		}
 	}
 	dest.Close()
-	utils.AtomicUpdateFile(path, buf.Bytes(), 0o644)
-	return nil
+	return utils.AtomicUpdateFile(path, buf.Bytes(), 0o644)
 }
 
 func fetch_cached(name, url, cache_path string, max_cache_age time.Duration) (string, error) {
@@ -357,14 +356,15 @@ func fetch_cached(name, url, cache_path string, max_cache_age time.Duration) (st
 	var jm JSONMetadata
 	if err == nil {
 		defer zf.Close()
-		err = json.Unmarshal(utils.UnsafeStringToBytes(zf.Comment), &jm)
-		if max_cache_age < 0 {
-			return cache_path, nil
-		}
-		cache_age, err := utils.ISO8601Parse(jm.Timestamp)
-		if err == nil {
-			if time.Now().Before(cache_age.Add(max_cache_age)) {
+		if err = json.Unmarshal(utils.UnsafeStringToBytes(zf.Comment), &jm); err == nil {
+			if max_cache_age < 0 {
 				return cache_path, nil
+			}
+			cache_age, err := utils.ISO8601Parse(jm.Timestamp)
+			if err == nil {
+				if time.Now().Before(cache_age.Add(max_cache_age)) {
+					return cache_path, nil
+				}
 			}
 		}
 	}
@@ -428,7 +428,9 @@ func fetch_cached(name, url, cache_path string, max_cache_age time.Duration) (st
 	jm.Etag = resp.Header.Get("ETag")
 	jm.Timestamp = utils.ISO8601Format(time.Now())
 	comment, _ := json.Marshal(jm)
-	w.SetComment(utils.UnsafeBytesToString(comment))
+	if err = w.SetComment(utils.UnsafeBytesToString(comment)); err != nil {
+		return "", err
+	}
 	for _, file := range r.File {
 		err = w.Copy(file)
 		if err != nil {
@@ -465,16 +467,16 @@ type ThemeMetadata struct {
 
 func ParseThemeMetadata(path string) (*ThemeMetadata, map[string]string, error) {
 	var in_metadata, in_blurb, finished_metadata bool
-	ans := ThemeMetadata{}
+	ans := ThemeMetadata{Is_dark: true} // the default background in kitty is dark
 	settings := map[string]string{}
+
 	read_is_dark := func(key, val string) (err error) {
 		settings[key] = val
 		if key == "background" {
-			val = strings.TrimSpace(val)
 			if val != "" {
 				bg, err := style.ParseColor(val)
 				if err == nil {
-					ans.Is_dark = utils.Max(bg.Red, bg.Green, bg.Green) < 115
+					ans.Is_dark = utils.Max(bg.Red, bg.Green, bg.Blue) < 115
 				}
 			}
 		}
@@ -575,76 +577,6 @@ func (self *Theme) Code() (string, error) {
 	return self.load_code()
 }
 
-func patch_conf(text, theme_name string) string {
-	addition := fmt.Sprintf("# BEGIN_KITTY_THEME\n# %s\ninclude current-theme.conf\n# END_KITTY_THEME", theme_name)
-	pat := utils.MustCompile(`(?ms)^# BEGIN_KITTY_THEME.+?# END_KITTY_THEME`)
-	replaced := false
-	ntext := pat.ReplaceAllStringFunc(text, func(string) string {
-		replaced = true
-		return addition
-	})
-	if !replaced {
-		if text != "" {
-			text += "\n\n"
-		}
-		ntext = text + addition
-	}
-	pat = utils.MustCompile(fmt.Sprintf(`(?m)^\s*(%s)\b`, strings.Join(maps.Keys(AllColorSettingNames), "|")))
-	return pat.ReplaceAllString(ntext, `# $1`)
-}
-func is_kitty_gui_cmdline(cmd ...string) bool {
-	if len(cmd) == 0 {
-		return false
-	}
-	if filepath.Base(cmd[0]) != "kitty" {
-		return false
-	}
-	if len(cmd) == 1 {
-		return true
-	}
-	s := cmd[1][:1]
-	switch s {
-	case `@`:
-		return false
-	case `+`:
-		if cmd[1] == `+` {
-			return len(cmd) > 2 && cmd[2] == `open`
-		}
-		return cmd[1] == `+open`
-	}
-	return true
-}
-
-type ReloadDestination string
-
-const (
-	RELOAD_IN_PARENT ReloadDestination = "parent"
-	RELOAD_IN_ALL                      = "all"
-)
-
-func reload_config(reload_in ReloadDestination) bool {
-	switch reload_in {
-	case RELOAD_IN_PARENT:
-		if pid, err := strconv.Atoi(os.Getenv("KITTY_PID")); err == nil {
-			if p, err := process.NewProcess(int32(pid)); err == nil {
-				if c, err := p.CmdlineSlice(); err == nil && is_kitty_gui_cmdline(c...) {
-					return p.SendSignal(unix.SIGUSR1) == nil
-				}
-			}
-		}
-	case RELOAD_IN_ALL:
-		if all, err := process.Processes(); err == nil {
-			for _, p := range all {
-				if c, err := p.CmdlineSlice(); err == nil && is_kitty_gui_cmdline(c...) {
-					p.SendSignal(unix.SIGUSR1)
-				}
-			}
-			return true
-		}
-	}
-	return false
-}
-
 func (self *Theme) SaveInDir(dirpath string) (err error) {
 	path := filepath.Join(dirpath, self.Name()+".conf")
 	code, err := self.Code()
@@ -655,7 +587,7 @@ func (self *Theme) SaveInDir(dirpath string) (err error) {
 }
 
 func (self *Theme) SaveInConf(config_dir, reload_in, config_file_name string) (err error) {
-	os.MkdirAll(config_dir, 0o755)
+	_ = os.MkdirAll(config_dir, 0o755)
 	path := filepath.Join(config_dir, `current-theme.conf`)
 	code, err := self.Code()
 	if err != nil {
@@ -665,23 +597,22 @@ func (self *Theme) SaveInConf(config_dir, reload_in, config_file_name string) (e
 	if err != nil {
 		return err
 	}
-	confpath := filepath.Join(config_dir, config_file_name)
-	if q, err := filepath.EvalSymlinks(confpath); err == nil {
-		confpath = q
+	confpath := config_file_name
+	if !filepath.IsAbs(config_file_name) {
+		confpath = filepath.Join(config_dir, config_file_name)
 	}
-	raw, err := os.ReadFile(confpath)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
+	patcher := config.Patcher{Write_backup: true}
+	if _, err = patcher.Patch(
+		confpath, "KITTY_THEME", fmt.Sprintf("# %s\ninclude current-theme.conf", self.metadata.Name),
+		utils.Keys(AllColorSettingNames)...); err != nil {
+		return
 	}
-	nraw := patch_conf(utils.UnsafeBytesToString(raw), self.metadata.Name)
-	if len(raw) > 0 {
-		os.WriteFile(confpath+".bak", raw, 0o600)
+	switch reload_in {
+	case "parent":
+		config.ReloadConfigInKitty(true)
+	case "all":
+		config.ReloadConfigInKitty(false)
 	}
-	err = utils.AtomicUpdateFile(confpath, utils.UnsafeStringToBytes(nraw), 0o600)
-	if err != nil {
-		return err
-	}
-	reload_config(ReloadDestination(reload_in))
 	return
 }
 
@@ -780,9 +711,9 @@ func (self *Themes) Copy() *Themes {
 	return ans
 }
 
-var camel_case_pat = (&utils.Once[*regexp.Regexp]{Run: func() *regexp.Regexp {
+var camel_case_pat = sync.OnceValue(func() *regexp.Regexp {
 	return regexp.MustCompile(`([a-z])([A-Z])`)
-}}).Get
+})
 
 func ThemeNameFromFileName(fname string) string {
 	fname = fname[:len(fname)-len(path.Ext(fname))]
@@ -801,12 +732,12 @@ func (self *Themes) At(x int) *Theme {
 func (self *Themes) Names() []string { return self.index_map }
 
 func (self *Themes) create_index_map() {
-	self.index_map = maps.Keys(self.name_map)
+	self.index_map = utils.Keys(self.name_map)
 	self.index_map = utils.StableSortWithKey(self.index_map, strings.ToLower)
 }
 
 func (self *Themes) Filtered(is_ok func(*Theme) bool) *Themes {
-	themes := utils.Filter(maps.Values(self.name_map), is_ok)
+	themes := utils.Filter(utils.Values(self.name_map), is_ok)
 	ans := Themes{name_map: make(map[string]*Theme, len(themes))}
 	for _, theme := range themes {
 		ans.name_map[theme.metadata.Name] = theme
@@ -909,7 +840,15 @@ func (self *Themes) ThemeByName(name string) *Theme {
 
 func match(expression string, items []string) []*subseq.Match {
 	matches := subseq.ScoreItems(expression, items, subseq.Options{Level1: " "})
-	matches = utils.StableSort(matches, func(a, b *subseq.Match) bool { return a.Score > b.Score })
+	matches = utils.StableSort(matches, func(a, b *subseq.Match) int {
+		if b.Score < a.Score {
+			return -1
+		}
+		if b.Score > a.Score {
+			return 1
+		}
+		return 0
+	})
 	return matches
 }
 

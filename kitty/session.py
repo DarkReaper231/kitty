@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
 import os
@@ -9,13 +9,12 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, Generator, Iterator, List, Mapping, Optional, Tuple, Union
 
 from .cli_stub import CLIOptions
-from .constants import kitten_exe
 from .layout.interface import all_layouts
 from .options.types import Options
 from .options.utils import resize_window, to_layout_names, window_size
 from .os_window_size import WindowSize, WindowSizeData, WindowSizes
 from .typing import SpecialWindowInstance
-from .utils import expandvars, log_error, resolve_custom_file, resolved_shell, which
+from .utils import expandvars, log_error, resolve_custom_file, resolved_shell, shlex_split
 
 if TYPE_CHECKING:
     from .launch import LaunchSpec
@@ -27,7 +26,9 @@ def get_os_window_sizing_data(opts: Options, session: Optional['Session'] = None
         sizes = WindowSizes(WindowSize(*opts.initial_window_width), WindowSize(*opts.initial_window_height))
     else:
         sizes = session.os_window_size
-    return WindowSizeData(sizes, opts.remember_window_size, opts.single_window_margin_width, opts.window_margin_width, opts.window_padding_width)
+    return WindowSizeData(
+        sizes, opts.remember_window_size, opts.single_window_margin_width, opts.window_margin_width,
+        opts.single_window_padding_width, opts.window_padding_width)
 
 
 ResizeSpec = Tuple[str, int]
@@ -38,6 +39,11 @@ class WindowSpec:
     def __init__(self, launch_spec: Union['LaunchSpec', 'SpecialWindowInstance']):
         self.launch_spec = launch_spec
         self.resize_spec: Optional[ResizeSpec] = None
+        self.is_background_process = False
+        if hasattr(launch_spec, 'opts'):  # LaunchSpec
+            from .launch import LaunchSpec
+            assert isinstance(launch_spec, LaunchSpec)
+            self.is_background_process = launch_spec.opts.type == 'background'
 
 
 class Tab:
@@ -52,6 +58,13 @@ class Tab:
         self.cwd: Optional[str] = None
         self.next_title: Optional[str] = None
 
+    @property
+    def has_non_background_processes(self) -> bool:
+        for w in self.windows:
+            if not w.is_background_process:
+                return True
+        return False
+
 
 class Session:
 
@@ -63,6 +76,13 @@ class Session:
         self.os_window_class: Optional[str] = None
         self.os_window_state: Optional[str] = None
         self.focus_os_window: bool = False
+
+    @property
+    def has_non_background_processes(self) -> bool:
+        for t in self.tabs:
+            if t.has_non_background_processes:
+                return True
+        return False
 
     def add_tab(self, opts: Options, name: str = '') -> None:
         if self.tabs and not self.tabs[-1].windows:
@@ -82,7 +102,7 @@ class Session:
         needs_expandvars = False
         if isinstance(cmd, str):
             needs_expandvars = True
-            cmd = shlex.split(cmd)
+            cmd = list(shlex_split(cmd))
         spec = parse_launch_args(cmd)
         if needs_expandvars:
             assert isinstance(cmd, list)
@@ -221,7 +241,7 @@ def create_sessions(
                     session_data = f.read()
             yield from parse_session(session_data, opts, environ=environ)
             return
-    if default_session and default_session != 'none':
+    if default_session and default_session != 'none' and not getattr(args, 'args', None):
         try:
             with open(default_session) as f:
                 session_data = f.read()
@@ -236,11 +256,8 @@ def create_sessions(
     ans.tabs[-1].layout = current_layout
     if special_window is None:
         cmd = args.args if args and args.args else resolved_shell(opts)
-        if args and args.hold:
-            cmd[0] = which(cmd[0]) or cmd[0]
-            cmd = [kitten_exe(), '__hold_till_enter__'] + cmd
         from kitty.tabs import SpecialWindow
         cwd: Optional[str] = args.directory if respect_cwd and args else None
-        special_window = SpecialWindow(cmd, cwd_from=cwd_from, cwd=cwd)
+        special_window = SpecialWindow(cmd, cwd_from=cwd_from, cwd=cwd, hold=bool(args and args.hold))
     ans.add_special_window(special_window)
     yield ans

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/process"
@@ -20,9 +21,9 @@ import (
 
 var _ = fmt.Print
 
-var TmuxExe = (&utils.Once[string]{Run: func() string {
+var TmuxExe = sync.OnceValue(func() string {
 	return utils.FindExe("tmux")
-}}).Get
+})
 
 func tmux_socket_address() (socket string) {
 	socket = os.Getenv("TMUX")
@@ -55,7 +56,7 @@ func tmux_socket_address() (socket string) {
 	return socket
 }
 
-var TmuxSocketAddress = (&utils.Once[string]{Run: tmux_socket_address}).Get
+var TmuxSocketAddress = sync.OnceValue(tmux_socket_address)
 
 func tmux_command(args ...string) (c *exec.Cmd, stderr *strings.Builder) {
 	c = exec.Command(TmuxExe(), args...)
@@ -100,4 +101,4 @@ func tmux_allow_passthrough() error {
 	}
 }
 
-var TmuxAllowPassthrough = (&utils.Once[error]{Run: tmux_allow_passthrough}).Get
+var TmuxAllowPassthrough = sync.OnceValue(tmux_allow_passthrough)

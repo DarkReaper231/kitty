@@ -1,11 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
-from kitty.fast_data_types import DECAWM, DECCOLM, DECOM, IRM, Cursor, parse_bytes
+from kitty.fast_data_types import DECAWM, DECCOLM, DECOM, IRM, VT_PARSER_BUFFER_SIZE, Cursor
 from kitty.marks import marker_from_function, marker_from_regex
 from kitty.window import pagerhist
 
-from . import BaseTest
+from . import BaseTest, parse_bytes
 
 
 class TestScreen(BaseTest):
@@ -419,6 +419,9 @@ class TestScreen(BaseTest):
             s.draw('*')
         s.cursor_position(2, 2)
         self.ae(str(s.line(0)), '\t*'*13)
+        s = self.create_screen(cols=4, lines=2)
+        s.draw('aaaX\tbbbb')
+        self.ae(str(s.line(0)) + str(s.line(1)), 'aaaXbbbb')
 
     def test_margins(self):
         # Taken from vttest/main.c
@@ -600,9 +603,33 @@ class TestScreen(BaseTest):
         s.draw('\u25b6\ufe0f')
         self.ae(s.cursor.x, 2)
 
+    def test_writing_with_cursor_on_trailer_of_wide_character(self):
+        s = self.create_screen()
+        def r(x, pos, expected):
+            s.reset()
+            s.draw('😸')
+            self.ae(s.cursor.x, 2)
+            s.cursor.x = 1
+            s.draw(x)
+            self.ae(s.cursor.x, pos)
+            self.ae(str(s.line(0)), expected)
+
+        r('a', 2, ' a')
+        r('😸', 3, ' 😸')
+        r('\u0304', 1, '😸\u0304')
+        r('\r', 0, '😸')
+
+
     def test_serialize(self):
         from kitty.window import as_text
         s = self.create_screen()
+        parse_bytes(s, b'\x1b[1;91m')
+        s.draw('X')
+        parse_bytes(s, b'\x1b[0m\x1b[2m')
+        s.draw('Y')
+        self.ae(as_text(s, True), '\x1b[m\x1b[22;1;91mX\x1b[22;2;39mY\n\n\n\n')
+
+        s.reset()
         s.draw('ab' * s.columns)
         s.carriage_return(), s.linefeed()
         s.draw('c')
@@ -905,21 +932,22 @@ class TestScreen(BaseTest):
         def send(what: str):
             return parse_bytes(s, f'\033]52;p;{what}\a'.encode('ascii'))
 
-        def t(q, use_pending_mode, *expected):
+        def t(q, *expected):
             c.clear()
-            if use_pending_mode:
-                parse_bytes(s, b'\033[?2026h')
             send(q)
-            if use_pending_mode:
-                self.ae(c.cc_buf, [])
-                parse_bytes(s, b'\033[?2026l')
-            self.ae(c.cc_buf, list(expected))
+            del q
+            t.ex = list(expected)
+            del expected
+            try:
+                self.ae(tuple(map(len, c.cc_buf)), tuple(map(len, t.ex)))
+                self.ae(c.cc_buf, t.ex)
+            finally:
+                del t.ex
 
-        for use_pending_mode in (False, True):
-            t('XYZ', use_pending_mode, ('p;XYZ', False))
-            t('a' * 8192, use_pending_mode, ('p;' + 'a' * (8192 - 6), True), (';' + 'a' * 6, False))
-            t('', use_pending_mode, ('p;', False))
-            t('!', use_pending_mode, ('p;!', False))
+        t('XYZ', ('p;XYZ', False))
+        t('a' * VT_PARSER_BUFFER_SIZE, ('p;' + 'a' * (VT_PARSER_BUFFER_SIZE - 8), True), (';' + 'a' * 8, False))
+        t('', ('p;', False))
+        t('!', ('p;!', False))
 
     def test_key_encoding_flags_stack(self):
         s = self.create_screen()
@@ -981,7 +1009,7 @@ class TestScreen(BaseTest):
         w('#P')
         w('#R')
         ac(0, 1)
-        w('#10P')
+        w('10#P')
         w('#R')
         ac(0, 1)
         w('#Q')
@@ -1000,22 +1028,30 @@ class TestScreen(BaseTest):
             url = ''.join(s.text_for_marked_url())
             self.assertEqual(expected, url)
 
-        def t(url, x=0, y=0, before='', after=''):
+        def t(url, x=0, y=0, before='', after='', expected=''):
             s.reset()
             s.cursor.x = x
             s.cursor.y = y
             s.draw(before + url + after)
-            ae(url, x=x + 1 + len(before), y=y)
+            ae(expected or url, x=x + 1 + len(before), y=y)
+
 
         t('http://moo.com')
         t('http://moo.com/something?else=+&what-')
+        t('http://moo.com#fragme')
         for (st, e) in '() {} [] <>'.split():
             t('http://moo.com', before=st, after=e)
-        for trailer in ')-=]}':
+        for trailer in ')-=':
             t('http://moo.com' + trailer)
-        for trailer in '{([':
+        for trailer in '{}([<>':
             t('http://moo.com', after=trailer)
         t('http://moo.com', x=s.columns - 9)
+        t('https://wraps-by-one-char.com', before='[', after=']')
+        t('http://[::1]:8080')
+        t('https://wr[aps-by-one-ch]ar.com')
+        t('http://[::1]:8080/x', after='[')
+        t('http://[::1]:8080/x]y34', expected='http://[::1]:8080/x')
+        t('https://wraps-by-one-char.com[]/x', after='[')
 
     def test_prompt_marking(self):
         s = self.create_screen()
@@ -1169,3 +1205,46 @@ class TestScreen(BaseTest):
         draw_prompt('p1')
         draw_prompt('p1')
         self.ae(lco(which=3), '0a\n1a')
+
+    def test_pointer_shapes(self):
+        from kitty.window import set_pointer_shape
+        s = self.create_screen()
+        c = s.callbacks
+        response = ''
+
+        def cb(data):
+            nonlocal response
+            response = set_pointer_shape(s, str(data, 'utf-8'))
+        c.set_pointer_shape = cb
+
+        def send(a):
+            nonlocal response
+            response = ''
+            parse_bytes(s, f'\x1b]22;{a}\x1b\\'.encode())
+            return response
+
+        self.ae(send('?__current__'), '0')
+        self.ae(send('?__default__,__grabbed__,default,ne-resize,crosshair,XXX'), 'text,default,1,1,1,0')
+
+        def t(q, e=None):
+            self.ae(send(q), '')
+            self.ae(send('?__current__'), e)
+
+        t('default', 'default')
+        s.reset()
+        self.ae(send('?__current__'), '0')
+        t('=crosshair', 'crosshair')
+        t('<', '0')
+        t('=crosshair', 'crosshair')
+        t('', '0')
+        t('>help', 'help')
+        t('>wait', 'wait')
+        t('<', 'help')
+        t('<', '0')
+        t('default,help', 'help')
+        t('<', '0')
+        t('>default,help', 'help')
+        t('<', 'default')
+        t('<', '0')
+        t('=left_ptr', 'default')
+        t('=fleur', 'move')

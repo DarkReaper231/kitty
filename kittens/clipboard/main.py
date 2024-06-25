@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2018, Kovid Goyal <kovid at kovidgoyal.net>
 
 import sys
@@ -50,7 +50,7 @@ Read or write to the system clipboard.
 
 This kitten operates most simply in :italic:`filter mode`.
 To set the clipboard text, pipe in the new text on :file:`STDIN`. Use the
-:option:`--get-clipboard` option to output the current clipboard text content to
+:option:`--get-clipboard` option to instead output the current clipboard text content to
 :file:`STDOUT`. Note that copying from the clipboard will cause a permission
 popup, see :opt:`clipboard_control` for details.
 
@@ -60,22 +60,22 @@ the clipboard. Some examples:
 .. code:: sh
 
     # Copy an image to the clipboard:
-    kitty +kitten clipboard picture.png
+    kitten clipboard picture.png
 
     # Copy an image and some text to the clipboard:
-    kitty +kitten clipboard picture.jpg text.txt
+    kitten clipboard picture.jpg text.txt
 
     # Copy text from STDIN and an image to the clipboard:
-    echo hello | kitty +kitten clipboard picture.png /dev/stdin
+    echo hello | kitten clipboard picture.png /dev/stdin
 
     # Copy any raster image available on the clipboard to a PNG file:
-    kitty +kitten clipboard -g picture.png
+    kitten clipboard -g picture.png
 
     # Copy an image to a file and text to STDOUT:
-    kitty +kitten clipboard -g picture.png /dev/stdout
+    kitten clipboard -g picture.png /dev/stdout
 
     # List the formats available on the system clipboard
-    kitty +kitten clipboard -g -m . /dev/stdout
+    kitten clipboard -g -m . /dev/stdout
 '''
 
 usage = '[files to copy to/from]'

@@ -5,10 +5,10 @@ package unicode_names
 import (
 	"fmt"
 	"kitty/tools/utils"
+	"slices"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"golang.org/x/exp/slices"
 )
 
 var _ = fmt.Print
@@ -18,9 +18,9 @@ func TestUnicodeInputQueries(t *testing.T) {
 		if expected == nil {
 			expected = make([]rune, 0)
 		}
-		expected = utils.Sort(expected, func(a, b rune) bool { return a < b })
+		expected = utils.Sort(expected, func(a, b rune) int { return int(a) - int(b) })
 		actual := CodePointsForQuery(query)
-		actual = utils.Sort(actual, func(a, b rune) bool { return a < b })
+		actual = utils.Sort(actual, func(a, b rune) int { return int(a) - int(b) })
 		diff := cmp.Diff(expected, actual)
 		if diff != "" {
 			t.Fatalf("Failed query: %#v\n%s", query, diff)

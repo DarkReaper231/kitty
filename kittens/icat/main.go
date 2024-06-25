@@ -42,7 +42,7 @@ const (
 	supported
 )
 
-var transfer_by_file, transfer_by_memory, transfer_by_stream transfer_mode
+var transfer_by_file, transfer_by_memory transfer_mode
 
 var files_channel chan input_arg
 var output_channel chan *image_data
@@ -146,13 +146,48 @@ func main(cmd *cli.Command, o *Options, args []string) (rc int, err error) {
 	if err != nil {
 		return 1, err
 	}
-	t, err := tty.OpenControllingTerm()
-	if err != nil {
-		return 1, fmt.Errorf("Failed to open controlling terminal with error: %w", err)
-	}
-	screen_size, err = t.GetSize()
-	if err != nil {
-		return 1, fmt.Errorf("Failed to query terminal using TIOCGWINSZ with error: %w", err)
+	if opts.UseWindowSize == "" {
+		if tty.IsTerminal(os.Stdout.Fd()) {
+			screen_size, err = tty.GetSize(int(os.Stdout.Fd()))
+		} else {
+			t, oerr := tty.OpenControllingTerm()
+			if oerr != nil {
+				return 1, fmt.Errorf("Failed to open controlling terminal with error: %w", oerr)
+			}
+			screen_size, err = t.GetSize()
+		}
+		if err != nil {
+			return 1, fmt.Errorf("Failed to query terminal using TIOCGWINSZ with error: %w", err)
+		}
+	} else {
+		parts := strings.SplitN(opts.UseWindowSize, ",", 4)
+		if len(parts) != 4 {
+			return 1, fmt.Errorf("Invalid size specification: " + opts.UseWindowSize)
+		}
+		screen_size = &unix.Winsize{}
+		t := 0
+		if t, err = strconv.Atoi(parts[0]); err != nil || t < 1 {
+			return 1, fmt.Errorf("Invalid size specification: %s with error: %w", opts.UseWindowSize, err)
+		}
+		screen_size.Col = uint16(t)
+		if t, err = strconv.Atoi(parts[1]); err != nil || t < 1 {
+			return 1, fmt.Errorf("Invalid size specification: %s with error: %w", opts.UseWindowSize, err)
+		}
+		screen_size.Row = uint16(t)
+		if t, err = strconv.Atoi(parts[2]); err != nil || t < 1 {
+			return 1, fmt.Errorf("Invalid size specification: %s with error: %w", opts.UseWindowSize, err)
+		}
+		screen_size.Xpixel = uint16(t)
+		if t, err = strconv.Atoi(parts[3]); err != nil || t < 1 {
+			return 1, fmt.Errorf("Invalid size specification: %s with error: %w", opts.UseWindowSize, err)
+		}
+		screen_size.Ypixel = uint16(t)
+		if screen_size.Xpixel < screen_size.Col {
+			return 1, fmt.Errorf("Invalid size specification: %s with error: The pixel width is smaller than the number of columns", opts.UseWindowSize)
+		}
+		if screen_size.Ypixel < screen_size.Row {
+			return 1, fmt.Errorf("Invalid size specification: %s with error: The pixel height is smaller than the number of rows", opts.UseWindowSize)
+		}
 	}
 
 	if opts.PrintWindowSize {
@@ -162,7 +197,9 @@ func main(cmd *cli.Command, o *Options, args []string) (rc int, err error) {
 	if opts.Clear {
 		cc := &graphics.GraphicsCommand{}
 		cc.SetAction(graphics.GRT_action_delete).SetDelete(graphics.GRT_free_visible)
-		cc.WriteWithPayloadTo(os.Stdout, nil)
+		if err = cc.WriteWithPayloadTo(os.Stdout, nil); err != nil {
+			return 1, err
+		}
 	}
 	if screen_size.Xpixel == 0 || screen_size.Ypixel == 0 {
 		return 1, fmt.Errorf("Terminal does not support reporting screen sizes in pixels, use a terminal such as kitty, WezTerm, Konsole, etc. that does.")
@@ -221,10 +258,9 @@ func main(cmd *cli.Command, o *Options, args []string) (rc int, err error) {
 		}
 	}
 	if passthrough_mode != no_passthrough {
-		// tmux doesnt allow responses from the terminal so we cant detect if memory or file based transferring is supported
+		// tmux doesn't allow responses from the terminal so we can't detect if memory or file based transferring is supported
 		transfer_by_memory = unsupported
 		transfer_by_file = unsupported
-		transfer_by_stream = supported
 	}
 	if opts.DetectSupport {
 		if transfer_by_memory == supported {
@@ -256,7 +292,7 @@ func main(cmd *cli.Command, o *Options, args []string) (rc int, err error) {
 		if imgd.err != nil {
 			print_error("Failed to process \x1b[31m%s\x1b[39m: %s\r\n", imgd.source_name, imgd.err)
 		} else {
-			transmit_image(imgd)
+			transmit_image(imgd, opts.NoTrailingNewline)
 			if imgd.err != nil {
 				print_error("Failed to transmit \x1b[31m%s\x1b[39m: %s\r\n", imgd.source_name, imgd.err)
 			}

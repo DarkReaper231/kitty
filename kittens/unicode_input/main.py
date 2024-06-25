@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2018, Kovid Goyal <kovid at kovidgoyal.net>
 
 from typing import List, Optional
@@ -16,6 +16,13 @@ default=none
 choices=none,graphic,text
 Whether to use the textual or the graphical form for emoji. By default the
 default form specified in the Unicode standard for the symbol is used.
+
+
+--tab
+type=choices
+default=previous
+choices=previous,code,name,emoticons,favorites
+The initial tab to display. Defaults to using the tab from the previous kitten invocation.
 
 
 '''.format

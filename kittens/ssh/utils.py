@@ -105,18 +105,18 @@ def read_data_from_shared_memory(shm_name: str) -> Any:
     with SharedMemory(shm_name, readonly=True) as shm:
         shm.unlink()
         if shm.stats.st_uid != os.geteuid() or shm.stats.st_gid != os.getegid():
-            raise ValueError('Incorrect owner on pwfile')
+            raise ValueError(f'Incorrect owner on pwfile: uid={shm.stats.st_uid} gid={shm.stats.st_gid}')
         mode = stat.S_IMODE(shm.stats.st_mode)
         if mode != stat.S_IREAD | stat.S_IWRITE:
-            raise ValueError('Incorrect permissions on pwfile')
+            raise ValueError(f'Incorrect permissions on pwfile: 0o{mode:03o}')
         return json.loads(shm.read_data_with_size())
 
 
-def get_ssh_data(msg: str, request_id: str) -> Iterator[bytes]:
+def get_ssh_data(msgb: memoryview, request_id: str) -> Iterator[bytes]:
     from base64 import standard_b64decode
     yield b'\nKITTY_DATA_START\n'  # to discard leading data
     try:
-        msg = standard_b64decode(msg).decode('utf-8')
+        msg = standard_b64decode(msgb).decode('utf-8')
         md = dict(x.split('=', 1) for x in msg.split(':'))
         pw = md['pw']
         pwfilename = md['pwfile']
@@ -148,9 +148,25 @@ def get_ssh_data(msg: str, request_id: str) -> Iterator[bytes]:
             yield b'KITTY_DATA_END\n'
 
 
-def set_env_in_cmdline(env: Dict[str, str], argv: List[str]) -> None:
-    patch_cmdline('clone_env', create_shared_memory(env, 'ksse-'), argv)
-
+def set_env_in_cmdline(env: Dict[str, str], argv: List[str], clone: bool = True) -> None:
+    from kitty.options.utils import DELETE_ENV_VAR
+    if clone:
+        patch_cmdline('clone_env', create_shared_memory(env, 'ksse-'), argv)
+        return
+    idx = argv.index('ssh')
+    for i in range(idx, len(argv)):
+        if argv[i] == '--kitten':
+            idx = i + 1
+        elif argv[i].startswith('--kitten='):
+            idx = i
+    env_dirs = []
+    for k, v in env.items():
+        if v is DELETE_ENV_VAR:
+            x = f'--kitten=env={k}'
+        else:
+            x = f'--kitten=env={k}={v}'
+        env_dirs.append(x)
+    argv[idx+1:idx+1] = env_dirs
 
 
 def get_ssh_cli() -> Tuple[Set[str], Set[str]]:

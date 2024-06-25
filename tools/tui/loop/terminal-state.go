@@ -12,18 +12,19 @@ import (
 type KeyboardStateBits uint8
 
 const (
-	DISAMBIGUATE_KEYS KeyboardStateBits = 1 << iota
-	REPORT_KEY_EVENT_TYPES
-	REPORT_ALTERNATE_KEYS
-	REPORT_ALL_KEYS_AS_ESCAPE_CODES
-	REPORT_TEXT_WITH_KEYS
-	FULL_KEYBOARD_PROTOCOL = DISAMBIGUATE_KEYS | REPORT_ALTERNATE_KEYS | REPORT_ALL_KEYS_AS_ESCAPE_CODES | REPORT_TEXT_WITH_KEYS | REPORT_KEY_EVENT_TYPES
+	LEGACY_KEYS                     KeyboardStateBits = 0
+	DISAMBIGUATE_KEYS                                 = 1
+	REPORT_KEY_EVENT_TYPES                            = 2
+	REPORT_ALTERNATE_KEYS                             = 4
+	REPORT_ALL_KEYS_AS_ESCAPE_CODES                   = 8
+	REPORT_TEXT_WITH_KEYS                             = 16
+	FULL_KEYBOARD_PROTOCOL                            = DISAMBIGUATE_KEYS | REPORT_ALTERNATE_KEYS | REPORT_ALL_KEYS_AS_ESCAPE_CODES | REPORT_TEXT_WITH_KEYS | REPORT_KEY_EVENT_TYPES
+	NO_KEYBOARD_STATE_CHANGE                          = 32
 )
 
 const (
 	SAVE_CURSOR                   = "\0337"
 	RESTORE_CURSOR                = "\0338"
-	S7C1T                         = "\033 F"
 	SAVE_PRIVATE_MODE_VALUES      = "\033[?s"
 	RESTORE_PRIVATE_MODE_VALUES   = "\033[?r"
 	SAVE_COLORS                   = "\033[#P"
@@ -95,7 +96,7 @@ const (
 )
 
 type TerminalStateOptions struct {
-	alternate_screen, restore_colors bool
+	Alternate_screen, restore_colors bool
 	mouse_tracking                   MouseTracking
 	kitty_keyboard_mode              KeyboardStateBits
 }
@@ -115,8 +116,7 @@ func reset_modes(sb *strings.Builder, modes ...Mode) {
 func (self *TerminalStateOptions) SetStateEscapeCodes() string {
 	var sb strings.Builder
 	sb.Grow(256)
-	sb.WriteString(S7C1T)
-	if self.alternate_screen {
+	if self.Alternate_screen {
 		sb.WriteString(SAVE_CURSOR)
 	}
 	sb.WriteString(SAVE_PRIVATE_MODE_VALUES)
@@ -128,14 +128,16 @@ func (self *TerminalStateOptions) SetStateEscapeCodes() string {
 		IRM, DECKM, DECSCNM, BRACKETED_PASTE, FOCUS_TRACKING,
 		MOUSE_BUTTON_TRACKING, MOUSE_MOTION_TRACKING, MOUSE_MOVE_TRACKING, MOUSE_UTF8_MODE, MOUSE_SGR_MODE)
 	set_modes(&sb, DECARM, DECAWM, DECTCEM)
-	if self.alternate_screen {
+	if self.Alternate_screen {
 		set_modes(&sb, ALTERNATE_SCREEN)
 		sb.WriteString(CLEAR_SCREEN)
 	}
-	if self.kitty_keyboard_mode > 0 {
-		sb.WriteString(fmt.Sprintf("\033[>%du", self.kitty_keyboard_mode))
-	} else {
+	switch self.kitty_keyboard_mode {
+	case LEGACY_KEYS:
 		sb.WriteString("\033[>u")
+	case NO_KEYBOARD_STATE_CHANGE:
+	default:
+		sb.WriteString(fmt.Sprintf("\033[>%du", self.kitty_keyboard_mode))
 	}
 	if self.mouse_tracking != NO_MOUSE_TRACKING {
 		sb.WriteString(MOUSE_SGR_PIXEL_MODE.EscapeCodeToSet())
@@ -154,17 +156,19 @@ func (self *TerminalStateOptions) SetStateEscapeCodes() string {
 func (self *TerminalStateOptions) ResetStateEscapeCodes() string {
 	var sb strings.Builder
 	sb.Grow(64)
-	sb.WriteString("\033[<u")
-	if self.alternate_screen {
+	if self.kitty_keyboard_mode != NO_KEYBOARD_STATE_CHANGE {
+		sb.WriteString("\033[<u")
+	}
+	if self.Alternate_screen {
 		sb.WriteString(ALTERNATE_SCREEN.EscapeCodeToReset())
 	} else {
 		sb.WriteString(SAVE_CURSOR)
 	}
 	sb.WriteString(RESTORE_PRIVATE_MODE_VALUES)
 	if self.restore_colors {
-		sb.WriteString(RESTORE_CURSOR)
+		sb.WriteString(RESTORE_COLORS)
 	}
-	sb.WriteString(RESTORE_COLORS)
+	sb.WriteString(RESTORE_CURSOR)
 	return sb.String()
 }
 

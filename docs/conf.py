@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # vim:fileencoding=utf-8
 #
 # Configuration file for the Sphinx documentation builder.
@@ -7,18 +7,19 @@
 # full list see the documentation:
 # https://www.sphinx-doc.org/en/master/config
 
+import glob
 import os
 import re
 import subprocess
 import sys
 import time
-from functools import partial
-from typing import Any, Callable, Dict, Iterable, List, Tuple
+from functools import lru_cache, partial
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Tuple
 
 from docutils import nodes
 from docutils.parsers.rst.roles import set_classes
 from pygments.lexer import RegexLexer, bygroups  # type: ignore
-from pygments.token import Comment, Keyword, Literal, Name, Number, String, Whitespace  # type: ignore
+from pygments.token import Comment, Error, Keyword, Literal, Name, Number, String, Whitespace  # type: ignore
 from sphinx import addnodes, version_info
 from sphinx.util.logging import getLogger
 
@@ -27,7 +28,8 @@ if kitty_src not in sys.path:
     sys.path.insert(0, kitty_src)
 
 from kitty.conf.types import Definition, expand_opt_references  # noqa
-from kitty.constants import str_version, website_url  # noqa
+from kitty.constants import str_version, website_url # noqa
+from kitty.fast_data_types import Shlex  # noqa
 
 # config {{{
 # -- Project information -----------------------------------------------------
@@ -156,8 +158,8 @@ html_theme_options: Dict[str, Any] = {
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ['_static']
 html_favicon = html_logo = '../logo/kitty.svg'
-html_css_files = ['custom.css']
-html_js_files = ['custom.js']
+html_css_files = ['custom.css', 'timestamps.css']
+html_js_files = ['custom.js', 'timestamps.js']
 
 # Custom sidebar templates, must be a dictionary that maps document names
 # to template names.
@@ -176,8 +178,8 @@ manpages_url = 'https://man7.org/linux/man-pages/man{section}/{page}.{section}.h
 # One entry per manual page. List of tuples
 # (source start file, name, description, authors, manual section).
 man_pages = [
-    ('invocation', 'kitty', 'kitty Documentation', [author], 1),
-    ('conf', 'kitty.conf', 'kitty.conf Documentation', [author], 5)
+    ('invocation', 'kitty', 'The fast, feature rich terminal emulator', [author], 1),
+    ('conf', 'kitty.conf', 'Configuration file for kitty', [author], 5)
 ]
 
 
@@ -209,16 +211,16 @@ def commit_role(
     ' Link to a github commit '
     try:
         commit_id = subprocess.check_output(
-            f'git rev-list --max-count=1 --skip=# {text}'.split()).decode('utf-8').strip()
+            f'git rev-list --max-count=1 {text}'.split()).decode('utf-8').strip()
     except Exception:
         msg = inliner.reporter.error(
-            f'GitHub commit id "{text}" not recognized.', line=lineno)
+            f'git commit id "{text}" not recognized.', line=lineno)
         prb = inliner.problematic(rawtext, rawtext, msg)
         return [prb], [msg]
     url = f'https://github.com/kovidgoyal/kitty/commit/{commit_id}'
     set_classes(options)
     short_id = subprocess.check_output(
-        f'git rev-list --max-count=1 --abbrev-commit --skip=# {commit_id}'.split()).decode('utf-8').strip()
+        f'git rev-list --max-count=1 --abbrev-commit {commit_id}'.split()).decode('utf-8').strip()
     node = nodes.reference(rawtext, f'commit: {short_id}', refuri=url, **options)
     return [node], []
 # }}}
@@ -251,20 +253,20 @@ if you specify a program-to-run you can use the special placeholder
     as_rst = partial(option_spec_as_rst, heading_char='_')
     from kitty.rc.base import all_command_names, command_for_name
     from kitty.remote_control import cli_msg, global_options_spec
-    with open('generated/cli-kitty-at.rst', 'w') as f:
+    with open('generated/cli-kitten-at.rst', 'w') as f:
         p = partial(print, file=f)
-        p('kitty @')
+        p('kitten @')
         p('-' * 80)
-        p('.. program::', 'kitty @')
+        p('.. program::', 'kitten @')
         p('\n\n' + as_rst(
-            global_options_spec, message=cli_msg, usage='command ...', appname='kitty @'))
+            global_options_spec, message=cli_msg, usage='command ...', appname='kitten @'))
         from kitty.rc.base import cli_params_for
         for cmd_name in sorted(all_command_names()):
             func = command_for_name(cmd_name)
             p(f'.. _at-{func.name}:\n')
-            p('kitty @', func.name)
+            p('kitten @', func.name)
             p('-' * 120)
-            p('.. program::', 'kitty @', func.name)
+            p('.. program::', 'kitten @', func.name)
             p('\n\n' + as_rst(*cli_params_for(func)))
     from kittens.runner import get_kitten_cli_docs
 
@@ -344,14 +346,70 @@ class ConfLexer(RegexLexer):  # type: ignore
     aliases = ['conf']
     filenames = ['*.conf']
 
+    def map_flags(self: RegexLexer, val: str, start_pos: int) -> Iterator[Tuple[int, Any, str]]:
+            expecting_arg = ''
+            s = Shlex(val)
+            from kitty.options.utils import allowed_key_map_options
+            last_pos = 0
+            while (tok := s.next_word())[0] > -1:
+                x = tok[1]
+                if tok[0] > last_pos:
+                    yield start_pos + last_pos, Whitespace, ' ' * (tok[0] - last_pos)
+                last_pos = tok[0] + len(x)
+                tok_start = start_pos + tok[0]
+                if expecting_arg:
+                    yield tok_start, String, x
+                    expecting_arg = ''
+                elif x.startswith('--'):
+                    expecting_arg = x[2:]
+                    k, sep, v = expecting_arg.partition('=')
+                    k = k.replace('-', '_')
+                    expecting_arg = k
+                    if expecting_arg not in allowed_key_map_options:
+                        yield tok_start, Error, x
+                    elif sep == '=':
+                        expecting_arg = ''
+                        yield tok_start, Name, x
+                    else:
+                        yield tok_start, Name, x
+                else:
+                    break
+
+    def mapargs(self: RegexLexer, match: 're.Match[str]') -> Iterator[Tuple[int, Any, str]]:
+        start_pos = match.start()
+        val = match.group()
+        parts = val.split(maxsplit=1)
+        if parts[0].startswith('--'):
+            seen = 0
+            for (pos, token, text) in self.map_flags(val, start_pos):
+                yield pos, token, text
+                seen += len(text)
+            start_pos += seen
+            val = val[seen:]
+            parts = val.split(maxsplit=1)
+
+        if not val:
+            return
+        yield start_pos, Literal, parts[0]  # key spec
+        if len(parts) == 1:
+            return
+        start_pos += len(parts[0])
+        val = val[len(parts[0]):]
+        m = re.match(r'(\s+)(\S+)', val)
+        if m is None:
+            return
+        yield start_pos, Whitespace, m.group(1)
+        yield start_pos + m.start(2), Name.Function, m.group(2)  # action function
+        yield start_pos + m.end(2), String, val[m.end(2):]
+
     tokens = {
         'root': [
             (r'#.*?$', Comment.Single),
             (r'\s+$', Whitespace),
             (r'\s+', Whitespace),
             (r'(include)(\s+)(.+?)$', bygroups(Comment.Preproc, Whitespace, Name.Namespace)),
-            (r'(map)(\s+)(\S+)(\s+)', bygroups(
-                Keyword.Declaration, Whitespace, String, Whitespace), 'action'),
+            (r'(map)(\s+)', bygroups(
+                Keyword.Declaration, Whitespace), 'mapargs'),
             (r'(mouse_map)(\s+)(\S+)(\s+)(\S+)(\s+)(\S+)(\s+)', bygroups(
                 Keyword.Declaration, Whitespace, String, Whitespace, Name.Variable, Whitespace, String, Whitespace), 'action'),
             (r'(symbol_map)(\s+)(\S+)(\s+)(.+?)$', bygroups(
@@ -362,6 +420,9 @@ class ConfLexer(RegexLexer):  # type: ignore
         'action': [
             (r'[a-z_0-9]+$', Name.Function, 'root'),
             (r'[a-z_0-9]+', Name.Function, 'args'),
+        ],
+        'mapargs': [
+            (r'.+$', mapargs, 'root'),
         ],
         'args': [
             (r'\s+', Whitespace, 'args'),
@@ -529,6 +590,18 @@ def write_conf_docs(app: Any, all_kitten_names: Iterable[str]) -> None:
     from kitty.actions import as_rst
     with open('generated/actions.rst', 'w', encoding='utf-8') as f:
         f.write(as_rst())
+
+    from kitty.rc.base import MATCH_TAB_OPTION, MATCH_WINDOW_OPTION
+    with open('generated/matching.rst', 'w') as f:
+        print('Matching windows', file=f)
+        print('______________________________', file=f)
+        w = 'm' + MATCH_WINDOW_OPTION[MATCH_WINDOW_OPTION.find('Match') + 1:]
+        print('When matching windows,', w, file=f)
+        print('Matching tabs', file=f)
+        print('______________________________', file=f)
+        w = 'm' + MATCH_TAB_OPTION[MATCH_TAB_OPTION.find('Match') + 1:]
+        print('When matching tabs,', w, file=f)
+
 # }}}
 
 
@@ -546,6 +619,129 @@ def add_html_context(app: Any, pagename: str, templatename: str, context: Any, d
         context['toctree'] = include_sub_headings
 
 
+@lru_cache
+def monkeypatch_man_writer() -> None:
+    '''
+    Monkeypatch the docutils man translator to be nicer
+    '''
+    from docutils.nodes import Element
+    from docutils.writers.manpage import Table, Translator
+    from sphinx.writers.manpage import ManualPageTranslator
+
+    # Generate nicer tables https://sourceforge.net/p/docutils/bugs/475/
+    class PatchedTable(Table):  # type: ignore
+        _options: list[str]
+        def __init__(self) -> None:
+            super().__init__()
+            self.needs_border_removal = self._options == ['center']
+            if self.needs_border_removal:
+                self._options = ['box', 'center']
+
+        def as_list(self) -> list[str]:
+            ans: list[str] = super().as_list()
+            if self.needs_border_removal:
+                # remove side and top borders as we use box in self._options
+                ans[2] = ans[2][1:]
+                a, b = ans[2].rpartition('|')[::2]
+                ans[2] = a + b
+                if ans[3] == '_\n':
+                    del ans[3]  # top border
+                del ans[-2] # bottom border
+            return ans
+    def visit_table(self: ManualPageTranslator, node: object) -> None:
+        setattr(self, '_active_table', PatchedTable())
+    setattr(ManualPageTranslator, 'visit_table', visit_table)
+
+    # Improve header generation
+    def header(self: ManualPageTranslator) -> str:
+        di = getattr(self, '_docinfo')
+        di['ktitle'] = di['title'].replace('_', '-')
+        th = (".TH \"%(ktitle)s\" %(manual_section)s"
+              " \"%(date)s\" \"%(version)s\"") % di
+        if di["manual_group"]:
+            th += " \"%(manual_group)s\"" % di
+        th += "\n"
+        sh_tmpl: str = (".SH Name\n"
+                   "%(ktitle)s \\- %(subtitle)s\n")
+        return th + sh_tmpl % di  # type: ignore
+
+    setattr(ManualPageTranslator, 'header', header)
+
+    def visit_image(self: ManualPageTranslator, node: Element) -> None:
+        pass
+
+    def depart_image(self: ManualPageTranslator, node: Element) -> None:
+        pass
+
+    def depart_figure(self: ManualPageTranslator, node: Element) -> None:
+        self.body.append(' (images not supported)\n')
+        Translator.depart_figure(self, node)
+
+    setattr(ManualPageTranslator, 'visit_image', visit_image)
+    setattr(ManualPageTranslator, 'depart_image', depart_image)
+    setattr(ManualPageTranslator, 'depart_figure', depart_figure)
+
+    orig_astext = Translator.astext
+    def astext(self: Translator) -> Any:
+        b = []
+        for line in self.body:
+            if line.startswith('.SH'):
+                x, y = line.split(' ', 1)
+                parts = y.splitlines(keepends=True)
+                parts[0] = parts[0].capitalize()
+                line = x + ' ' + '\n'.join(parts)
+            b.append(line)
+        self.body = b
+        return orig_astext(self)
+    setattr(Translator, 'astext', astext)
+
+
+def setup_man_pages() -> None:
+    from kittens.runner import get_kitten_cli_docs
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for x in glob.glob(os.path.join(base, 'docs/kittens/*.rst')):
+        kn = os.path.basename(x).rpartition('.')[0]
+        if kn == 'custom':
+            continue
+        cd = get_kitten_cli_docs(kn) or {}
+        khn = kn.replace('_', '-')
+        man_pages.append((f'kittens/{kn}', 'kitten-' + khn, cd.get('short_desc', 'kitten Documentation'), [author], 1))
+    monkeypatch_man_writer()
+
+
+def build_extra_man_pages() -> None:
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    kitten = os.environ.get('KITTEN_EXE_FOR_DOCS', os.path.join(base, 'kitty/launcher/kitten'))
+    if not os.path.exists(kitten):
+        kitten = os.path.join(base, 'kitty/launcher/kitty.app/Contents/MacOS/kitten')
+        if not os.path.exists(kitten):
+            subprocess.call(['find', os.path.join(base, 'kitty/launcher')])
+            raise Exception(f'The kitten binary {kitten} is not built cannot generate man pages')
+    raw = subprocess.check_output([kitten, '-h']).decode()
+    started = 0
+    names = set()
+    for line in raw.splitlines():
+        if line.strip() == '@':
+            started = len(line.rstrip()[:-1])
+        q = line.strip()
+        if started and len(q.split()) == 1 and not q.startswith('-') and ':' not in q:
+            if len(line) - len(line.lstrip()) == started:
+                if not os.path.exists(os.path.join(base, f'docs/kittens/{q}.rst')):
+                    names.add(q)
+    cwd = os.path.join(base, 'docs/_build/man')
+    subprocess.check_call([kitten, '__generate_man_pages__'], cwd=cwd)
+    subprocess.check_call([kitten, '__generate_man_pages__'] + list(names), cwd=cwd)
+
+
+if building_man_pages:
+    setup_man_pages()
+
+
+def build_finished(*a: Any, **kw: Any) -> None:
+    if building_man_pages:
+        build_extra_man_pages()
+
+
 def setup(app: Any) -> None:
     os.makedirs('generated/conf', exist_ok=True)
     from kittens.runner import all_kitten_names
@@ -557,10 +753,7 @@ def setup(app: Any) -> None:
     app.connect('source-read', replace_string)
     app.add_config_value('analytics_id', '', 'env')
     app.connect('html-page-context', add_html_context)
+    app.connect('build-finished', build_finished)
     app.add_lexer('session', SessionLexer() if version_info[0] < 3 else SessionLexer)
     app.add_role('link', link_role)
     app.add_role('commit', commit_role)
-    # monkey patch sphinx_inline_tabs to avoid a warning about parallel reads
-    # see https://github.com/pradyunsg/sphinx-inline-tabs/issues/26
-    inline_tabs = app.extensions['sphinx_inline_tabs']
-    inline_tabs.parallel_read_safe = inline_tabs.parallel_write_safe = True

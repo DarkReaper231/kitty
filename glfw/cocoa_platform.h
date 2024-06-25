@@ -139,6 +139,7 @@ typedef struct _GLFWwindowNS
     int             width, height;
     int             fbWidth, fbHeight;
     float           xscale, yscale;
+    int             blur_radius;
 
     // The total sum of the distances the cursor has been warped
     // since the last cursor motion event was processed
@@ -156,6 +157,7 @@ typedef struct _GLFWwindowNS
     GLFWcocoarenderframefun renderFrameCallback;
     // update cursor after switching desktops with Mission Control
     bool delayed_cursor_update_requested;
+    GLFWcocoarenderframefun resizeCallback;
 } _GLFWwindowNS;
 
 typedef struct _GLFWDisplayLinkNS
@@ -182,7 +184,7 @@ typedef struct _GLFWlibraryNS
     id                  nibObjects;
 
     char                keyName[64];
-    char                text[256];
+    char                text[512];
     CGPoint             cascadePoint;
     // Where to place the cursor when re-enabled
     double              restoreCursorPosX, restoreCursorPosY;

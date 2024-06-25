@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"kitty/tools/cli/markup"
+	"kitty/tools/tty"
 	"kitty/tools/tui/loop"
 	"kitty/tools/utils"
 	"kitty/tools/utils/style"
@@ -57,8 +58,11 @@ func truncate_at_space(text string, width int) (string, string) {
 }
 
 func extra_for(width, screen_width int) int {
-	return utils.Max(0, screen_width-width)/2 + 1
+	return max(0, screen_width-width)/2 + 1
 }
+
+var debugprintln = tty.DebugPrintln
+var _ = debugprintln
 
 func GetChoices(o *Options) (response string, err error) {
 	response = ""
@@ -66,12 +70,12 @@ func GetChoices(o *Options) (response string, err error) {
 	if err != nil {
 		return "", err
 	}
-	lp.MouseTrackingMode(loop.BUTTONS_ONLY_MOUSE_TRACKING)
+	lp.MouseTrackingMode(loop.FULL_MOUSE_TRACKING)
 
 	prefix_style_pat := regexp.MustCompile("^(?:\x1b\\[[^m]*?m)+")
 	choice_order := make([]Choice, 0, len(o.Choices))
 	clickable_ranges := make(map[string][]Range, 16)
-	allowed := utils.NewSet[string](utils.Max(2, len(o.Choices)))
+	allowed := utils.NewSet[string](max(2, len(o.Choices)))
 	response_on_accept := o.Default
 	switch o.Type {
 	case "yesno":
@@ -89,6 +93,9 @@ func GetChoices(o *Options) (response string, err error) {
 			}
 			letter = strings.ToLower(letter)
 			idx := strings.Index(strings.ToLower(text), letter)
+			if idx < 0 {
+				return "", fmt.Errorf("The choice letter %#v is not present in the choice text: %#v", letter, text)
+			}
 			idx = len([]rune(strings.ToLower(text)[:idx]))
 			allowed.Add(letter)
 			c := Choice{text: text, idx: idx, color: color, letter: letter}
@@ -123,6 +130,9 @@ func GetChoices(o *Options) (response string, err error) {
 	}
 
 	draw_long_text := func(screen_width int, text string, msg_lines []string) []string {
+		if screen_width < 3 {
+			return msg_lines
+		}
 		if text == "" {
 			msg_lines = append(msg_lines, "")
 		} else {
@@ -328,7 +338,7 @@ func GetChoices(o *Options) (response string, err error) {
 			}
 		}
 		y := int(sz.HeightCells) - len(msg_lines)
-		y = utils.Max(0, (y/2)-2)
+		y = max(0, (y/2)-2)
 		lp.QueueWriteString(strings.Repeat("\r\n", y))
 		for _, line := range msg_lines {
 			if replacement_text != "" {
@@ -358,12 +368,15 @@ func GetChoices(o *Options) (response string, err error) {
 		if hidden_text != "" && message != "" {
 			message = message[:hidden_text_start_pos] + hidden_text + message[hidden_text_end_pos:]
 			hidden_text = ""
-			draw_screen()
+			_ = draw_screen()
 		}
 	}
 
 	lp.OnInitialize = func() (string, error) {
 		lp.SetCursorVisible(false)
+		if o.Title != "" {
+			lp.SetWindowTitle(o.Title)
+		}
 		return "", draw_screen()
 	}
 
@@ -398,15 +411,30 @@ func GetChoices(o *Options) (response string, err error) {
 	}
 
 	lp.OnMouseEvent = func(ev *loop.MouseEvent) error {
-		if ev.Event_type == loop.MOUSE_CLICK {
-			for letter, ranges := range clickable_ranges {
-				for _, r := range ranges {
-					if r.has_point(ev.Cell.X, ev.Cell.Y) {
-						response = letter
-						lp.Quit(0)
-						return nil
-					}
+		on_letter := ""
+		for letter, ranges := range clickable_ranges {
+			for _, r := range ranges {
+				if r.has_point(ev.Cell.X, ev.Cell.Y) {
+					on_letter = letter
+					break
 				}
+			}
+		}
+		if on_letter != "" {
+			if s, has_shape := lp.CurrentPointerShape(); !has_shape && s != loop.POINTER_POINTER {
+				lp.PushPointerShape(loop.POINTER_POINTER)
+			}
+		} else {
+			if _, has_shape := lp.CurrentPointerShape(); has_shape {
+				lp.PopPointerShape()
+			}
+		}
+
+		if ev.Event_type == loop.MOUSE_CLICK {
+			if on_letter != "" {
+				response = on_letter
+				lp.Quit(0)
+				return nil
 			}
 			if hidden_text != "" && replacement_range.has_point(ev.Cell.X, ev.Cell.Y) {
 				unhide()

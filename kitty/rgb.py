@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2017, Kovid Goyal <kovid at kovidgoyal.net>
 
 import re
@@ -70,7 +70,7 @@ def to_color(raw: str, validate: bool = False) -> Optional[Color]:
         elif raw.startswith('rgb:'):
             val = parse_rgb(raw[4:])
     if val is None and validate:
-        raise ValueError(f'Invalid color name: {raw}')
+        raise ValueError(f'Invalid color name: {raw!r}')
     return val
 
 

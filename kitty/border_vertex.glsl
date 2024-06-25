@@ -1,7 +1,6 @@
-#version GLSL_VERSION
 uniform uvec2 viewport;
 uniform uint colors[9];
-uniform float background_opacity, do_srgb_correction;
+uniform float background_opacity;
 uniform float tint_opacity, tint_premult;
 uniform float gamma_lut[256];
 in vec4 rect;  // left, top, right, bottom
@@ -21,14 +20,6 @@ const uvec2 pos_map[] = uvec2[4](
     uvec2(LEFT, BOTTOM),
     uvec2(LEFT, TOP)
 );
-
-float linear2srgb(float x) {
-    // Linear to sRGB conversion. Needed to match alpha from the cell shader
-    float lower = 12.92 * x;
-    float upper = 1.055 * pow(x, 1.0f / 2.4f) - 0.055f;
-
-    return mix(lower, upper, step(0.0031308f, x));
-}
 
 float to_color(uint c) {
     return gamma_lut[c & FF];
@@ -53,6 +44,5 @@ void main() {
     color3 = is_window_bg * window_bg + (1. - is_window_bg) * color3;
     float final_opacity = is_default_bg * tint_opacity + (1. - is_default_bg) * background_opacity;
     float final_premult_opacity = is_default_bg * tint_premult + (1. - is_default_bg) * background_opacity;
-    final_opacity = do_srgb_correction * linear2srgb(final_opacity) + (1. - do_srgb_correction) * final_opacity;
     color = vec4(color3 * final_premult_opacity, final_opacity);
 }

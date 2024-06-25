@@ -7,10 +7,11 @@
 #pragma once
 #include "data-types.h"
 #include "monotonic.h"
+#include "kitty-uthash.h"
 
 typedef struct {
     unsigned char action, transmission_type, compressed, delete_action;
-    uint32_t format, more, id, image_number, data_sz, data_offset, placement_id, quiet;
+    uint32_t format, more, id, image_number, data_sz, data_offset, placement_id, quiet, parent_id, parent_placement_id;
     uint32_t width, height, x_offset, y_offset;
     union { uint32_t cursor_movement, compose_mode; };
     union { uint32_t cell_x_offset, blend_mode; };
@@ -22,6 +23,7 @@ typedef struct {
     union { int32_t z_index, gap; };
     size_t payload_sz;
     bool unicode_placement;
+    int32_t offset_from_parent_x, offset_from_parent_y;
 } GraphicsCommand;
 
 typedef struct {
@@ -35,12 +37,21 @@ typedef struct {
     int32_t start_row, start_column;
     uint32_t client_id;
     ImageRect src_rect;
-    // Indicates whether this reference represents a cell image that should be
+    // Indicates whether this reference represents a cell ref that should be
     // removed when the corresponding cells are modified.
-    bool is_cell_image;
+    // The internal id of the virtual ref this cell image was created from. Is a cell ref if this is non-zero.
+    id_type virtual_ref_id;
     // Virtual refs are not displayed but they can be used as prototypes for
     // refs placed using unicode placeholders.
     bool is_virtual_ref;
+
+    struct {
+        id_type img, ref;
+        struct { int32_t x, y; } offset;
+    } parent;
+
+    id_type internal_id;
+    hash_handle_type hh;
 } ImageRef;
 
 typedef struct {
@@ -50,22 +61,30 @@ typedef struct {
 
 typedef enum { ANIMATION_STOPPED = 0, ANIMATION_LOADING = 1, ANIMATION_RUNNING = 2} AnimationState;
 
+typedef struct TextureRef {
+    uint32_t id, refcnt;
+} TextureRef;
+
 typedef struct {
-    uint32_t texture_id, client_id, client_number, width, height;
+    uint32_t client_id, client_number, width, height;
+    TextureRef *texture;
     id_type internal_id;
 
     bool root_frame_data_loaded;
     ImageRef *refs;
+    id_type ref_id_counter;
     Frame *extra_frames, root_frame;
     uint32_t current_frame_index, frame_id_counter;
     uint64_t animation_duration;
-    size_t refcnt, refcap, extra_framecnt;
+    size_t extra_framecnt;
     monotonic_t atime;
     size_t used_storage;
     bool is_drawn;
     AnimationState animation_state;
     uint32_t max_loops, current_loop;
     monotonic_t current_frame_shown_at;
+
+    hash_handle_type hh;
 } Image;
 
 typedef struct {
@@ -76,10 +95,10 @@ typedef struct {
 } BackgroundImage;
 
 typedef struct {
-    float vertices[16];
+    ImageRect src_rect, dest_rect;
     uint32_t texture_id, group_count;
     int z_index;
-    id_type image_id;
+    id_type image_id, ref_id;
 } ImageRenderData;
 
 typedef struct {
@@ -106,11 +125,14 @@ typedef struct {
 typedef struct {
     PyObject_HEAD
 
-    size_t image_count, images_capacity, storage_limit;
+    size_t storage_limit;
     LoadData currently_loading;
     Image *images;
-    size_t count, capacity;
-    ImageRenderData *render_data;
+    id_type image_id_counter;
+    struct {
+        size_t count, capacity;
+        ImageRenderData *item;
+    } render_data;
     bool layers_dirty;
     // The number of images below MIN_ZINDEX / 2, then the number of refs between MIN_ZINDEX / 2 and -1 inclusive, then the number of refs above 0 inclusive.
     size_t num_of_below_refs, num_of_negative_refs, num_of_positive_refs;
@@ -131,7 +153,7 @@ typedef struct {
 
 static inline float
 gl_size(const unsigned int sz, const unsigned int viewport_size) {
-    // convert pixel sz to OpenGL co-ordinate system.
+    // convert pixel sz to OpenGL coordinate system.
     const float px = 2.f / viewport_size;
     return px * sz;
 }
@@ -158,7 +180,7 @@ gl_pos_y(const unsigned int px_from_top_margin, const unsigned int viewport_size
 }
 
 
-GraphicsManager* grman_alloc(void);
+GraphicsManager* grman_alloc(bool for_paused_rendering);
 void grman_clear(GraphicsManager*, bool, CellPixelSize fg);
 const char* grman_handle_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_t *payload, Cursor *c, bool *is_dirty, CellPixelSize fg);
 Image* grman_put_cell_image(GraphicsManager *self, uint32_t row, uint32_t col, uint32_t image_id, uint32_t placement_id, uint32_t x, uint32_t y, uint32_t w, uint32_t h, CellPixelSize cell);
@@ -169,7 +191,9 @@ void grman_rescale(GraphicsManager *self, CellPixelSize fg);
 void grman_remove_cell_images(GraphicsManager *self, int32_t top, int32_t bottom);
 void grman_remove_all_cell_images(GraphicsManager *self);
 void gpu_data_for_image(ImageRenderData *ans, float left, float top, float right, float bottom);
-void gpu_data_for_centered_image(ImageRenderData *ans, unsigned int screen_width_px, unsigned int screen_height_px, unsigned int width, unsigned int height);
 bool png_from_file_pointer(FILE* fp, const char *path, uint8_t** data, unsigned int* width, unsigned int* height, size_t* sz);
 bool png_path_to_bitmap(const char *path, uint8_t** data, unsigned int* width, unsigned int* height, size_t* sz);
+bool png_from_data(void *png_data, size_t png_data_sz, const char *path_for_error_messages, uint8_t** data, unsigned int* width, unsigned int* height, size_t* sz);
 bool scan_active_animations(GraphicsManager *self, const monotonic_t now, monotonic_t *minimum_gap, bool os_window_context_set);
+void scale_rendered_graphic(ImageRenderData*, float xstart, float ystart, float x_scale, float y_scale);
+void grman_pause_rendering(GraphicsManager *self, GraphicsManager *dest);

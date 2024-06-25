@@ -5,6 +5,7 @@ package diff
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 
@@ -12,8 +13,6 @@ import (
 	"kitty/tools/utils"
 	"kitty/tools/utils/images"
 	"kitty/tools/wcswidth"
-
-	"golang.org/x/exp/slices"
 )
 
 var _ = fmt.Print
@@ -124,7 +123,7 @@ func (self *Search) search(logical_lines *LogicalLines) {
 		}
 	})
 	for _, spans := range self.matches {
-		slices.SortFunc(spans, func(a, b Span) bool { return a.start < b.start })
+		slices.SortFunc(spans, func(a, b Span) int { return a.start - b.start })
 	}
 }
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
 import atexit
@@ -11,8 +11,25 @@ import string
 import sys
 from contextlib import contextmanager, suppress
 from functools import lru_cache
-from time import monotonic
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, Iterable, Iterator, List, Mapping, Match, NamedTuple, Optional, Pattern, Tuple, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Match,
+    NamedTuple,
+    Optional,
+    Pattern,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 from .constants import (
     appname,
@@ -20,12 +37,13 @@ from .constants import (
     config_dir,
     is_macos,
     is_wayland,
-    read_kitty_resource,
+    kitten_exe,
     runtime_dir,
     shell_path,
     ssh_control_master_template,
 )
-from .fast_data_types import WINDOW_FULLSCREEN, WINDOW_MAXIMIZED, WINDOW_MINIMIZED, WINDOW_NORMAL, Color, open_tty
+from .fast_data_types import WINDOW_FULLSCREEN, WINDOW_MAXIMIZED, WINDOW_MINIMIZED, WINDOW_NORMAL, Color, Shlex, get_options, monotonic, open_tty
+from .fast_data_types import timed_debug_print as _timed_debug_print
 from .rgb import to_color
 from .types import run_once
 from .typing import AddressFamily, PopenType, Socket, StartupCtx
@@ -104,16 +122,6 @@ def platform_window_id(os_window_id: int) -> Optional[int]:
     return None
 
 
-def load_shaders(name: str, vertex_name: str = '', fragment_name: str = '') -> Tuple[str, str]:
-    from .fast_data_types import GLSL_VERSION
-
-    def load(which: str, lname: str = '') -> str:
-        lname = lname or name
-        return read_kitty_resource(f'{lname}_{which}.glsl').decode('utf-8').replace('GLSL_VERSION', str(GLSL_VERSION), 1)
-
-    return load('vertex', vertex_name), load('fragment', fragment_name)
-
-
 def safe_print(*a: Any, **k: Any) -> None:
     with suppress(Exception):
         print(*a, **k)
@@ -123,7 +131,7 @@ def log_error(*a: Any, **k: str) -> None:
     from .fast_data_types import log_error_string
     output = getattr(log_error, 'redirect', log_error_string)
     with suppress(Exception):
-        msg = k.get('sep', ' ').join(map(str, a)) + k.get('end', '').replace('\0', '')
+        msg = k.get('sep', ' ').join(map(str, a)) + k.get('end', '')
         output(msg)
 
 
@@ -386,6 +394,9 @@ def unix_socket_directories() -> Iterator[str]:
     if is_macos:
         from .fast_data_types import user_cache_dir
         candidates = [user_cache_dir(), '/Library/Caches']
+    else:
+        if os.environ.get('XDG_RUNTIME_DIR'):
+            candidates.insert(0, os.environ['XDG_RUNTIME_DIR'])
     for loc in candidates:
         if os.access(loc, os.W_OK | os.R_OK | os.X_OK):
             yield loc
@@ -490,7 +501,10 @@ single_instance = SingleInstance()
 
 def parse_address_spec(spec: str) -> Tuple[AddressFamily, Union[Tuple[str, int], str], Optional[str]]:
     import socket
-    protocol, rest = spec.split(':', 1)
+    try:
+        protocol, rest = spec.split(':', 1)
+    except ValueError:
+        raise ValueError(f'Invalid listen-on value: {spec} must be of the form protocol:address')
     socket_path = None
     address: Union[str, Tuple[str, int]] = ''
     if protocol == 'unix':
@@ -505,7 +519,7 @@ def parse_address_spec(spec: str) -> Tuple[AddressFamily, Union[Tuple[str, int],
         host, port = rest.rsplit(':', 1)
         address = host, int(port)
     else:
-        raise ValueError(f'Unknown protocol in --listen-on value: {spec}')
+        raise ValueError(f'Unknown protocol in listen-on value: {spec}')
     return family, address, socket_path
 
 
@@ -618,7 +632,7 @@ def get_hostname(fallback: str = '') -> str:
 
 def resolve_editor_cmd(editor: str, shell_env: Mapping[str, str]) -> Optional[str]:
     import shlex
-    editor_cmd = shlex.split(editor)
+    editor_cmd = list(shlex_split(editor))
     editor_exe = (editor_cmd or ('',))[0]
     if editor_exe and os.path.isabs(editor_exe):
         return editor
@@ -652,24 +666,21 @@ def get_editor_from_env(env: Mapping[str, str]) -> Optional[str]:
 
 
 def get_editor_from_env_vars(opts: Optional[Options] = None) -> List[str]:
-    import shlex
-
     editor = get_editor_from_env(os.environ)
     if not editor:
         shell_env = read_shell_environment(opts)
         editor = get_editor_from_env(shell_env)
 
-    for ans in (editor, 'vim', 'nvim', 'vi', 'emacs', 'kak', 'micro', 'nano', 'vis'):
-        if ans and which(shlex.split(ans)[0], only_system=True):
+    for ans in (editor, 'vim', 'nvim', 'vi', 'emacs', 'hx', 'kak', 'micro', 'nano', 'vis'):
+        if ans and which(next(shlex_split(ans)), only_system=True):
             break
     else:
         ans = 'vim'
-    return shlex.split(ans)
+    return list(shlex_split(ans))
 
 
 def get_editor(opts: Optional[Options] = None, path_to_edit: str = '', line_number: int = 0) -> List[str]:
     if opts is None:
-        from .fast_data_types import get_options
         try:
             opts = get_options()
         except RuntimeError:
@@ -679,8 +690,7 @@ def get_editor(opts: Optional[Options] = None, path_to_edit: str = '', line_numb
     if opts.editor == '.':
         ans = get_editor_from_env_vars()
     else:
-        import shlex
-        ans = shlex.split(opts.editor)
+        ans = list(shlex_split(opts.editor))
     ans[0] = os.path.expanduser(ans[0])
     if path_to_edit:
         if line_number:
@@ -712,6 +722,26 @@ def is_path_in_temp_dir(path: str) -> bool:
     return False
 
 
+def is_ok_to_read_image_file(path: str, fd: int) -> bool:
+    import stat
+    path = os.path.abspath(os.path.realpath(path))
+    try:
+        path_stat = os.stat(path, follow_symlinks=True)
+        fd_stat = os.fstat(fd)
+    except OSError:
+        return False
+    if not os.path.samestat(path_stat, fd_stat):
+        return False
+    parts = path.split(os.sep)[1:]
+    if len(parts) < 1:
+        return False
+    if parts[0] in ('sys', 'proc', 'dev'):
+        if parts[0] == 'dev':
+            return len(parts) > 2 and parts[1] == 'shm'
+        return False
+    return stat.S_ISREG(fd_stat.st_mode)
+
+
 def resolve_abs_or_config_path(path: str, env: Optional[Mapping[str, str]] = None, conf_dir: Optional[str] = None) -> str:
     path = os.path.expanduser(path)
     path = expandvars(path, env or {})
@@ -721,7 +751,6 @@ def resolve_abs_or_config_path(path: str, env: Optional[Mapping[str, str]] = Non
 
 
 def resolve_custom_file(path: str) -> str:
-    from .fast_data_types import get_options
     opts: Optional[Options] = None
     with suppress(RuntimeError):
         opts = get_options()
@@ -741,8 +770,19 @@ def resolved_shell(opts: Optional[Options] = None) -> List[str]:
     if q == '.':
         ans = [shell_path]
     else:
-        import shlex
-        ans = shlex.split(q)
+        env = {}
+        if opts is not None:
+            env['TERM'] = opts.term
+        if 'SHELL' not in os.environ:
+            env['SHELL'] = shell_path
+        if 'HOME' not in os.environ:
+            env['HOME'] = os.path.expanduser('~')
+        if 'USER' not in os.environ:
+            import pwd
+            env['USER'] = pwd.getpwuid(os.geteuid()).pw_name
+        def expand(x: str) -> str:
+            return expandvars(x, env)
+        ans = list(map(expand, shlex_split(q)))
     return ans
 
 
@@ -777,7 +817,6 @@ def which(name: str, only_system: bool = False) -> Optional[str]:
         return name
     import shutil
 
-    from .fast_data_types import get_options
     opts: Optional[Options] = None
     with suppress(RuntimeError):
         opts = get_options()
@@ -982,7 +1021,7 @@ def reload_conf_in_all_kitties() -> None:
 
 @run_once
 def control_codes_pat() -> 'Pattern[str]':
-    return re.compile('[\x00-\x09\x0b-\x1f\x7f\x80-\x9f]')
+    return re.compile('[\x00-\x09\x0b-\x1f\x7f-\x9f]')
 
 
 def sanitize_control_codes(text: str, replace_with: str = '') -> str:
@@ -1014,7 +1053,9 @@ def cleanup_ssh_control_masters() -> None:
             os.remove(x)
 
 
-def path_from_osc7_url(url: str) -> str:
+def path_from_osc7_url(url: Union[str, bytes]) -> str:
+    if isinstance(url, bytes):
+        url = url.decode('utf-8')
     if url.startswith('kitty-shell-cwd://'):
         return '/' + url.split('/', 3)[-1]
     if url.startswith('file://'):
@@ -1115,7 +1156,8 @@ def sanitize_url_for_dispay_to_user(url: str) -> str:
         if purl.path:
             purl = purl._replace(path=unquote(purl.path))
         url = urlunparse(purl)
-    except Exception:
+    except Exception as e:
+        log_error(e)
         url = 'Unparseable URL: ' + url
     return url
 
@@ -1145,3 +1187,60 @@ def is_png(path: str) -> bool:
             header = f.read(8)
             return header.startswith(b'\211PNG\r\n\032\n')
     return False
+
+
+def cmdline_for_hold(cmd: Sequence[str] = (), opts: Optional['Options'] = None) -> List[str]:
+    if opts is None:
+        with suppress(RuntimeError):
+            opts = get_options()
+    if opts is None:
+        from .options.types import defaults
+        opts = defaults
+    ksi = ' '.join(opts.shell_integration)
+    import shlex
+    shell = shlex.join(resolved_shell(opts))
+    return [kitten_exe(), 'run-shell', f'--shell={shell}', f'--shell-integration={ksi}', '--env=KITTY_HOLD=1'] + list(cmd)
+
+
+def safe_mtime(path: str) -> Optional[float]:
+    with suppress(OSError):
+        return os.path.getmtime(path)
+    return None
+
+
+@run_once
+def get_custom_window_icon() -> Union[Tuple[float, str], Tuple[None, None]]:
+    filenames = ['kitty.app.png']
+    if is_macos:
+        # On macOS, prefer icns to png.
+        filenames.insert(0, 'kitty.app.icns')
+    for name in filenames:
+        custom_icon_path = os.path.join(config_dir, name)
+        custom_icon_mtime = safe_mtime(custom_icon_path)
+        if custom_icon_mtime is not None:
+            return custom_icon_mtime, custom_icon_path
+    return None, None
+
+
+def key_val_matcher(items: Iterable[Tuple[str, str]], key_pat: 're.Pattern[str]', val_pat: Optional['re.Pattern[str]']) -> bool:
+    for key, val in items:
+        if key_pat.search(key) is not None and (
+                val_pat is None or val_pat.search(val) is not None):
+            return True
+    return False
+
+
+def shlex_split(text: str, allow_ansi_quoted_strings: bool = False) -> Iterator[str]:
+    s = Shlex(text, allow_ansi_quoted_strings)
+    while (q := s.next_word())[0] > -1:
+        yield q[1]
+
+
+def shlex_split_with_positions(text: str, allow_ansi_quoted_strings: bool = False) -> Iterator[Tuple[int, str]]:
+    s = Shlex(text, allow_ansi_quoted_strings)
+    while (q := s.next_word())[0] > -1:
+        yield q
+
+
+def timed_debug_print(*a: Any, sep: str = ' ', end: str = '\n') -> None:
+    _timed_debug_print(sep.join(map(str, a)) + end)

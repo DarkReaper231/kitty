@@ -1,47 +1,45 @@
-from typing import Callable, Tuple, Union
+from typing import Callable, Union
 
-IO_BUFFER_SIZE: int
-
-
-class JobCapsule:
-    pass
-
-
-class SignatureCapsule:
-    pass
-
+ReadOnlyBuffer = Union[bytes, bytearray, memoryview]
+WriteBuffer = Union[bytearray, memoryview]
 
 class RsyncError(Exception):
     pass
 
+class Hasher:
+    def __init__(self, which: str, data: ReadOnlyBuffer = b''): ...
+    def update(self, data: ReadOnlyBuffer) -> None: ...
+    def reset(self) -> None: ...
+    def digest(self) -> bytes: ...
+    def hexdigest(self) -> str: ...
 
-def begin_create_signature(file_size: int = -1, strong_len: int = 0) -> Tuple[JobCapsule, int, int]:
-    pass
-
-
-def begin_load_signature() -> Tuple[JobCapsule, SignatureCapsule]:
-    pass
-
-
-def build_hash_table(sig: SignatureCapsule) -> None:
-    pass
-
-
-def begin_create_delta(sig: SignatureCapsule) -> JobCapsule:
-    pass
+    @property
+    def digest_size(self) -> int: ...
+    @property
+    def block_size(self) -> int: ...
+    @property
+    def name(self) -> str: ...
 
 
-def begin_patch(callback: Callable[[memoryview, int], int]) -> JobCapsule:
-    pass
+class Patcher:
+
+    def __init__(self, expected_input_size: int = 0): ...
+    def signature_header(self, output: WriteBuffer) -> int: ...
+    def sign_block(self, block: ReadOnlyBuffer, output: WriteBuffer) -> int: ...
+    def apply_delta_data(self, data: ReadOnlyBuffer, read: Callable[[int, WriteBuffer], int], write: Callable[[ReadOnlyBuffer], None]) -> None: ...
+    def finish_delta_data(self) -> None: ...
+
+    @property
+    def block_size(self) -> int: ...
+    @property
+    def total_data_in_delta(self) -> int: ...
 
 
-def iter_job(job_capsule: JobCapsule, input_data: bytes, output_buf: bytearray) -> Tuple[bool, int, int]:
-    pass
+class Differ:
+
+    def add_signature_data(self, data: ReadOnlyBuffer) -> None: ...
+    def finish_signature_data(self) -> None: ...
+    def next_op(self, read: Callable[[WriteBuffer], int], write: Callable[[ReadOnlyBuffer], None]) -> bool: ...
 
 
-def parse_ftc(src: Union[str, bytes, memoryview], callback: Callable[[memoryview, memoryview, bool], None]) -> None:
-    pass
-
-
-def decode_utf8_buffer(src: Union[str, bytes, memoryview]) -> str:
-    pass
+def parse_ftc(x: Union[str, ReadOnlyBuffer], callback: Callable[[memoryview, memoryview], None]) -> None: ...

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2018, Kovid Goyal <kovid at kovidgoyal.net>
 
 import sys
@@ -9,8 +9,8 @@ from kitty.cli_stub import HintsCLIOptions
 from kitty.clipboard import set_clipboard_string, set_primary_selection
 from kitty.constants import website_url
 from kitty.fast_data_types import get_options
-from kitty.typing import BossType
-from kitty.utils import resolve_custom_file
+from kitty.typing import BossType, WindowType
+from kitty.utils import get_editor, resolve_custom_file
 
 from ..tui.handler import result_handler
 
@@ -115,14 +115,16 @@ controls where to display the selected error message, other options are ignored.
 --regex
 default={default_regex}
 The regular expression to use when option :option:`--type` is set to
-:code:`regex`, in python syntax. If you specify a numbered group in the regular
+:code:`regex`, in Perl 5 syntax. If you specify a numbered group in the regular
 expression, only the group will be matched. This allow you to match text
 ignoring a prefix/suffix, as needed. The default expression matches lines. To
-match text over multiple lines, you should prefix the regular expression with
-:code:`(?ms)`, which turns on MULTILINE and DOTALL modes for the regex engine.
-If you specify named groups and a :option:`--program`, then the program will be
-passed arguments corresponding to each named group of the form
-:code:`key=value`.
+match text over multiple lines, things get a little tricky, as line endings
+are a sequence of zero or more null bytes followed by either a carriage return
+or a newline character. To have a pattern match over line endings you will need to
+match the character set ``[\0\r\n]``. The newlines and null bytes are automatically
+stripped from the returned text. If you specify named groups and a
+:option:`--program`, then the program will be passed arguments corresponding
+to each named group of the form :code:`key=value`.
 
 
 --linenum-action
@@ -134,7 +136,7 @@ window, :code:`window` a new kitty window, :code:`tab` a new tab,
 :code:`os_window` a new OS window and :code:`background` run in the background.
 The actual action is whatever arguments are provided to the kitten, for
 example:
-:code:`kitty +kitten hints --type=linenum --linenum-action=tab vim +{line} {path}`
+:code:`kitten hints --type=linenum --linenum-action=tab vim +{line} {path}`
 will open the matched path at the matched line number in vim in
 a new kitty tab. Note that in order to use :option:`--program` to copy or paste
 the provided arguments, you need to use the special value :code:`self`.
@@ -144,6 +146,13 @@ the provided arguments, you need to use the special value :code:`self`.
 default=default
 Comma separated list of recognized URL prefixes. Defaults to the list of
 prefixes defined by the :opt:`url_prefixes` option in :file:`kitty.conf`.
+
+
+--url-excluded-characters
+default=default
+Characters to exclude when matching URLs. Defaults to the list of characters
+defined by the :opt:`url_excluded_characters` option in :file:`kitty.conf`.
+The syntax for this option is the same as for :opt:`url_excluded_characters`.
 
 
 --word-characters
@@ -206,19 +215,25 @@ bottom.
 --hints-foreground-color
 default=black
 type=str
-The foreground color for hints.
+The foreground color for hints. You can use color names or hex values. For the eight basic
+named terminal colors you can also use the :code:`bright-` prefix to get the bright variant of the
+color.
 
 
 --hints-background-color
 default=green
 type=str
-The background color for hints.
+The background color for hints. You can use color names or hex values. For the eight basic
+named terminal colors you can also use the :code:`bright-` prefix to get the bright variant of the
+color.
 
 
 --hints-text-color
-default=gray
+default=bright-gray
 type=str
-The foreground color for text pointed to by the hints.
+The foreground color for text pointed to by the hints. You can use color names or hex values. For the eight basic
+named terminal colors you can also use the :code:`bright-` prefix to get the bright variant of the
+color.
 
 
 --customize-processing
@@ -257,7 +272,10 @@ def linenum_handle_result(args: List[str], data: Dict[str, Any], target_window_i
     if not path:
         return
 
-    cmd = [x.format(path=path, line=line) for x in extra_cli_args or ('vim', '+{line}', '{path}')]
+    if extra_cli_args:
+        cmd = [x.format(path=path, line=line) for x in extra_cli_args]
+    else:
+        cmd = get_editor(path_to_edit=path, line_number=line)
     w = boss.window_id_map.get(target_window_id)
     action = data['linenum_action']
 
@@ -294,7 +312,14 @@ def linenum_handle_result(args: List[str], data: Dict[str, Any], target_window_i
             }[action])(*cmd)
 
 
-@result_handler(type_of_input='screen-ansi', has_ready_notification=True)
+def on_mark_clicked(boss: BossType, window: WindowType, url: str, hyperlink_id: int, cwd: str) -> bool:
+    if url.startswith('mark:'):
+        window.send_cmd_response({'Type': 'mark_activated', 'Mark': int(url[5:])})
+        return True
+    return False
+
+
+@result_handler(type_of_input='screen-ansi', has_ready_notification=True, open_url_handler=on_mark_clicked)
 def handle_result(args: List[str], data: Dict[str, Any], target_window_id: int, boss: BossType) -> None:
     cp = data['customize_processing']
     if data['type'] == 'linenum':
@@ -369,7 +394,7 @@ def handle_result(args: List[str], data: Dict[str, Any], target_window_id: int, 
                             m.append('{}={}'.format(k, v or ''))
                     if launch_args:
                         w = boss.window_id_map.get(target_window_id)
-                        boss.call_remote_control(active_window=w, args=tuple(launch_args + ([m] if isinstance(m, str) else m)))
+                        boss.call_remote_control(self_window=w, args=tuple(launch_args + ([m] if isinstance(m, str) else m)))
                     else:
                         boss.open_url(m, program, cwd=cwd)
 

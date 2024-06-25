@@ -5,6 +5,7 @@
  * Distributed under terms of the GPL3 license.
  */
 
+#define PY_SSIZE_T_CLEAN
 #include <libgen.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -19,6 +20,7 @@
 #include <wchar.h>
 #include <Python.h>
 #include <fcntl.h>
+#include "launcher.h"
 
 #ifndef KITTY_LIB_PATH
 #define KITTY_LIB_PATH "../.."
@@ -28,13 +30,13 @@
 #endif
 
 static void cleanup_free(void *p) { free(*(void**) p); }
-#define FREE_AFTER_FUNCTION __attribute__((cleanup(cleanup_free)))
+#define RAII_ALLOC(type, name, initializer) __attribute__((cleanup(cleanup_free))) type *name = initializer
 
 
 #ifndef __FreeBSD__
 static bool
 safe_realpath(const char* src, char *buf, size_t buf_sz) {
-    FREE_AFTER_FUNCTION char* ans = realpath(src, NULL);
+    RAII_ALLOC(char, ans, realpath(src, NULL));
     if (ans == NULL) return false;
     snprintf(buf, buf_sz, "%s", ans);
     return true;
@@ -83,8 +85,8 @@ canonicalize_path(const char *srcpath, char *dstpath, size_t sz) {
     // remove . and .. path segments
     bool ok = false;
     size_t plen = strlen(srcpath) + 1, chk;
-    FREE_AFTER_FUNCTION char *wtmp = malloc(plen);
-    FREE_AFTER_FUNCTION char **tokv = malloc(sizeof(char*) * plen);
+    RAII_ALLOC(char, wtmp, malloc(plen));
+    RAII_ALLOC(char*, tokv, malloc(sizeof(char*) * plen));
     if (!wtmp || !tokv) goto end;
     char *s, *tok, *sav;
     bool relpath = *srcpath != '/';
@@ -182,6 +184,9 @@ run_embedded(RunData *run_data) {
     PyPreConfig_InitPythonConfig(&preconfig);
     preconfig.utf8_mode = 1;
     preconfig.coerce_c_locale = 1;
+#ifdef SET_PYTHON_HOME
+    preconfig.isolated = 1;
+#endif
     status = Py_PreInitialize(&preconfig);
     if (PyStatus_Exception(status)) goto fail;
     PyConfig config;
@@ -194,7 +199,15 @@ run_embedded(RunData *run_data) {
     if (PyStatus_Exception(status)) goto fail;
     status = PyConfig_SetBytesString(&config, &config.run_filename, run_data->lib_dir);
     if (PyStatus_Exception(status)) goto fail;
-
+#ifdef SET_PYTHON_HOME
+#ifndef __APPLE__
+    char pyhome[256];
+    snprintf(pyhome, sizeof(pyhome), "%s/%s", run_data->lib_dir, SET_PYTHON_HOME);
+    status = PyConfig_SetBytesString(&config, &config.home, pyhome);
+    if (PyStatus_Exception(status)) goto fail;
+#endif
+    config.isolated = 1;
+#endif
     status = Py_InitializeFromConfig(&config);
     if (PyStatus_Exception(status))  goto fail;
     PyConfig_Clear(&config);
@@ -344,12 +357,91 @@ delegate_to_kitten_if_possible(int argc, char *argv[], char* exe_dir) {
     if (argc > 3 && strcmp(argv[1], "+") == 0 && strcmp(argv[2], "kitten") == 0 && is_wrapped_kitten(argv[3])) exec_kitten(argc - 2, argv + 2, exe_dir);
 }
 
+static bool
+is_boolean_flag(const char *x) {
+    static const char *all_boolean_options = KITTY_CLI_BOOL_OPTIONS;
+    char buf[128];
+    snprintf(buf, sizeof(buf), " %s ", x);
+    return strstr(all_boolean_options, buf) != NULL;
+}
+
+static void
+handle_fast_commandline(int argc, char *argv[]) {
+    char current_option_expecting_argument[128] = {0};
+    CLIOptions opts = {0};
+    int first_arg = 1;
+    if (argc > 1 && strcmp(argv[1], "+open") == 0) {
+        first_arg = 2;
+    } else if (argc > 2 && strcmp(argv[1], "+") == 0 && strcmp(argv[2], "open") == 0) {
+        first_arg = 3;
+    }
+    for (int i = first_arg; i < argc; i++) {
+        const char *arg = argv[i];
+        if (current_option_expecting_argument[0]) {
+handle_option_value:
+            if (strcmp(current_option_expecting_argument, "session") == 0) {
+                opts.session = arg;
+            } else if (strcmp(current_option_expecting_argument, "instance-group") == 0) {
+                opts.instance_group = arg;
+            }
+            current_option_expecting_argument[0] = 0;
+        } else {
+            if (!arg || !arg[0] || !arg[1] || arg[0] != '-' || strcmp(arg, "--") == 0) {
+                if (first_arg > 1) {
+                    opts.open_urls = argv + i;
+                    opts.open_url_count = argc - i;
+                }
+                break;
+            }
+            if (arg[1] == '-') {  // long opt
+                const char *equal = strchr(arg, '=');
+                if (equal == NULL) {
+                    if (strcmp(arg+2, "version") == 0) {
+                        opts.version_requested = true;
+                    } else if (strcmp(arg+2, "single-instance") == 0) {
+                        opts.single_instance = true;
+                    } else if (strcmp(arg+2, "wait-for-single-instance-window-close") == 0) {
+                        opts.wait_for_single_instance_window_close = true;
+                    } else if (!is_boolean_flag(arg+2)) {
+                        strncpy(current_option_expecting_argument, arg+2, sizeof(current_option_expecting_argument)-1);
+                    }
+                } else {
+                    memcpy(current_option_expecting_argument, arg+2, equal - (arg + 2));
+                    arg = equal + 1;
+                    goto handle_option_value;
+                }
+            } else {
+                char buf[2] = {0};
+                for (int i = 1; arg[i] != 0; i++) {
+                    switch(arg[i]) {
+                        case 'v': opts.version_requested = true; break;
+                        case '1': opts.single_instance = true; break;
+                        default:
+                            buf[0] = arg[i]; buf[1] = 0;
+                            if (!is_boolean_flag(buf)) { current_option_expecting_argument[0] = arg[i]; current_option_expecting_argument[1] = 0; }
+                    }
+                }
+            }
+        }
+    }
+
+    if (opts.version_requested) {
+        if (isatty(STDOUT_FILENO)) {
+            printf("\x1b[3mkitty\x1b[23m \x1b[32m%s\x1b[39m created by \x1b[1;34mKovid Goyal\x1b[22;39m\n", KITTY_VERSION);
+        } else {
+            printf("kitty %s created by Kovid Goyal\n", KITTY_VERSION);
+        }
+        exit(0);
+    }
+    if (opts.single_instance) single_instance_main(argc, argv, &opts);
+}
+
 int main(int argc, char *argv[], char* envp[]) {
     if (argc < 1 || !argv) { fprintf(stderr, "Invalid argc/argv\n"); return 1; }
     if (!ensure_working_stdio()) return 1;
     char exe[PATH_MAX+1] = {0};
     char exe_dir_buf[PATH_MAX+1] = {0};
-    FREE_AFTER_FUNCTION const char *lc_ctype = NULL;
+    RAII_ALLOC(const char, lc_ctype, NULL);
 #ifdef __APPLE__
     lc_ctype = getenv("LC_CTYPE");
     if (lc_ctype) lc_ctype = strdup(lc_ctype);
@@ -358,9 +450,14 @@ int main(int argc, char *argv[], char* envp[]) {
     strncpy(exe_dir_buf, exe, sizeof(exe_dir_buf));
     char *exe_dir = dirname(exe_dir_buf);
     delegate_to_kitten_if_possible(argc, argv, exe_dir);
+    handle_fast_commandline(argc, argv);
     int num, ret=0;
     char lib[PATH_MAX+1] = {0};
-    num = snprintf(lib, PATH_MAX, "%s/%s", exe_dir, KITTY_LIB_PATH);
+    if (KITTY_LIB_PATH[0] == '/') {
+        num = snprintf(lib, PATH_MAX, "%s", KITTY_LIB_PATH);
+    } else {
+        num = snprintf(lib, PATH_MAX, "%s/%s", exe_dir, KITTY_LIB_PATH);
+    }
 
     if (num < 0 || num >= PATH_MAX) { fprintf(stderr, "Failed to create path to kitty lib\n"); return 1; }
     RunData run_data = {.exe = exe, .exe_dir = exe_dir, .lib_dir = lib, .argc = argc, .argv = argv, .lc_ctype = lc_ctype};

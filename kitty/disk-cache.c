@@ -5,11 +5,12 @@
  * Distributed under terms of the GPL3 license.
  */
 
-#define EXTRA_INIT if (PyModule_AddFunctions(module, module_methods) != 0) return false;
-#define MAX_KEY_SIZE 256u
+#define MAX_KEY_SIZE 16u
+
 #include "disk-cache.h"
 #include "safe-wrappers.h"
 #include "kitty-uthash.h"
+#include "simd-string.h"
 #include "loop-utils.h"
 #include "fast-file-copy.h"
 #include "threading.h"
@@ -32,29 +33,29 @@ typedef struct {
     UT_hash_handle hh;
 } CacheEntry;
 
+typedef struct Hole {
+    off_t pos, size;
+} Hole;
+
+typedef struct Holes {
+    Hole *items;
+    size_t capacity, count;
+    off_t largest_hole_size;
+} Holes;
 
 typedef struct {
     PyObject_HEAD
     char *cache_dir;
     int cache_file_fd;
+    Py_ssize_t small_hole_threshold;
     pthread_mutex_t lock;
     pthread_t write_thread;
     bool thread_started, lock_inited, loop_data_inited, shutting_down, fully_initialized;
     LoopData loop_data;
     CacheEntry *entries, currently_writing;
+    Holes holes;
     unsigned long long total_size;
 } DiskCache;
-
-static void
-xor_data(const uint8_t* restrict key, const size_t key_sz, uint8_t* restrict data, const size_t data_sz) {
-    size_t unaligned_sz = data_sz % key_sz;
-    size_t aligned_sz = data_sz - unaligned_sz;
-    for (size_t offset = 0; offset < aligned_sz; offset += key_sz) {
-        for (size_t i = 0; i < key_sz; i++) data[offset + i] ^= key[i];
-    }
-    for (size_t i = 0; i < unaligned_sz; i++) data[aligned_sz + i] ^= key[i];
-}
-
 
 void
 free_cache_entry(CacheEntry *e) {
@@ -66,11 +67,12 @@ free_cache_entry(CacheEntry *e) {
 #define mutex(op) pthread_mutex_##op(&self->lock)
 
 static PyObject*
-new(PyTypeObject *type, PyObject UNUSED *args, PyObject UNUSED *kwds) {
+new_diskcache_object(PyTypeObject *type, PyObject UNUSED *args, PyObject UNUSED *kwds) {
     DiskCache *self;
     self = (DiskCache*)type->tp_alloc(type, 0);
     if (self) {
         self->cache_file_fd = -1;
+        self->small_hole_threshold = 512;
     }
     return (PyObject*) self;
 }
@@ -80,7 +82,7 @@ open_cache_file_without_tmpfile(const char *cache_path) {
     int fd = -1;
     static const char template[] = "%s/disk-cache-XXXXXXXXXXXX";
     const size_t sz = strlen(cache_path) + sizeof(template) + 4;
-    FREE_AFTER_FUNCTION char *buf = calloc(1, sz);
+    RAII_ALLOC(char, buf, calloc(1, sz));
     if (!buf) { errno = ENOMEM; return -1; }
     snprintf(buf, sz - 1, template, cache_path);
     while (fd < 0) {
@@ -132,8 +134,8 @@ typedef struct {
 static void
 defrag(DiskCache *self) {
     int new_cache_file = -1;
-    FREE_AFTER_FUNCTION DefragEntry *defrag_entries = NULL;
-    AutoFreeFastFileCopyBuffer fcb = {0};
+    RAII_ALLOC(DefragEntry, defrag_entries, NULL);
+    RAII_FreeFastFileCopyBuffer(fcb);
     bool lock_released = false, ok = false;
 
     off_t size_on_disk = size_of_cache_file(self);
@@ -177,6 +179,8 @@ defrag(DiskCache *self) {
         e->new_offset = current_pos;
         current_pos += e->data_sz;
     }
+    self->holes.count = 0;
+    self->holes.largest_hole_size = 0;
     ok = true;
 
 cleanup:
@@ -194,24 +198,69 @@ cleanup:
     if (new_cache_file > -1) safe_close(new_cache_file, __FILE__, __LINE__);
 }
 
-static int
-cmp_pos_in_cache_file(void *a_, void *b_) {
-    CacheEntry *a = a_, *b = b_;
-    return a->pos_in_cache_file - b->pos_in_cache_file;
+static bool
+find_hole_to_use(DiskCache *self, const off_t required_sz) {
+    if (self->holes.largest_hole_size < required_sz) return false;
+    off_t largest_hole_size = 0;
+    bool found = false;
+    ssize_t remove_at = -1;
+    for (size_t i = 0; i < self->holes.count; i++) {
+        Hole *h = self->holes.items + i;
+        if (!found && h->size >= required_sz) {
+            found = true;
+            self->currently_writing.pos_in_cache_file = h->pos;
+            bool was_largest_hole = h->size == self->holes.largest_hole_size;
+            h->size -= required_sz;
+            h->pos += required_sz;
+            if (h->size <= self->small_hole_threshold) remove_at = i;
+            if (!was_largest_hole) {
+                if (remove_at < 0) return found;
+                largest_hole_size = self->holes.largest_hole_size;
+                break;
+            }
+        }
+        if (h->size > largest_hole_size) largest_hole_size = h->size;
+    }
+    self->holes.largest_hole_size = largest_hole_size;
+    if (remove_at > -1) remove_i_from_array(self->holes.items, (size_t)remove_at, self->holes.count);
+    return found;
+}
+
+static inline bool
+needs_defrag(DiskCache *self) {
+    off_t size_on_disk = size_of_cache_file(self);
+    return self->total_size && size_on_disk > 0 && (size_t)size_on_disk > self->total_size * 2;
 }
 
 static void
-find_hole(DiskCache *self) {
-    off_t required_size = self->currently_writing.data_sz, prev = -100;
-    HASH_SORT(self->entries, cmp_pos_in_cache_file);
-    CacheEntry *s, *tmp;
-    HASH_ITER(hh, self->entries, s, tmp) {
-        if (s->pos_in_cache_file >= 0 && s->data_sz > 0) {
-            if (prev >= 0 && s->pos_in_cache_file - prev >= required_size) {
-                self->currently_writing.pos_in_cache_file = prev;
+add_hole(DiskCache *self, off_t pos, off_t size) {
+    if (size <= self->small_hole_threshold) return;
+    Hole *h;
+    if (self->holes.count) {
+        // see if we can find a hole that ends where we start and merge
+        // look through the prev at most 128 holes for a match
+        h = &self->holes.items[self->holes.count-1];
+        for (size_t i = 0; i < MIN(self->holes.count, 128u); i++, h--) {
+            if (h->pos + h->size == pos) {
+                h->size += size;
+                self->holes.largest_hole_size = MAX(self->holes.largest_hole_size, h->size);
                 return;
             }
-            prev = s->pos_in_cache_file + s->data_sz;
+        }
+    }
+    ensure_space_for(&self->holes, items, Hole, self->holes.count + 16, capacity, 64, false);
+    h = &self->holes.items[self->holes.count++];
+    h->pos = pos; h->size = size;
+    self->holes.largest_hole_size = MAX(self->holes.largest_hole_size, h->size);
+}
+
+static void
+remove_from_disk(DiskCache *self, CacheEntry *s) {
+    if (s->written_to_disk) {
+        s->written_to_disk = false;
+        if (s->data_sz && s->pos_in_cache_file > -1) {
+            add_hole(self, s->pos_in_cache_file, s->data_sz);
+            s->pos_in_cache_file = -1;
         }
     }
 }
@@ -219,8 +268,7 @@ find_hole(DiskCache *self) {
 static bool
 find_cache_entry_to_write(DiskCache *self) {
     CacheEntry *tmp, *s;
-    off_t size_on_disk = size_of_cache_file(self);
-    if (self->total_size && size_on_disk > 0 && (size_t)size_on_disk > self->total_size * 2) defrag(self);
+    if (needs_defrag(self)) defrag(self);
     HASH_ITER(hh, self->entries, s, tmp) {
         if (!s->written_to_disk) {
             if (s->data) {
@@ -229,10 +277,10 @@ find_cache_entry_to_write(DiskCache *self) {
                 s->data = NULL;
                 self->currently_writing.data_sz = s->data_sz;
                 self->currently_writing.pos_in_cache_file = -1;
-                xor_data(s->encryption_key, sizeof(s->encryption_key), self->currently_writing.data, s->data_sz);
+                xor_data64(s->encryption_key, self->currently_writing.data, s->data_sz);
                 self->currently_writing.hash_keylen = MIN(s->hash_keylen, MAX_KEY_SIZE);
                 memcpy(self->currently_writing.hash_key, s->hash_key, self->currently_writing.hash_keylen);
-                find_hole(self);
+                find_hole_to_use(self, self->currently_writing.data_sz);
                 return true;
             }
             s->written_to_disk = true;
@@ -417,6 +465,7 @@ dealloc(DiskCache* self) {
         safe_close(self->cache_file_fd, __FILE__, __LINE__);
         self->cache_file_fd = -1;
     }
+    free(self->holes.items); zero_at_ptr(&self->holes);
     if (self->currently_writing.data) free(self->currently_writing.data);
     free(self->cache_dir); self->cache_dir = NULL;
     Py_TYPE(self)->tp_free((PyObject*)self);
@@ -441,7 +490,7 @@ add_to_disk_cache(PyObject *self_, const void *key, size_t key_sz, const void *d
     if (!ensure_state(self)) return false;
     if (key_sz > MAX_KEY_SIZE) { PyErr_SetString(PyExc_KeyError, "cache key is too long"); return false; }
     CacheEntry *s = NULL;
-    FREE_AFTER_FUNCTION uint8_t *copied_data = malloc(data_sz);
+    RAII_ALLOC(uint8_t, copied_data, malloc(data_sz));
     if (!copied_data) { PyErr_NoMemory(); return false; }
     memcpy(copied_data, data, data_sz);
 
@@ -451,10 +500,9 @@ add_to_disk_cache(PyObject *self_, const void *key, size_t key_sz, const void *d
         if (!(s = create_cache_entry(key, key_sz))) goto end;
         HASH_ADD_KEYPTR(hh, self->entries, s->hash_key, s->hash_keylen, s);
     } else {
-        s->written_to_disk = false;
+        remove_from_disk(self, s);
+        self->total_size -= MIN(self->total_size, s->data_sz);
         if (s->data) free(s->data);
-        if (data_sz <= self->total_size) self->total_size -= data_sz;
-        else self->total_size = 0;
     }
     s->data = copied_data; s->data_sz = data_sz; copied_data = NULL;
     self->total_size += s->data_sz;
@@ -478,6 +526,7 @@ remove_from_disk_cache(PyObject *self_, const void *key, size_t key_sz) {
     if (s) {
         removed = true;
         HASH_DEL(self->entries, s);
+        remove_from_disk(self, s);
         self->total_size = (self->total_size > s->data_sz) ? self->total_size - s->data_sz : 0;
         free_cache_entry(s);
     }
@@ -497,6 +546,9 @@ clear_disk_cache(PyObject *self_) {
         free_cache_entry(s);
     }
     self->total_size = 0;
+    self->holes.count = 0;
+    self->holes.largest_hole_size = 0;
+    if (self->cache_file_fd > -1) add_hole(self, 0, size_of_cache_file(self));
     mutex(unlock);
     wakeup_write_loop(self);
 }
@@ -552,11 +604,11 @@ read_from_disk_cache(PyObject *self_, const void *key, size_t key_sz, void*(allo
     if (s->data) { memcpy(data, s->data, s->data_sz); }
     else if (self->currently_writing.data && self->currently_writing.hash_key && self->currently_writing.hash_keylen == key_sz && memcmp(self->currently_writing.hash_key, key, key_sz) == 0) {
         memcpy(data, self->currently_writing.data, s->data_sz);
-        xor_data(s->encryption_key, sizeof(s->encryption_key), data, s->data_sz);
+        xor_data64(s->encryption_key, data, s->data_sz);
     }
     else {
         read_from_cache_entry(self, s, data);
-        xor_data(s->encryption_key, sizeof(s->encryption_key), data, s->data_sz);
+        xor_data64(s->encryption_key, data, s->data_sz);
     }
     if (store_in_ram && !s->data && s->data_sz) {
         void *copy = malloc(s->data_sz);
@@ -635,19 +687,6 @@ PYWRAP(ensure_state) {
     (void)args;
     ensure_state(self);
     Py_RETURN_NONE;
-}
-
-PYWRAP(xor_data) {
-    (void) self;
-    const char *key, *data;
-    Py_ssize_t keylen, data_sz;
-    PA("y#y#", &key, &keylen, &data, &data_sz);
-    PyObject *ans = PyBytes_FromStringAndSize(NULL, data_sz);
-    if (ans == NULL) return NULL;
-    void *dest = PyBytes_AS_STRING(ans);
-    memcpy(dest, data, data_sz);
-    xor_data((const uint8_t*)key, keylen, dest, data_sz);
-    return ans;
 }
 
 PYWRAP(read_from_cache_file) {
@@ -770,6 +809,7 @@ static PyMethodDef methods[] = {
 
 static PyMemberDef members[] = {
     {"total_size", T_ULONGLONG, offsetof(DiskCache, total_size), READONLY, "total_size"},
+    {"small_hole_threshold", T_PYSSIZET, offsetof(DiskCache, small_hole_threshold), 0, "small_hole_threshold"},
     {NULL},
 };
 
@@ -783,13 +823,8 @@ PyTypeObject DiskCache_Type = {
     .tp_doc = "A disk based secure cache",
     .tp_methods = methods,
     .tp_members = members,
-    .tp_new = new,
-};
-
-static PyMethodDef module_methods[] = {
-    MW(xor_data, METH_VARARGS),
-    {NULL, NULL, 0, NULL}        /* Sentinel */
+    .tp_new = new_diskcache_object,
 };
 
 INIT_TYPE(DiskCache)
-PyObject* create_disk_cache(void) { return new(&DiskCache_Type, NULL, NULL); }
+PyObject* create_disk_cache(void) { return new_diskcache_object(&DiskCache_Type, NULL, NULL); }

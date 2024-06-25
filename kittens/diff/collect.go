@@ -263,6 +263,9 @@ func walk(base string, patterns []string, names *utils.Set[string], pmap, path_n
 		return err
 	}
 	return filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
 		is_allowed := allowed(path, patterns...)
 		if !is_allowed {
 			if d.IsDir() {
@@ -297,7 +300,9 @@ func (self *Collection) collect_files(left, right string) error {
 	if err != nil {
 		return err
 	}
-	err = walk(right, conf.Ignore_name, right_names, right_path_map, path_name_map)
+	if err = walk(right, conf.Ignore_name, right_names, right_path_map, path_name_map); err != nil {
+		return err
+	}
 	common_names := left_names.Intersect(right_names)
 	changed_names := utils.NewSet[string](common_names.Len())
 	for n := range common_names.Iterable() {
@@ -312,6 +317,16 @@ func (self *Collection) collect_files(left, right string) error {
 		if ld != rd {
 			changed_names.Add(n)
 			self.add_change(left_path_map[n], right_path_map[n])
+		} else {
+			if lstat, err := os.Stat(left_path_map[n]); err == nil {
+				if rstat, err := os.Stat(right_path_map[n]); err == nil {
+					if lstat.Mode() != rstat.Mode() {
+						// identical files with only a mode change
+						changed_names.Add(n)
+						self.add_change(left_path_map[n], right_path_map[n])
+					}
+				}
+			}
 		}
 	}
 	removed := left_names.Subtract(common_names)

@@ -2,10 +2,13 @@
 # License: GPLv3 Copyright: 2021, Kovid Goyal <kovid at kovidgoyal.net>
 
 import errno
+import io
+import json
 import os
+import re
 import stat
 import tempfile
-from base64 import standard_b64decode, standard_b64encode
+from base64 import b85decode
 from collections import defaultdict, deque
 from contextlib import suppress
 from dataclasses import Field, dataclass, field, fields
@@ -13,23 +16,27 @@ from enum import Enum, auto
 from functools import partial
 from gettext import gettext as _
 from itertools import count
-from time import monotonic
-from typing import IO, Any, Callable, DefaultDict, Deque, Dict, Iterable, Iterator, List, Optional, Tuple, Union, cast
+from time import time_ns
+from typing import IO, Any, Callable, DefaultDict, Deque, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
-from kittens.transfer.librsync import LoadSignature, PatchFile, delta_for_file, signature_of_file
 from kittens.transfer.utils import IdentityCompressor, ZlibCompressor, abspath, expand_home, home_path
-from kitty.fast_data_types import FILE_TRANSFER_CODE, OSC, add_timer, get_boss, get_options
+from kitty.fast_data_types import ESC_OSC, FILE_TRANSFER_CODE, AES256GCMDecrypt, add_timer, base64_decode, base64_encode, get_boss, get_options, monotonic
 from kitty.types import run_once
 
-from .utils import log_error, sanitize_control_codes
+from .utils import log_error
 
 EXPIRE_TIME = 10  # minutes
 MAX_ACTIVE_RECEIVES = MAX_ACTIVE_SENDS = 10
 ftc_prefix = str(FILE_TRANSFER_CODE)
 
 
-def escape_semicolons(x: str) -> str:
-    return x.replace(';', ';;')
+@run_once
+def safe_string_pat() -> 're.Pattern[str]':
+    return re.compile(r'[^0-9a-zA-Z_:./@-]')
+
+
+def safe_string(x: str) -> str:
+    return safe_string_pat().sub('', x)
 
 
 def as_unicode(x: Union[str, bytes]) -> str:
@@ -268,6 +275,8 @@ class FileTransmissionCommand:
             val = getattr(self, k.name)
             if val != k.default:
                 ans.append(f'{k.name}={val!r}')
+        if self.data:
+            ans.append(f'data={len(self.data)} bytes')
         return 'FTC(' + ', '.join(ans) + ')'
 
     def asdict(self, keep_defaults: bool = False) -> Dict[str, Union[str, int, bytes]]:
@@ -302,12 +311,12 @@ class FileTransmissionCommand:
             if issubclass(k.type, Enum):
                 yield val.name
             elif k.type is bytes:
-                yield standard_b64encode(val)
+                yield base64_encode(val)
             elif k.type is str:
                 if k.metadata.get('base64'):
-                    yield standard_b64encode(val.encode('utf-8'))
+                    yield base64_encode(val.encode('utf-8'))
                 else:
-                    yield escape_semicolons(sanitize_control_codes(val))
+                    yield safe_string(val)
             elif k.type is int:
                 yield str(val)
             else:
@@ -320,26 +329,24 @@ class FileTransmissionCommand:
     def deserialize(cls, data: Union[str, bytes, memoryview]) -> 'FileTransmissionCommand':
         ans = FileTransmissionCommand()
         fmap = serialized_to_field_map()
-        from kittens.transfer.rsync import decode_utf8_buffer, parse_ftc
+        from kittens.transfer.rsync import parse_ftc
 
-        def handle_item(key: memoryview, val: memoryview, has_semicolons: bool) -> None:
+        def handle_item(key: memoryview, val: memoryview) -> None:
             field = fmap.get(key)
             if field is None:
                 return
             if issubclass(field.type, Enum):
-                setattr(ans, field.name, field.type[decode_utf8_buffer(val)])
+                setattr(ans, field.name, field.type[str(val, "utf-8")])
             elif field.type is bytes:
-                setattr(ans, field.name, standard_b64decode(val))
+                setattr(ans, field.name, base64_decode(val))
             elif field.type is int:
                 setattr(ans, field.name, int(val))
             elif field.type is str:
                 if field.metadata.get('base64'):
-                    sval = standard_b64decode(val).decode('utf-8')
+                    sval = base64_decode(val).decode('utf-8')
                 else:
-                    sval = decode_utf8_buffer(val)
-                    if has_semicolons:
-                        sval = sval.replace(';;', ';')
-                setattr(ans, field.name, sanitize_control_codes(sval))
+                    sval = safe_string(str(val, "utf-8"))
+                setattr(ans, field.name, sval)
 
         parse_ftc(data, handle_item)
         if ans.action is Action.invalid:
@@ -367,14 +374,78 @@ class ZlibDecompressor:
         return ans
 
 
+class PatchFile:
+
+    def __init__(self, path: str, expected_size: int):
+        from kittens.transfer.rsync import Patcher
+        self.patcher = Patcher(expected_size)
+        self.block_buffer = memoryview(bytearray(self.patcher.block_size))
+        self.path = path
+        self.signature_done = False
+        self.src_file: Optional[io.BufferedReader] = None
+        self._dest_file: Optional[IO[bytes]] = None
+        self.closed = False
+
+    @property
+    def dest_file(self) -> IO[bytes]:
+        if self._dest_file is None:
+            self._dest_file = tempfile.NamedTemporaryFile(mode='wb', dir=os.path.dirname(os.path.abspath(os.path.realpath(self.path))), delete=False)
+        return self._dest_file
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        p = self.patcher
+        del self.block_buffer, self.patcher
+        if self._dest_file is not None and not self._dest_file.closed:
+            self._dest_file.close()
+            p.finish_delta_data()
+            if self.src_file is not None:
+                os.replace(self.dest_file.name, self.src_file.name)
+        if self.src_file is not None and not self.src_file.closed:
+            self.src_file.close()
+
+    def tell(self) -> int:
+        df = self.dest_file
+        if df.closed:
+            return os.path.getsize(self.path)
+        return df.tell()
+
+    def read_from_src(self, pos: int, b: Union[bytearray, memoryview]) -> int:
+        assert self.src_file is not None
+        self.src_file.seek(pos, os.SEEK_SET)
+        return self.src_file.readinto(b)
+
+    def write_to_dest(self, b: Union[bytes, bytearray, memoryview]) -> None:
+        self.dest_file.write(b)
+
+    def write(self, b: bytes) -> None:
+        self.patcher.apply_delta_data(b, self.read_from_src, self.write_to_dest)
+
+    def next_signature_block(self, buf: memoryview) -> int:
+        if self.signature_done:
+            return 0
+        if self.src_file is None:
+            self.src_file = open(self.path, 'rb')
+            return self.patcher.signature_header(buf)
+        n = self.src_file.readinto(self.block_buffer)
+        if n > 0:
+            n = self.patcher.sign_block(self.block_buffer[:n], buf)
+        else:
+            self.src_file.seek(0, os.SEEK_SET)
+            self.signature_done = True
+        return n
+
+
 class DestFile:
 
     def __init__(self, ftc: FileTransmissionCommand) -> None:
         self.name = ftc.name
         if not os.path.isabs(self.name):
-            self.name = os.path.expanduser(self.name)
+            self.name = expand_home(self.name)
             if not os.path.isabs(self.name):
-                self.name = os.path.join(tempfile.gettempdir(), self.name)
+                self.name = abspath(self.name, use_home=True)
         try:
             self.existing_stat: Optional[os.stat_result] = os.stat(self.name, follow_symlinks=False)
         except OSError:
@@ -394,6 +465,10 @@ class DestFile:
         self.actual_file: Union[PatchFile, IO[bytes], None] = None
         self.failed = False
         self.bytes_written = 0
+
+    def signature_iterator(self) -> PatchFile:
+        self.actual_file = PatchFile(self.name, self.existing_stat.st_size if self.existing_stat is not None else 0)
+        return self.actual_file
 
     def __repr__(self) -> str:
         return f'DestFile(name={self.name}, file_id={self.file_id}, actual_file={self.actual_file})'
@@ -467,19 +542,42 @@ class DestFile:
             decompressed = self.decompressor(data, is_last=is_last)
             if self.actual_file is None:
                 self.make_parent_dirs()
-                if self.ttype is TransmissionType.rsync:
-                    self.actual_file = PatchFile(self.name)
-                else:
-                    self.unlink_existing_if_needed()
-                    flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_BINARY', 0)
-                    self.actual_file = open(os.open(self.name, flags, self.permissions), mode='r+b', closefd=True)
-            af = cast(Union[IO[bytes], PatchFile], self.actual_file)
+                self.unlink_existing_if_needed()
+                flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_BINARY', 0)
+                self.actual_file = open(os.open(self.name, flags, self.permissions), mode='r+b', closefd=True)
+            af = self.actual_file
             if decompressed or is_last:
                 af.write(decompressed)
                 self.bytes_written = af.tell()
             if is_last:
                 self.close()
                 self.apply_metadata()
+
+
+def check_bypass(password: str, request_id: str, bypass_data: str) -> bool:
+    protocol, sep, bypass_data = bypass_data.partition(':')
+    if protocol == 'kitty-1':
+        try:
+            pcmd = json.loads(bypass_data)
+            pubkey = pcmd.get('pubkey', '')
+            if not pubkey:
+                return False
+            ekey = get_boss().encryption_key
+            d = AES256GCMDecrypt(ekey.derive_secret(b85decode(pubkey)), b85decode(pcmd['iv']), b85decode(pcmd['tag']))
+            data = d.add_data_to_be_decrypted(b85decode(pcmd['encrypted']), True)
+            timestamp, sep, payload = data.decode('utf-8').partition(':')
+            delta = time_ns() - int(timestamp)
+            if abs(delta) > 5 * 60 * 1e9:
+                return False
+            return payload == f'{request_id};{password}'
+        except Exception as err:
+            log_error(f'Invalid file transmission bypass data received: {err}')
+            return False
+    elif protocol == 'sha256':
+        return (encode_bypass(request_id, password) == bypass_data) if password else False
+    else:
+        log_error(f'Invalid file transmission bypass data received with protocol: {protocol}')
+    return False
 
 
 class ActiveReceive:
@@ -492,11 +590,13 @@ class ActiveReceive:
         self.bypass_ok: Optional[bool] = None
         if bypass:
             byp = get_options().file_transfer_confirmation_bypass
-            self.bypass_ok = (encode_bypass(request_id, byp) == bypass) if byp else False
+            self.bypass_ok = check_bypass(byp, request_id, bypass)
         self.files = {}
         self.last_activity_at = monotonic()
         self.send_acknowledgements = quiet < 1
         self.send_errors = quiet < 2
+        self.pending_files_to_transmit_signature_of: Deque[Tuple[PatchFile, str]] = deque()
+        self.signature_pending_chunks: Deque[FileTransmissionCommand] = deque()
 
     @property
     def is_expired(self) -> bool:
@@ -531,7 +631,8 @@ class ActiveReceive:
             df.write_data(self.files, ftc.data, ftc.action is Action.end_data)
         except Exception:
             df.failed = True
-            df.close()
+            with suppress(Exception):
+                df.close()
             raise
         return df
 
@@ -556,15 +657,21 @@ class SourceFile:
             raise TransmissionError(ErrorCode.EINVAL, msg='Cannot send a directory', file_id=self.file_id)
         self.compressor: Union[ZlibCompressor, IdentityCompressor] = IdentityCompressor()
         self.target = b''
-        self.open_file: Optional[IO[bytes]] = None
+        self.open_file: Optional[io.BufferedReader] = None
         if stat.S_ISLNK(self.stat.st_mode):
             self.target = os.readlink(self.path).encode('utf-8')
         else:
             self.open_file = open(self.path, 'rb')
             if ftc.compression is Compression.zlib:
                 self.compressor = ZlibCompressor()
-        self.signature_loader = LoadSignature() if self.waiting_for_signature else None
-        self.delta_loader: Optional[Iterator[memoryview]] = None
+        from kittens.transfer import rsync
+        self.differ = rsync.Differ() if self.waiting_for_signature else None
+        self.buf = bytearray()
+        self.write_pos = 0
+
+    def write(self, b: Union[bytes, bytearray, memoryview]) -> None:
+        self.buf[self.write_pos:self.write_pos+len(b)] = b
+        self.write_pos += len(b)
 
     @property
     def ready_to_transmit(self) -> bool:
@@ -574,8 +681,7 @@ class SourceFile:
         if self.open_file is not None:
             self.open_file.close()
             self.open_file = None
-        self.signature_loader = None
-        self.delta_loader = None
+        self.differ = None
 
     def next_chunk(self, sz: int = 1024 * 1024) -> Tuple[bytes, int]:
         if self.target:
@@ -586,16 +692,16 @@ class SourceFile:
                 self.transmitted = True
                 data = b''
             else:
-                if self.delta_loader is None:
+                if self.differ is None:
                     data = self.open_file.read(sz)
                     if not data or self.open_file.tell() >= self.stat.st_size:
                         self.transmitted = True
                 else:
-                    try:
-                        data = next(self.delta_loader)
-                    except StopIteration:
+                    self.write_pos = 0
+                    has_more = self.differ.next_op(self.open_file.readinto, self.write)
+                    data = memoryview(self.buf)[:self.write_pos]
+                    if not has_more:
                         self.transmitted = True
-                        data = b''
         uncompressed_sz = len(data)
         cchunk = self.compressor.compress(data)
         if self.transmitted and not isinstance(self.compressor, IdentityCompressor):
@@ -611,10 +717,10 @@ class ActiveSend:
         self.id = request_id
         self.expected_num_of_args = num_of_args
         self.bypass_ok: Optional[bool] = None
-        self.accepted = False
         if bypass:
             byp = get_options().file_transfer_confirmation_bypass
-            self.bypass_ok = (encode_bypass(request_id, byp) == bypass) if byp else False
+            self.bypass_ok = check_bypass(byp, request_id, bypass)
+        self.accepted = False
         self.last_activity_at = monotonic()
         self.send_acknowledgements = quiet < 1
         self.send_errors = quiet < 2
@@ -646,14 +752,13 @@ class ActiveSend:
         af = self.queued_files_map.get(cmd.file_id)
         if af is None:
             raise TransmissionError(ErrorCode.EINVAL, f'Signature data for unknown file_id: {cmd.file_id}')
-        sl = af.signature_loader
+        sl = af.differ
         if sl is None:
             raise TransmissionError(ErrorCode.EINVAL, f'Signature data for file that is not using rsync: {cmd.file_id}')
-        sl.add_chunk(cmd.data)
+        sl.add_signature_data(cmd.data)
         if cmd.action is Action.end_data:
-            sl.commit()
+            sl.finish_signature_data()
             af.waiting_for_signature = False
-            af.delta_loader = delta_for_file(af.path, sl.signature)
 
     @property
     def is_expired(self) -> bool:
@@ -750,12 +855,13 @@ class FileTransmission:
             if self.active_sends[a].is_expired:
                 self.drop_send(a)
 
-    def handle_serialized_command(self, data: str) -> None:
+    def handle_serialized_command(self, data: memoryview) -> None:
         try:
             cmd = FileTransmissionCommand.deserialize(data)
         except Exception as e:
             log_error(f'Failed to parse file transmission command with error: {e}')
             return
+        # print('from kitten:', cmd)
         if not cmd.id:
             log_error('File transmission command without id received, ignoring')
             return
@@ -924,11 +1030,12 @@ class FileTransmission:
                         df.ttype = ttype
                         if ttype is TransmissionType.rsync:
                             try:
-                                fs = signature_of_file(df.name)
+                                fs = df.signature_iterator()
                             except OSError as err:
                                 self.send_fail_on_os_error(err, 'Failed to open file to read signature', ar, df.file_id)
                             else:
-                                self.callback_after(partial(self.transmit_rsync_signature, fs, ar.id, df.file_id, deque()))
+                                ar.pending_files_to_transmit_signature_of.append((fs, df.file_id))
+                                self.callback_after(partial(self.transmit_rsync_signature, ar.id))
         elif cmd.action in (Action.data, Action.end_data):
             try:
                 before = 0
@@ -949,7 +1056,9 @@ class FileTransmission:
                 if ar.send_errors:
                     self.send_transmission_error(ar.id, err)
             except Exception as err:
-                log_error(f'Transmission protocol failed to write data to file with error: {err}')
+                import traceback
+                st = traceback.format_exc()
+                log_error(f'Transmission protocol failed to write data to file with error: {st}')
                 if ar.send_errors:
                     te = TransmissionError(file_id=cmd.file_id, msg=str(err))
                     self.send_transmission_error(ar.id, te)
@@ -969,43 +1078,55 @@ class FileTransmission:
         else:
             log_error(f'Transmission receive command with unknown action: {cmd.action}, ignoring')
 
-    def transmit_rsync_signature(
-        self, fs: Iterator[memoryview],
-        receive_id: str, file_id: str,
-        pending: Deque[FileTransmissionCommand],
-        timer_id: Optional[int] = None
-    ) -> None:
-        ar = self.active_receives.get(receive_id)
-        if ar is None:
+    def transmit_rsync_signature(self, receive_id: str, timer_id: Optional[int] = None) -> None:
+        q = self.active_receives.get(receive_id)
+        if q is None:
             return
-        func = partial(self.transmit_rsync_signature, fs, receive_id, file_id, pending)
-        while pending:
-            if self.write_ftc_to_child(pending[0], use_pending=False):
-                pending.popleft()
+        ar = q  # for mypy
+        while ar.signature_pending_chunks:
+            if self.write_ftc_to_child(ar.signature_pending_chunks[0], use_pending=False):
+                ar.signature_pending_chunks.popleft()
             else:
-                self.callback_after(func, timeout=0.1)
+                self.callback_after(partial(self.transmit_rsync_signature, receive_id), timeout=0.1)
                 return
-        try:
-            chunk = next(fs)
-        except StopIteration:
-            self.write_ftc_to_child(FileTransmissionCommand(id=receive_id, action=Action.end_data, file_id=file_id))
+        if not ar.pending_files_to_transmit_signature_of:
             return
-        except OSError as err:
-            if ar.send_errors:
-                self.send_fail_on_os_error(err, 'Failed to read signature', ar, file_id)
-            return
-        if not len(chunk):
-            self.write_ftc_to_child(FileTransmissionCommand(id=receive_id, action=Action.end_data, file_id=file_id))
-            return
+        fs, file_id = ar.pending_files_to_transmit_signature_of[0]
+        pos = 0
+        buf = memoryview(bytearray(4096))
+        is_finished = False
+        while len(buf) >= pos + 32:
+            try:
+                n = fs.next_signature_block(buf[pos:])
+            except OSError as err:
+                if ar.send_errors:
+                    self.send_fail_on_os_error(err, 'Failed to read signature', ar, file_id)
+                return
+            if not n:
+                is_finished = True
+                ar.pending_files_to_transmit_signature_of.popleft()
+                break
+            pos += n
+
+        chunk = buf[:pos]
         has_capacity = True
-        for data in split_for_transfer(chunk, session_id=receive_id, file_id=file_id):
+
+        def write_ftc(data: FileTransmissionCommand) -> None:
+            nonlocal has_capacity
             if has_capacity:
                 if not self.write_ftc_to_child(data, use_pending=False):
                     has_capacity = False
-                    pending.append(data)
+                    ar.signature_pending_chunks.append(data)
             else:
-                pending.append(data)
-        self.callback_after(func)
+                ar.signature_pending_chunks.append(data)
+
+        if len(chunk):
+            for data in split_for_transfer(chunk, session_id=receive_id, file_id=file_id):
+                write_ftc(data)
+        if is_finished:
+            endftc = FileTransmissionCommand(id=receive_id, action=Action.end_data, file_id=file_id)
+            write_ftc(endftc)
+        self.callback_after(partial(self.transmit_rsync_signature, receive_id))
 
     def send_status_response(
         self, code: Union[ErrorCode, str] = ErrorCode.EINVAL,
@@ -1026,7 +1147,7 @@ class FileTransmission:
         window = boss.window_id_map.get(self.window_id)
         if window is not None:
             data = tuple(payload.get_serialized_fields(prefix_with_osc_code=True))
-            queued = window.screen.send_escape_code_to_child(OSC, data)
+            queued = window.screen.send_escape_code_to_child(ESC_OSC, data)
             if not queued:
                 if use_pending:
                     if appendleft:

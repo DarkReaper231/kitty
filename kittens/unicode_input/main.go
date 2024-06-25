@@ -3,15 +3,18 @@
 package unicode_input
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
 
 	"kitty/tools/cli"
+	"kitty/tools/tty"
 	"kitty/tools/tui"
 	"kitty/tools/tui/loop"
 	"kitty/tools/tui/readline"
@@ -19,8 +22,6 @@ import (
 	"kitty/tools/utils"
 	"kitty/tools/utils/style"
 	"kitty/tools/wcswidth"
-
-	"golang.org/x/exp/slices"
 )
 
 var _ = fmt.Print
@@ -48,7 +49,7 @@ func build_sets() {
 	}
 	EMOTICONS_SET = make([]rune, 0, 0x1f64f-0x1f600+1)
 	for i := 0x1f600; i <= 0x1f64f; i++ {
-		DEFAULT_SET = append(DEFAULT_SET, rune(i))
+		EMOTICONS_SET = append(EMOTICONS_SET, rune(i))
 	}
 }
 
@@ -248,6 +249,8 @@ func (self *handler) update_codepoints() {
 		self.table.set_codepoints(q.codepoints, self.mode, q.index_word)
 	}
 }
+
+var debugprintln = tty.DebugPrintln
 
 func (self *handler) update_current_char() {
 	self.update_codepoints()
@@ -481,9 +484,11 @@ func (self *handler) next_mode(delta int) {
 	}
 }
 
+var ErrCanceledByUser = errors.New("Canceled by user")
+
 func (self *handler) on_key_event(event *loop.KeyEvent) (err error) {
 	if event.MatchesPressOrRepeat("esc") || event.MatchesPressOrRepeat("ctrl+c") {
-		return fmt.Errorf("Canceled by user")
+		return ErrCanceledByUser
 	}
 	if event.MatchesPressOrRepeat("f1") || event.MatchesPressOrRepeat("ctrl+1") {
 		event.Handled = true
@@ -497,10 +502,10 @@ func (self *handler) on_key_event(event *loop.KeyEvent) (err error) {
 	} else if event.MatchesPressOrRepeat("f4") || event.MatchesPressOrRepeat("ctrl+4") {
 		event.Handled = true
 		self.switch_mode(FAVORITES)
-	} else if event.MatchesPressOrRepeat("tab") || event.MatchesPressOrRepeat("ctrl+]") {
+	} else if event.MatchesPressOrRepeat("ctrl+tab") || event.MatchesPressOrRepeat("ctrl+]") {
 		event.Handled = true
 		self.next_mode(1)
-	} else if event.MatchesPressOrRepeat("shift+tab") || event.MatchesPressOrRepeat("ctrl+[") {
+	} else if event.MatchesPressOrRepeat("ctrl+shift+tab") || event.MatchesPressOrRepeat("ctrl+[") {
 		event.Handled = true
 		self.next_mode(-1)
 	}
@@ -549,14 +554,25 @@ func run_loop(opts *Options) (lp *loop.Loop, err error) {
 	defer cv.Save()
 
 	h := handler{recent: cached_data.Recent, lp: lp, emoji_variation: opts.EmojiVariation}
-	switch cached_data.Mode {
-	case "HEX":
+	switch opts.Tab {
+	case "previous":
+		switch cached_data.Mode {
+		case "HEX":
+			h.mode = HEX
+		case "NAME":
+			h.mode = NAME
+		case "EMOTICONS":
+			h.mode = EMOTICONS
+		case "FAVORITES":
+			h.mode = FAVORITES
+		}
+	case "code":
 		h.mode = HEX
-	case "NAME":
+	case "name":
 		h.mode = NAME
-	case "EMOTICONS":
+	case "emoticons":
 		h.mode = EMOTICONS
-	case "FAVORITES":
+	case "favorites":
 		h.mode = FAVORITES
 	}
 	all_modes[0] = ModeData{mode: HEX, title: "Code", key: "F1"}
@@ -626,6 +642,9 @@ func main(cmd *cli.Command, o *Options, args []string) (rc int, err error) {
 	build_sets()
 	lp, err := run_loop(o)
 	if err != nil {
+		if err == ErrCanceledByUser {
+			err = nil
+		}
 		return 1, err
 	}
 	ds := lp.DeathSignalName()

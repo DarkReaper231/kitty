@@ -14,14 +14,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"kitty/tools/utils"
 	"kitty/tools/utils/shm"
 
-	"github.com/disintegration/imaging"
-	"golang.org/x/exp/slices"
+	"github.com/edwvee/exiffix"
+	"github.com/kovidgoyal/imaging"
 )
 
 var _ = fmt.Print
@@ -216,7 +218,7 @@ func check_resize(frame *ImageFrame, filename string) error {
 }
 
 func (frame *ImageFrame) set_delay(min_gap, delay int) {
-	frame.Delay_ms = int32(utils.Max(min_gap, delay) * 10)
+	frame.Delay_ms = int32(max(min_gap, delay) * 10)
 	if frame.Delay_ms == 0 {
 		frame.Delay_ms = -1 // gapless frame in the graphics protocol
 	}
@@ -244,7 +246,7 @@ func OpenNativeImageFromReader(f io.ReadSeeker) (ans *ImageData, err error) {
 	if err != nil {
 		return nil, err
 	}
-	f.Seek(0, os.SEEK_SET)
+	_, _ = f.Seek(0, io.SeekStart)
 	ans = &ImageData{Width: c.Width, Height: c.Height, Format_uppercase: strings.ToUpper(fmt)}
 
 	if ans.Format_uppercase == "GIF" {
@@ -253,7 +255,7 @@ func OpenNativeImageFromReader(f io.ReadSeeker) (ans *ImageData, err error) {
 			return nil, err
 		}
 	} else {
-		img, err := imaging.Decode(f, imaging.AutoOrientation(true))
+		img, _, err := exiffix.Decode(f)
 		if err != nil {
 			return nil, err
 		}
@@ -264,9 +266,9 @@ func OpenNativeImageFromReader(f io.ReadSeeker) (ans *ImageData, err error) {
 	return
 }
 
-var MagickExe = (&utils.Once[string]{Run: func() string {
+var MagickExe = sync.OnceValue(func() string {
 	return utils.FindExe("magick")
-}}).Get
+})
 
 func RunMagick(path string, cmd []string) ([]byte, error) {
 	if MagickExe() != "magick" {
@@ -308,7 +310,7 @@ func parse_identify_record(ans *IdentifyRecord, raw *IdentifyOutput) (err error)
 		if err != nil {
 			return fmt.Errorf("Invalid gap value in identify output: %s", raw.Gap)
 		}
-		ans.Gap = utils.Max(0, ans.Gap)
+		ans.Gap = max(0, ans.Gap)
 	}
 	area, pos, found := strings.Cut(raw.Canvas, "+")
 	ok := false
@@ -323,8 +325,9 @@ func parse_identify_record(ans *IdentifyRecord, raw *IdentifyOutput) (err error)
 					if found {
 						ans.Canvas.Left, err = strconv.Atoi(x)
 						if err == nil {
-							ans.Canvas.Top, err = strconv.Atoi(y)
-							ok = true
+							if ans.Canvas.Top, err = strconv.Atoi(y); err == nil {
+								ok = true
+							}
 						}
 					}
 				}
@@ -339,8 +342,9 @@ func parse_identify_record(ans *IdentifyRecord, raw *IdentifyOutput) (err error)
 	if found {
 		ans.Width, err = strconv.Atoi(w)
 		if err == nil {
-			ans.Height, err = strconv.Atoi(h)
-			ok = true
+			if ans.Height, err = strconv.Atoi(h); err == nil {
+				ok = true
+			}
 		}
 	}
 	if !ok {
@@ -351,8 +355,9 @@ func parse_identify_record(ans *IdentifyRecord, raw *IdentifyOutput) (err error)
 	if found {
 		ans.Dpi.X, err = strconv.ParseFloat(x, 64)
 		if err == nil {
-			ans.Dpi.Y, err = strconv.ParseFloat(y, 64)
-			ok = true
+			if ans.Dpi.Y, err = strconv.ParseFloat(y, 64); err == nil {
+				ok = true
+			}
 		}
 	}
 	if !ok {
@@ -400,7 +405,7 @@ func IdentifyWithMagick(path string) (ans []IdentifyRecord, err error) {
 	cmd = append(cmd, "-format", q, "--", path)
 	output, err := RunMagick(path, cmd)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Failed to identify image at path: %s with error: %w", path, err)
 	}
 	output = bytes.TrimRight(bytes.TrimSpace(output), ",")
 	raw_json := make([]byte, 0, len(output)+2)
@@ -410,7 +415,7 @@ func IdentifyWithMagick(path string) (ans []IdentifyRecord, err error) {
 	var records []IdentifyOutput
 	err = json.Unmarshal(raw_json, &records)
 	if err != nil {
-		return nil, fmt.Errorf("The ImageMagick identify program returned malformed output, with error: %w", err)
+		return nil, fmt.Errorf("The ImageMagick identify program returned malformed output for the image at path: %s, with error: %w", path, err)
 	}
 	ans = make([]IdentifyRecord, len(records))
 	for i, rec := range records {
@@ -563,7 +568,7 @@ func RenderWithMagick(path string, ro *RenderOptions, frames []IdentifyRecord) (
 		err = fmt.Errorf("Failed to render %d out of %d frames", len(frames)-len(ans), len(frames))
 		return
 	}
-	slices.SortFunc(ans, func(a, b *ImageFrame) bool { return a.Number < b.Number })
+	slices.SortFunc(ans, func(a, b *ImageFrame) int { return a.Number - b.Number })
 	anchor_frame := 1
 	for i, frame := range ans {
 		anchor_frame, frame.Compose_onto = SetGIFFrameDisposal(frame.Number, anchor_frame, byte(frames[i].Disposal))

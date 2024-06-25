@@ -5,6 +5,7 @@ package ssh
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -18,6 +19,11 @@ var _ = fmt.Print
 func TestGetSSHOptions(t *testing.T) {
 	m := SSHOptions()
 	if m["w"] != "local_tun[:remote_tun]" {
+
+		cmd := exec.Command(SSHExe())
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Run()
 		t.Fatalf("Unexpected set of SSH options: %#v", m)
 	}
 }
@@ -27,6 +33,9 @@ func TestParseSSHArgs(t *testing.T) {
 		ans, err := shlex.Split(x)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if len(ans) == 0 {
+			ans = []string{}
 		}
 		return ans
 	}
@@ -39,7 +48,7 @@ func TestParseSSHArgs(t *testing.T) {
 		check := func(a, b any) {
 			diff := cmp.Diff(a, b)
 			if diff != "" {
-				t.Fatalf("Unexpected value for args: %s\n%s", args, diff)
+				t.Fatalf("Unexpected value for args: %#v\n%s", args, diff)
 			}
 		}
 		check(split(expected_ssh_args), ssh_args)

@@ -24,13 +24,6 @@ func (self *write_msg) String() string {
 	return fmt.Sprintf("write_msg{%v %#v %#v}", self.id, string(self.bytes), self.str)
 }
 
-type write_dispatcher struct {
-	str       string
-	bytes     []byte
-	is_string bool
-	is_empty  bool
-}
-
 func write_ignoring_temporary_errors(f *tty.Term, buf []byte) (int, error) {
 	n, err := f.Write(buf)
 	if err != nil {
@@ -59,32 +52,49 @@ func writestring_ignoring_temporary_errors(f *tty.Term, buf string) (int, error)
 	return n, err
 }
 
-func (self *Loop) flush_pending_writes(tty_write_channel chan<- *write_msg) {
-	for len(self.pending_writes) > 0 {
+func (self *Loop) flush_pending_writes(tty_write_channel chan<- write_msg) (num_sent int) {
+	defer func() {
+		if num_sent > 0 {
+			self.pending_writes = utils.ShiftLeft(self.pending_writes, num_sent)
+		}
+	}()
+	for len(self.pending_writes) > num_sent {
 		select {
-		case tty_write_channel <- self.pending_writes[0]:
-			n := copy(self.pending_writes, self.pending_writes[1:])
-			self.pending_writes = self.pending_writes[:n]
+		case tty_write_channel <- self.pending_writes[num_sent]:
+			num_sent++
 		default:
 			return
 		}
 	}
+	return
 }
 
-func (self *Loop) wait_for_write_to_complete(sentinel IdType, tty_write_channel chan<- *write_msg, write_done_channel <-chan IdType, timeout time.Duration) error {
-	for len(self.pending_writes) > 0 {
+func (self *Loop) wait_for_write_to_complete(sentinel IdType, tty_write_channel chan<- write_msg, write_done_channel <-chan IdType, timeout time.Duration) error {
+	num_sent := 0
+	defer func() {
+		if num_sent > 0 {
+			self.pending_writes = utils.ShiftLeft(self.pending_writes, num_sent)
+		}
+	}()
+
+	end_time := time.Now().Add(timeout)
+	for num_sent < len(self.pending_writes) {
+		timeout = time.Until(end_time)
+		if timeout <= 0 {
+			return os.ErrDeadlineExceeded
+		}
 		select {
-		case tty_write_channel <- self.pending_writes[0]:
-			self.pending_writes = self.pending_writes[1:]
+		case tty_write_channel <- self.pending_writes[num_sent]:
+			num_sent++
 		case write_id, more := <-write_done_channel:
-			if write_id == sentinel {
-				return nil
-			}
 			if self.OnWriteComplete != nil {
-				err := self.OnWriteComplete(write_id)
+				err := self.OnWriteComplete(write_id, write_id < self.write_msg_id_counter)
 				if err != nil {
 					return err
 				}
+			}
+			if write_id == sentinel {
+				return nil
 			}
 			if !more {
 				return fmt.Errorf("The write_done_channel was unexpectedly closed")
@@ -93,43 +103,70 @@ func (self *Loop) wait_for_write_to_complete(sentinel IdType, tty_write_channel 
 			return os.ErrDeadlineExceeded
 		}
 	}
-	return nil
+	for {
+		timeout = time.Until(end_time)
+		if timeout <= 0 {
+			return os.ErrDeadlineExceeded
+		}
+		select {
+		case write_id, more := <-write_done_channel:
+			if self.OnWriteComplete != nil {
+				err := self.OnWriteComplete(write_id, write_id < self.write_msg_id_counter)
+				if err != nil {
+					return err
+				}
+			}
+			if write_id == sentinel {
+				return nil
+			}
+			if !more {
+				return fmt.Errorf("The write_done_channel was unexpectedly closed")
+			}
+		case <-time.After(timeout):
+			return os.ErrDeadlineExceeded
+		}
+	}
 }
 
-func (self *Loop) add_write_to_pending_queue(data *write_msg) {
-	self.pending_writes = append(self.pending_writes, data)
-}
-
-func create_write_dispatcher(msg *write_msg) *write_dispatcher {
-	self := write_dispatcher{str: msg.str, bytes: msg.bytes, is_string: msg.bytes == nil}
-	if self.is_string {
-		self.is_empty = self.str == ""
+func (self *Loop) add_write_to_pending_queue(data write_msg) {
+	if len(self.pending_writes) > 0 || self.tty_write_channel == nil {
+		self.pending_writes = append(self.pending_writes, data)
 	} else {
-		self.is_empty = len(self.bytes) == 0
+		select {
+		case self.tty_write_channel <- data:
+		default:
+			self.pending_writes = append(self.pending_writes, data)
+		}
 	}
-	return &self
 }
 
-func (self *write_dispatcher) write(f *tty.Term) (int, error) {
-	if self.is_string {
-		return writestring_ignoring_temporary_errors(f, self.str)
+func (self write_msg) is_empty() bool {
+	if self.bytes == nil {
+		return self.str == ""
 	}
-	return write_ignoring_temporary_errors(f, self.bytes)
+	return len(self.bytes) == 0
 }
 
-func (self *write_dispatcher) slice(n int) {
-	if self.is_string {
-		self.str = self.str[n:]
-		self.is_empty = self.str == ""
+func (self *write_msg) write(f *tty.Term) (err error) {
+	n := 0
+	if self.bytes == nil {
+		n, err = writestring_ignoring_temporary_errors(f, self.str)
 	} else {
-		self.bytes = self.bytes[n:]
-		self.is_empty = len(self.bytes) == 0
+		n, err = write_ignoring_temporary_errors(f, self.bytes)
 	}
+	if n > 0 {
+		if self.bytes == nil {
+			self.str = self.str[n:]
+		} else {
+			self.bytes = self.bytes[n:]
+		}
+	}
+	return
 }
 
 func write_to_tty(
 	pipe_r *os.File, term *tty.Term,
-	job_channel <-chan *write_msg, err_channel chan<- error, write_done_channel chan<- IdType,
+	job_channel <-chan write_msg, err_channel chan<- error, write_done_channel chan<- IdType,
 ) {
 	keep_going := true
 	defer func() {
@@ -159,21 +196,16 @@ func write_to_tty(
 		}
 	}
 
-	write_data := func(msg *write_msg) {
-		data := create_write_dispatcher(msg)
-		for !data.is_empty {
+	write_data := func(msg write_msg) {
+		for !msg.is_empty() {
 			wait_for_write_available()
 			if !keep_going {
 				return
 			}
-			n, err := data.write(term)
-			if err != nil {
+			if err := msg.write(term); err != nil {
 				err_channel <- err
 				keep_going = false
 				return
-			}
-			if n > 0 {
-				data.slice(n)
 			}
 		}
 	}
@@ -193,7 +225,7 @@ func write_to_tty(
 	}
 }
 
-func flush_writer(pipe_w *os.File, tty_write_channel chan<- *write_msg, write_done_channel <-chan IdType, pending_writes []*write_msg, timeout time.Duration) {
+func flush_writer(pipe_w *os.File, tty_write_channel chan<- write_msg, write_done_channel <-chan IdType, pending_writes []write_msg, timeout time.Duration) {
 	writer_quit := false
 	defer func() {
 		if tty_write_channel != nil {

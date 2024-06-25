@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode"
 
 	"kitty/tools/cli"
@@ -22,9 +23,9 @@ import (
 
 var _ = fmt.Print
 
-var RgExe = (&utils.Once[string]{Run: func() string {
+var RgExe = sync.OnceValue(func() string {
 	return utils.FindExe("rg")
-}}).Get
+})
 
 func get_options_for_rg() (expecting_args map[string]bool, alias_map map[string]string, err error) {
 	var raw []byte
@@ -42,16 +43,18 @@ func get_options_for_rg() (expecting_args map[string]bool, alias_map map[string]
 		if options_started {
 			s := strings.TrimLeft(line, " ")
 			indent := len(line) - len(s)
-			if indent < 12 && indent > 0 {
-				s, _, expecting_arg := strings.Cut(s, "<")
+			if indent < 8 && indent > 0 {
+				expecting_arg := strings.Contains(s, "=")
 				single_letter_aliases := make([]string, 0, 1)
 				long_option_names := make([]string, 0, 1)
 				for _, x := range strings.Split(s, ",") {
 					x = strings.TrimSpace(x)
 					if strings.HasPrefix(x, "--") {
-						long_option_names = append(long_option_names, x[2:])
+						lon, _, _ := strings.Cut(x[2:], "=")
+						long_option_names = append(long_option_names, lon)
 					} else if strings.HasPrefix(x, "-") {
-						single_letter_aliases = append(single_letter_aliases, x[1:])
+						son, _, _ := strings.Cut(x[1:], " ")
+						single_letter_aliases = append(single_letter_aliases, son)
 					}
 				}
 				if len(long_option_names) == 0 {
@@ -67,10 +70,14 @@ func get_options_for_rg() (expecting_args map[string]bool, alias_map map[string]
 				expecting_args[long_option_names[0]] = expecting_arg
 			}
 		} else {
-			if strings.HasPrefix(line, "OPTIONS:") {
+			if strings.HasSuffix(line, "OPTIONS:") {
 				options_started = true
 			}
 		}
+	}
+	if len(expecting_args) == 0 || len(alias_map) == 0 {
+		err = fmt.Errorf("Failed to parse rg help output, could not find any options")
+		return
 	}
 	return
 }
@@ -285,6 +292,9 @@ func (self *stdout_filter) Write(p []byte) (n int, err error) {
 
 func main(_ *cli.Command, _ *Options, args []string) (rc int, err error) {
 	delegate_to_rg, sanitized_args, kitten_opts, err := parse_args(args...)
+	if err != nil {
+		return 1, err
+	}
 	if delegate_to_rg {
 		sanitized_args = append([]string{"rg"}, sanitized_args...)
 		err = unix.Exec(RgExe(), sanitized_args, os.Environ())

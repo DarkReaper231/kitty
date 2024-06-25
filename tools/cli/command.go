@@ -39,6 +39,8 @@ type Command struct {
 	IgnoreAllArgs bool
 	// Specialised arg parsing
 	ParseArgsForCompletion func(cmd *Command, args []string, completions *Completions)
+	// Callback that is called on error
+	CallbackOnError func(cmd *Command, err error, during_parsing bool, exit_code int) (final_exit_code int)
 
 	SubCommandGroups []*CommandGroup
 	OptionGroups     []*OptionGroup
@@ -306,12 +308,12 @@ func (self *Command) GetVisibleOptions() ([]string, map[string][]*Option) {
 }
 
 func sort_levenshtein_matches(q string, matches []string) {
-	utils.StableSort(matches, func(a, b string) bool {
+	utils.StableSort(matches, func(a, b string) int {
 		la, lb := utils.LevenshteinDistance(a, q, true), utils.LevenshteinDistance(b, q, true)
 		if la != lb {
-			return la < lb
+			return la - lb
 		}
-		return a < b
+		return strings.Compare(a, b)
 	})
 
 }
@@ -415,12 +417,9 @@ func (self *Command) FindOptions(name_with_hyphens string) []*Option {
 	depth := 0
 	for p := self.Parent; p != nil; p = p.Parent {
 		depth++
-		x := p.FindOptions(name_with_hyphens)
-		if x != nil {
-			for _, po := range x {
-				if po.Depth >= depth {
-					ans = append(ans, po)
-				}
+		for _, po := range p.FindOptions(name_with_hyphens) {
+			if po.Depth >= depth {
+				ans = append(ans, po)
 			}
 		}
 	}
@@ -529,6 +528,9 @@ func (self *Command) ExecArgs(args []string) (exit_code int) {
 	}
 	cmd, err := root.ParseArgs(args)
 	if err != nil {
+		if self.CallbackOnError != nil {
+			return self.CallbackOnError(cmd, err, true, 1)
+		}
 		ShowError(err)
 		return 1
 	}
@@ -543,10 +545,13 @@ func (self *Command) ExecArgs(args []string) (exit_code int) {
 	} else if cmd.Run != nil {
 		exit_code, err = cmd.Run(cmd, cmd.Args)
 		if err != nil {
-			ShowError(err)
 			if exit_code == 0 {
 				exit_code = 1
 			}
+			if self.CallbackOnError != nil {
+				return self.CallbackOnError(cmd, err, false, exit_code)
+			}
+			ShowError(err)
 		}
 	}
 	return
@@ -566,6 +571,7 @@ func (self *Command) GetCompletions(argv []string, init_completions func(*Comple
 	}
 	if len(argv) > 0 {
 		exe := argv[0]
+		exe = filepath.Base(exe) // zsh completion script passes full path to exe when using aliases
 		cmd := self.FindSubCommand(exe)
 		if cmd != nil {
 			if cmd.ParseArgsForCompletion != nil {

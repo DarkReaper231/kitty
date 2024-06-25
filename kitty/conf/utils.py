@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # License: GPL v3 Copyright: 2018, Kovid Goyal <kovid at kovidgoyal.net>
 
 import os
 import re
-import shlex
 import sys
 from contextlib import contextmanager
 from typing import (
@@ -29,7 +28,7 @@ from ..fast_data_types import Color
 from ..rgb import to_color as as_color
 from ..types import ConvertibleToNumbers, ParsedShortcut, run_once
 from ..typing import Protocol
-from ..utils import expandvars, log_error
+from ..utils import expandvars, log_error, shlex_split
 
 key_pat = re.compile(r'([a-zA-Z][a-zA-Z0-9_-]*)\s+(.+)$')
 ItemParser = Callable[[str, str, Dict[str, Any]], bool]
@@ -94,7 +93,6 @@ class ToCmdline:
         return self
 
     def __call__(self, x: str, expand: bool = True) -> List[str]:
-        ans = shlex.split(x)
         if expand:
             ans = list(
                 map(
@@ -103,9 +101,11 @@ class ToCmdline:
                         os.environ if self.override_env is None else self.override_env,
                         fallback_to_os_env=False
                     ),
-                    ans
+                    shlex_split(x)
                 )
             )
+        else:
+            ans = list(shlex_split(x))
         return ans
 
 
@@ -262,14 +262,44 @@ def _parse(
     else:
         from ..constants import config_dir
         base_path_for_includes = config_dir
-    for i, line in enumerate(lines):
+
+    it = iter(lines)
+    line = ''
+    next_line: str = ''
+    next_line_num = 0
+
+    while True:
         try:
-            with currently_parsing.set_line(line, i + 1):
-                parse_line(line, parse_conf_item, ans, base_path_for_includes, accumulate_bad_lines)
-        except Exception as e:
-            if accumulate_bad_lines is None:
-                raise
-            accumulate_bad_lines.append(BadLine(i + 1, line.rstrip(), e, currently_parsing.file))
+            if next_line:
+                line = next_line
+            else:
+                line = next(it).lstrip()
+                next_line_num += 1
+            line_num = next_line_num
+
+            try:
+                next_line = next(it).lstrip()
+                next_line_num += 1
+
+                while next_line.startswith('\\'):
+                    line = line.rstrip('\n') + next_line[1:]
+                    try:
+                        next_line = next(it).lstrip()
+                        next_line_num += 1
+                    except StopIteration:
+                        next_line = ''
+                        break
+            except StopIteration:
+                next_line = ''
+            try:
+                with currently_parsing.set_line(line, line_num):
+                    parse_line(line, parse_conf_item, ans, base_path_for_includes, accumulate_bad_lines)
+            except Exception as e:
+                if accumulate_bad_lines is None:
+                    raise
+                accumulate_bad_lines.append(BadLine(line_num, line.rstrip(), e, currently_parsing.file))
+        except StopIteration:
+            break
 
 
 def parse_config_base(

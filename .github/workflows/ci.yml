@@ -2,7 +2,7 @@ name: CI
 on: [push, pull_request]
 env:
     CI: 'true'
-    ASAN_OPTIONS: leak_check_at_exit=0
+    ASAN_OPTIONS: detect_leaks=0
     LC_ALL: en_US.UTF-8
     LANG: en_US.UTF-8
 
@@ -27,7 +27,7 @@ jobs:
                       sanitize: 0
 
                     - python: b
-                      pyver: "3.11"
+                      pyver: "3.10"
                       sanitize: 1
 
                     - python: c
@@ -55,7 +55,7 @@ jobs:
               python-version: ${{ matrix.pyver }}
 
           - name: Install Go
-            uses: actions/setup-go@v3
+            uses: actions/setup-go@v4
             with:
               go-version-file: go.mod
 
@@ -82,18 +82,29 @@ jobs:
           - name: Set up Python
             uses: actions/setup-python@v4
             with:
-              python-version: "3.10"
+              python-version: "3.11"
 
           - name: Install Go
-            uses: actions/setup-go@v3
+            uses: actions/setup-go@v4
             with:
               go-version-file: go.mod
+              cache: false
+
+          - name: Cache Go build artifacts separately
+            uses: actions/cache@v3
+            with:
+              path: |
+                ~/.cache/go-build
+                ~/go/pkg/mod
+              key: ${{ runner.os }}-golang-static-${{ hashFiles('**/go.sum') }}
+              restore-keys: |
+                ${{ runner.os }}-golang-static-
 
           - name: Install build-only deps
             run: python -m pip install -r docs/requirements.txt ruff mypy types-requests types-docutils
 
           - name: Run ruff
-            run: ruff .
+            run: ruff check .
 
           - name: Run gofmt
             run: go version && python .github/workflows/ci.py gofmt
@@ -103,9 +114,6 @@ jobs:
 
           - name: Build kitty
             run: python setup.py build --debug
-
-          - name: Build static kitten
-            run: python setup.py build-static-binaries
 
           - name: Run mypy
             run: which python && python -m mypy --version && ./test.py mypy
@@ -118,6 +126,9 @@ jobs:
 
           - name: Build HTML docs
             run: make FAIL_WARN=1 html
+
+          - name: Build static kittens
+            run: python setup.py build-static-binaries
 
     bundle:
         name: Bundle test (${{ matrix.os }})
@@ -134,7 +145,7 @@ jobs:
               fetch-depth: 10
 
           - name: Install Go
-            uses: actions/setup-go@v3
+            uses: actions/setup-go@v4
             with:
               go-version-file: go.mod
 
@@ -159,7 +170,7 @@ jobs:
               python-version: "3.10"
 
           - name: Install Go
-            uses: actions/setup-go@v3
+            uses: actions/setup-go@v4
             with:
               go-version-file: go.mod
 
